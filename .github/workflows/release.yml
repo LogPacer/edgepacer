@@ -106,7 +106,7 @@ jobs:
             sudo chmod a+rw /var/run/docker.sock
           fi
           docker version
-          if ! command -v cross >/dev/null 2>&1 || ! cross --version | grep -q 'cross 0.2.5'; then
+          if ! cargo install --list | grep -q '^cross v0\.2\.5:'; then
             cargo install cross --version 0.2.5 --locked --force
           fi
 
