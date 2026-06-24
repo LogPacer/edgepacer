@@ -10,6 +10,7 @@ VERSION="${VERSION:-$(grep '^version' Cargo.toml | head -1 | cut -d'"' -f2)}"
 OUTPUT_DIR="${OUTPUT_DIR:-dist}"
 STAGE_DIR="${STAGE_DIR:-.docker-stage}"
 CARGO_FLAGS="${CARGO_FLAGS:---release}"
+AUDITABLE_RELEASE_BUILDS="${AUDITABLE_RELEASE_BUILDS:-0}"
 BINARIES=(edgepacer edgepacer-manager)
 
 RED='\033[0;31m'
@@ -62,6 +63,8 @@ Environment:
   STAGE_DIR     Docker staging directory (default: .docker-stage)
   CARGO_FLAGS   Additional cargo flags (default: --release)
                 Linux targets also add --features ebpf.
+  AUDITABLE_RELEASE_BUILDS
+                Set to 1 to build binaries with cargo-auditable metadata.
 EOF
 }
 
@@ -84,6 +87,14 @@ check_dependencies() {
         require_command docker "Docker must be installed and running for cross builds"
         "${SCRIPT_DIR}/scripts/ci/verify-cross-runner.sh"
     fi
+
+    if auditable_builds_enabled; then
+        require_command cargo-auditable "Install it with: cargo install cargo-auditable --version 0.7.4 --locked"
+    fi
+}
+
+auditable_builds_enabled() {
+    [[ "${AUDITABLE_RELEASE_BUILDS}" == "1" ]]
 }
 
 setup_target() {
@@ -202,17 +213,32 @@ build_target() {
             local volume_opts="-v edgepacer-cargo-registry-${target_triple}:/usr/local/cargo/registry"
             volume_opts+=" -v edgepacer-cargo-git-${target_triple}:/usr/local/cargo/git"
             local cross_container_opts="${CROSS_CONTAINER_OPTS:-} ${volume_opts}"
+            local rustc_workspace_wrapper="${RUSTC_WORKSPACE_WRAPPER:-}"
 
             if [[ "$platform_name" == windows-* ]]; then
                 # Build-only runs do not need Wine; wineboot can hang under arm64 QEMU.
                 cross_container_opts+=" --entrypoint /usr/bin/env"
             fi
 
-            CROSS_CONTAINER_OPTS="${cross_container_opts}" \
-                cross build ${target_cargo_flags} --target "$target_triple" --bin edgepacer --bin edgepacer-manager
+            if auditable_builds_enabled; then
+                rustc_workspace_wrapper="$(command -v cargo-auditable)"
+            fi
+
+            if [[ -n "${rustc_workspace_wrapper}" ]]; then
+                CROSS_CONTAINER_OPTS="${cross_container_opts}" \
+                    RUSTC_WORKSPACE_WRAPPER="${rustc_workspace_wrapper}" \
+                    cross build ${target_cargo_flags} --target "$target_triple" --bin edgepacer --bin edgepacer-manager
+            else
+                CROSS_CONTAINER_OPTS="${cross_container_opts}" \
+                    cross build ${target_cargo_flags} --target "$target_triple" --bin edgepacer --bin edgepacer-manager
+            fi
             ;;
         darwin-*)
-            cargo build ${target_cargo_flags} --target "$target_triple" --bin edgepacer --bin edgepacer-manager
+            if auditable_builds_enabled; then
+                cargo auditable build ${target_cargo_flags} --target "$target_triple" --bin edgepacer --bin edgepacer-manager
+            else
+                cargo build ${target_cargo_flags} --target "$target_triple" --bin edgepacer --bin edgepacer-manager
+            fi
             ;;
         *)
             log_error "Unsupported target: ${platform_name}"
