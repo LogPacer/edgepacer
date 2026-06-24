@@ -32,9 +32,9 @@ The chart deploys a DaemonSet, RBAC, host log mounts, and optional node-local
 trace Service exposure. Workloads must opt in to app-level collection with the
 `logpacer.com/service-name` pod label.
 
-Set `manager.updatePublicKey` to the hex-encoded Ed25519 release public key to
-enable manager self-updates. Without it, the deployed image runs normally but
-downloaded binary updates are rejected.
+The chart pins `manager.updatePublicKey` to the current Ed25519 release public
+key so manager self-updates verify by default. Override it only when rotating the
+release signing key or publishing a forked release stream.
 
 ## Local Checks
 
