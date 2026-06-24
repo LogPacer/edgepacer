@@ -53,10 +53,10 @@ jobs:
       matrix:
         include:
           - name: Linux amd64
-            runs_on: '"ubuntu-latest"'
+            runs_on: '["self-hosted","Linux","X64","logpacer-ci"]'
             target: linux-amd64
           - name: Linux arm64
-            runs_on: '"ubuntu-latest"'
+            runs_on: '["self-hosted","Linux","X64","logpacer-ci"]'
             target: linux-arm64
           - name: macOS amd64
             runs_on: '"macos-latest"'
@@ -65,7 +65,7 @@ jobs:
             runs_on: '"macos-latest"'
             target: darwin-arm64
           - name: Windows amd64
-            runs_on: '"ubuntu-latest"'
+            runs_on: '["self-hosted","Linux","X64","logpacer-ci"]'
             target: windows-amd64
     steps:
       - uses: actions/checkout@v4
@@ -73,13 +73,13 @@ jobs:
       - name: Normalize Linux Rust paths
         if: runner.os == 'Linux'
         run: |
-          export CARGO_HOME="${HOME}/.cargo"
-          export RUSTUP_HOME="${HOME}/.rustup"
+          export CARGO_HOME="${CARGO_HOME:-${HOME}/.cargo}"
+          export RUSTUP_HOME="${RUSTUP_HOME:-${HOME}/.rustup}"
           export PATH="${CARGO_HOME}/bin:${PATH}"
-          echo "CARGO_HOME=${HOME}/.cargo" >> "$GITHUB_ENV"
-          echo "RUSTUP_HOME=${HOME}/.rustup" >> "$GITHUB_ENV"
-          echo "${HOME}/.cargo/bin" >> "$GITHUB_PATH"
-          if [ ! -x "${HOME}/.cargo/bin/cargo" ] || [ ! -x "${HOME}/.cargo/bin/rustup" ]; then
+          echo "CARGO_HOME=${CARGO_HOME}" >> "$GITHUB_ENV"
+          echo "RUSTUP_HOME=${RUSTUP_HOME}" >> "$GITHUB_ENV"
+          echo "${CARGO_HOME}/bin" >> "$GITHUB_PATH"
+          if [ ! -x "${CARGO_HOME}/bin/cargo" ] || [ ! -x "${CARGO_HOME}/bin/rustup" ]; then
             curl --proto '=https' --tlsv1.2 --retry 10 --retry-connrefused --location --silent --show-error --fail https://sh.rustup.rs |
               sh -s -- --default-toolchain none -y
           fi
@@ -150,13 +150,13 @@ jobs:
 
       - name: Normalize Linux Rust paths
         run: |
-          export CARGO_HOME="${HOME}/.cargo"
-          export RUSTUP_HOME="${HOME}/.rustup"
+          export CARGO_HOME="${CARGO_HOME:-${HOME}/.cargo}"
+          export RUSTUP_HOME="${RUSTUP_HOME:-${HOME}/.rustup}"
           export PATH="${CARGO_HOME}/bin:${PATH}"
-          echo "CARGO_HOME=${HOME}/.cargo" >> "$GITHUB_ENV"
-          echo "RUSTUP_HOME=${HOME}/.rustup" >> "$GITHUB_ENV"
-          echo "${HOME}/.cargo/bin" >> "$GITHUB_PATH"
-          if [ ! -x "${HOME}/.cargo/bin/cargo" ] || [ ! -x "${HOME}/.cargo/bin/rustup" ]; then
+          echo "CARGO_HOME=${CARGO_HOME}" >> "$GITHUB_ENV"
+          echo "RUSTUP_HOME=${RUSTUP_HOME}" >> "$GITHUB_ENV"
+          echo "${CARGO_HOME}/bin" >> "$GITHUB_PATH"
+          if [ ! -x "${CARGO_HOME}/bin/cargo" ] || [ ! -x "${CARGO_HOME}/bin/rustup" ]; then
             curl --proto '=https' --tlsv1.2 --retry 10 --retry-connrefused --location --silent --show-error --fail https://sh.rustup.rs |
               sh -s -- --default-toolchain none -y
           fi
