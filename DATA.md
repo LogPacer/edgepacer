@@ -86,7 +86,8 @@ signature before replacing the running binary.
 
 GitHub Releases are the intended binary source. Each release includes:
 
-- standalone binaries for Linux, macOS, and Windows
+- standalone binaries for Linux and Windows; macOS binaries are built separately
+  when needed
 - `checksums.txt`
 - Sigstore bundle files (`*.sigstore.json`) for customer verification
 - `update-manifest.json`, which Rails can read or cache to answer

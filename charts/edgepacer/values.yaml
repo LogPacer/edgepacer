@@ -22,7 +22,7 @@ logLevel: info
 manager:
   checkIntervalSeconds: 30
   healthTimeoutSeconds: 60
-  updatePublicKey: ""
+  updatePublicKey: "f85508d85da579bb9fec884bb6fc60d1e84b6c3bbfc1add7377e3f0d47a87d53"
   debug: false
   forceUpdate: false
 

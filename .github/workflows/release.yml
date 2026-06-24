@@ -9,21 +9,13 @@ on:
       version:
         description: Release version without the leading v
         required: true
-      include_macos:
-        description: Build hosted macOS release binaries
-        required: false
-        default: false
-        type: boolean
 
 concurrency:
   group: release-${{ github.ref }}
   cancel-in-progress: false
 
 permissions:
-  attestations: write
-  contents: write
-  id-token: write
-  packages: write
+  contents: read
 
 env:
   IMAGE: ghcr.io/logpacer/edgepacer
@@ -32,11 +24,11 @@ env:
 jobs:
   resolve:
     name: Resolve Version
-    runs-on: [self-hosted, Linux, X64, logpacer-ci]
+    runs-on: ubuntu-24.04
+    permissions: {}
     outputs:
       version: ${{ steps.version.outputs.version }}
       tag: ${{ steps.version.outputs.tag }}
-      build_matrix: ${{ steps.matrix.outputs.build_matrix }}
     steps:
       - name: Resolve version
         id: version
@@ -49,49 +41,27 @@ jobs:
           echo "version=${version}" >> "$GITHUB_OUTPUT"
           echo "tag=v${version}" >> "$GITHUB_OUTPUT"
 
-      - name: Resolve build matrix
-        id: matrix
-        env:
-          INCLUDE_MACOS: ${{ inputs.include_macos }}
-        run: |
-          include_macos="${INCLUDE_MACOS:-false}"
-
-          if [ "${include_macos}" = "true" ]; then
-            matrix_json='{"include":[{"name":"Linux amd64","runs_on":"[\"self-hosted\",\"Linux\",\"X64\",\"logpacer-ci\"]","target":"linux-amd64"},{"name":"Linux arm64","runs_on":"[\"self-hosted\",\"Linux\",\"X64\",\"logpacer-ci\"]","target":"linux-arm64"},{"name":"macOS amd64","runs_on":"\"macos-latest\"","target":"darwin-amd64"},{"name":"macOS arm64","runs_on":"\"macos-latest\"","target":"darwin-arm64"},{"name":"Windows amd64","runs_on":"[\"self-hosted\",\"Linux\",\"X64\",\"logpacer-ci\"]","target":"windows-amd64"}]}'
-          else
-            matrix_json='{"include":[{"name":"Linux amd64","runs_on":"[\"self-hosted\",\"Linux\",\"X64\",\"logpacer-ci\"]","target":"linux-amd64"},{"name":"Linux arm64","runs_on":"[\"self-hosted\",\"Linux\",\"X64\",\"logpacer-ci\"]","target":"linux-arm64"},{"name":"Windows amd64","runs_on":"[\"self-hosted\",\"Linux\",\"X64\",\"logpacer-ci\"]","target":"windows-amd64"}]}'
-          fi
-
-          {
-            echo 'build_matrix<<JSON'
-            printf '%s\n' "${matrix_json}"
-            echo 'JSON'
-          } >> "$GITHUB_OUTPUT"
-
   build-binaries:
     name: Build ${{ matrix.name }} Binary
     needs: resolve
-    runs-on: ${{ fromJSON(matrix.runs_on) }}
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    env:
+      AUDITABLE_RELEASE_BUILDS: "1"
     timeout-minutes: 45
     strategy:
       fail-fast: false
-      matrix: ${{ fromJSON(needs.resolve.outputs.build_matrix) }}
+      matrix:
+        include:
+          - name: Linux amd64
+            target: linux-amd64
+          - name: Linux arm64
+            target: linux-arm64
+          - name: Windows amd64
+            target: windows-amd64
     steps:
       - uses: actions/checkout@v4
-
-      - name: Normalize Linux Rust paths
-        if: runner.os == 'Linux'
-        run: |
-          export CARGO_HOME="${CARGO_HOME:-${HOME}/.cargo}"
-          export RUSTUP_HOME="${RUSTUP_HOME:-${HOME}/.rustup}"
-          export PATH="${CARGO_HOME}/bin:${PATH}"
-          echo "CARGO_HOME=${CARGO_HOME}" >> "$GITHUB_ENV"
-          echo "RUSTUP_HOME=${RUSTUP_HOME}" >> "$GITHUB_ENV"
-          echo "${CARGO_HOME}/bin" >> "$GITHUB_PATH"
-          if [ ! -x "${CARGO_HOME}/bin/cargo" ] || [ ! -x "${CARGO_HOME}/bin/rustup" ]; then
-            curl --proto '=https' --tlsv1.2 --retry 10 --retry-connrefused --location --silent --show-error --fail https://sh.rustup.rs |
-              sh -s -- --default-toolchain none -y
-          fi
 
       - uses: dtolnay/rust-toolchain@master
         with:
@@ -102,26 +72,36 @@ jobs:
           key: release-${{ matrix.target }}
           cache-on-failure: true
 
-      - name: Install Linux build tools
-        if: runner.os == 'Linux'
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit
+
+      - name: Install release build tools
         run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends cmake perl
-          # Self-hosted release runners expose Docker through the host socket; cross needs direct access.
-          if ! docker version >/dev/null 2>&1 && [ -S /var/run/docker.sock ]; then
-            sudo chmod a+rw /var/run/docker.sock
-          fi
           docker version
+          if ! cargo install --list | grep -q '^cargo-auditable v0\.7\.4:'; then
+            cargo install cargo-auditable --version 0.7.4 --locked --force
+          fi
           if ! cargo install --list | grep -q '^cross v0\.2\.5:'; then
             cargo install cross --version 0.2.5 --locked --force
           fi
 
-      - name: Install macOS build tools
-        if: runner.os == 'macOS'
-        run: brew install cmake
-
       - name: Build release binaries
         run: scripts/release-package.sh --version "${{ needs.resolve.outputs.version }}" --skip-manifest ${{ matrix.target }}
+
+      - name: Verify auditable release binaries
+        run: |
+          mapfile -d '' release_binaries < <(
+            find dist -maxdepth 1 -type f \
+              \( -name 'edgepacer-${{ matrix.target }}*' -o -name 'edgepacer-manager-${{ matrix.target }}*' \) \
+              ! -name '*.sha256' \
+              -print0
+          )
+          if [ "${#release_binaries[@]}" -eq 0 ]; then
+            echo "no release binaries found for ${{ matrix.target }}" >&2
+            exit 1
+          fi
+          cargo audit bin "${release_binaries[@]}"
 
       - name: Build release manifest tool
         if: matrix.target == 'linux-amd64'
@@ -143,7 +123,7 @@ jobs:
         if: matrix.target == 'linux-amd64'
         uses: actions/upload-artifact@v4
         with:
-          name: release-manifest-tool
+          name: manifest-tool
           path: tools/release-manifest
           if-no-files-found: error
 
@@ -152,42 +132,15 @@ jobs:
     needs:
       - resolve
       - build-binaries
-    runs-on: [self-hosted, Linux, X64, logpacer-ci]
+    runs-on: ubuntu-24.04
+    permissions:
+      attestations: write
+      contents: write
+      id-token: write
+      packages: write
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
-
-      - name: Normalize Linux Rust paths
-        run: |
-          export CARGO_HOME="${CARGO_HOME:-${HOME}/.cargo}"
-          export RUSTUP_HOME="${RUSTUP_HOME:-${HOME}/.rustup}"
-          export PATH="${CARGO_HOME}/bin:${PATH}"
-          echo "CARGO_HOME=${CARGO_HOME}" >> "$GITHUB_ENV"
-          echo "RUSTUP_HOME=${RUSTUP_HOME}" >> "$GITHUB_ENV"
-          echo "${CARGO_HOME}/bin" >> "$GITHUB_PATH"
-          if [ ! -x "${CARGO_HOME}/bin/cargo" ] || [ ! -x "${CARGO_HOME}/bin/rustup" ]; then
-            curl --proto '=https' --tlsv1.2 --retry 10 --retry-connrefused --location --silent --show-error --fail https://sh.rustup.rs |
-              sh -s -- --default-toolchain none -y
-          fi
-
-      - uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: "1.95.0"
-
-      - uses: Swatinem/rust-cache@v2
-        with:
-          key: release-publish
-          cache-on-failure: true
-
-      - name: Install build tools
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends cmake perl protobuf-compiler
-          # Self-hosted release runners expose Docker through the host socket; Buildx needs direct access.
-          if ! docker version >/dev/null 2>&1 && [ -S /var/run/docker.sock ]; then
-            sudo chmod a+rw /var/run/docker.sock
-          fi
-          docker version
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -206,6 +159,24 @@ jobs:
           pattern: release-*
           path: dist
           merge-multiple: true
+
+      - name: Download release manifest tool
+        uses: actions/download-artifact@v4
+        with:
+          name: manifest-tool
+          path: dist/tools
+
+      - name: Resolve release manifest tool
+        id: manifest_tool
+        run: |
+          manifest_tool="$(find dist/tools -type f -name release-manifest -print -quit)"
+          if [ -z "${manifest_tool}" ]; then
+            echo "failed to find downloaded release-manifest tool" >&2
+            find dist/tools -maxdepth 3 -type f -print >&2
+            exit 1
+          fi
+          chmod 0555 "${manifest_tool}"
+          echo "path=${manifest_tool}" >> "$GITHUB_OUTPUT"
 
       - name: Stage image binaries
         run: |
@@ -293,6 +264,7 @@ jobs:
             --tag "${{ needs.resolve.outputs.tag }}" \
             --repository "${{ github.repository }}" \
             --dist-dir dist \
+            --manifest-tool "${{ steps.manifest_tool.outputs.path }}" \
             --sign-blobs
 
       - name: Attest release binary provenance
