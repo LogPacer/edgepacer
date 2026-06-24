@@ -21,13 +21,18 @@ log_success() { echo -e "${GREEN}[SUCCESS]${NC} $*"; }
 log_warn() { echo -e "${YELLOW}[WARN]${NC} $*"; }
 log_error() { echo -e "${RED}[ERROR]${NC} $*" >&2; }
 
-declare -A TARGETS=(
-    ["linux-amd64"]="x86_64-unknown-linux-musl"
-    ["linux-arm64"]="aarch64-unknown-linux-musl"
-    ["darwin-amd64"]="x86_64-apple-darwin"
-    ["darwin-arm64"]="aarch64-apple-darwin"
-    ["windows-amd64"]="x86_64-pc-windows-gnu"
-)
+target_triple_for_platform() {
+    local platform_name="$1"
+
+    case "$platform_name" in
+        linux-amd64) echo "x86_64-unknown-linux-musl" ;;
+        linux-arm64) echo "aarch64-unknown-linux-musl" ;;
+        darwin-amd64) echo "x86_64-apple-darwin" ;;
+        darwin-arm64) echo "aarch64-apple-darwin" ;;
+        windows-amd64) echo "x86_64-pc-windows-gnu" ;;
+        *) return 1 ;;
+    esac
+}
 
 show_help() {
     cat <<EOF
@@ -112,9 +117,10 @@ docker_arch_for_target() {
 
 stage_binaries() {
     local platform_name="$1"
-    local target_triple="${TARGETS[$platform_name]}"
+    local target_triple
     local docker_arch
 
+    target_triple="$(target_triple_for_platform "$platform_name")" || return 1
     docker_arch="$(docker_arch_for_target "$platform_name")" || return 0
 
     mkdir -p "${STAGE_DIR}/${docker_arch}"
@@ -136,8 +142,9 @@ binary_extension_for_target() {
 
 collect_artifacts() {
     local platform_name="$1"
-    local target_triple="${TARGETS[$platform_name]}"
+    local target_triple
     local binary_extension
+    target_triple="$(target_triple_for_platform "$platform_name")" || return 1
     binary_extension="$(binary_extension_for_target "$platform_name")"
 
     mkdir -p "${OUTPUT_DIR}"
@@ -171,9 +178,13 @@ needs_cross() {
 
 build_target() {
     local platform_name="$1"
-    local target_triple="${TARGETS[$platform_name]}"
+    local target_triple
     local target_cargo_flags="${CARGO_FLAGS}"
     local start_time
+    target_triple="$(target_triple_for_platform "$platform_name")" || {
+        log_error "Unsupported target: ${platform_name}"
+        return 1
+    }
     start_time="$(date +%s)"
 
     log_info "Building ${platform_name} (${target_triple})"
