@@ -178,6 +178,7 @@ jobs:
         run: cosign sign --yes "${{ steps.image.outputs.ref }}"
 
       - name: Attest image provenance
+        if: ${{ github.event.repository.private == false }}
         uses: actions/attest@v4
         with:
           subject-name: ${{ env.IMAGE }}
@@ -211,6 +212,7 @@ jobs:
         run: cosign sign --yes "${{ steps.chart.outputs.ref }}"
 
       - name: Attest chart provenance
+        if: ${{ github.event.repository.private == false }}
         uses: actions/attest@v4
         with:
           subject-name: ${{ steps.chart.outputs.name }}
@@ -232,6 +234,7 @@ jobs:
             --dist-dir dist
 
       - name: Attest release binary provenance
+        if: ${{ github.event.repository.private == false }}
         uses: actions/attest@v4
         with:
           subject-path: |
