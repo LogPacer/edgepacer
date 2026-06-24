@@ -44,22 +44,29 @@ jobs:
           echo "tag=v${version}" >> "$GITHUB_OUTPUT"
 
   build-binaries:
-    name: Build ${{ matrix.name }} Binaries
+    name: Build ${{ matrix.name }} Binary
     needs: resolve
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
         include:
-          - name: Linux
+          - name: Linux amd64
             os: ubuntu-latest
-            targets: linux-amd64 linux-arm64
-          - name: macOS
+            target: linux-amd64
+          - name: Linux arm64
+            os: ubuntu-latest
+            target: linux-arm64
+          - name: macOS amd64
             os: macos-latest
-            targets: darwin-amd64 darwin-arm64
-          - name: Windows
+            target: darwin-amd64
+          - name: macOS arm64
+            os: macos-latest
+            target: darwin-arm64
+          - name: Windows amd64
             os: ubuntu-latest
-            targets: windows-amd64
+            target: windows-amd64
     steps:
       - uses: actions/checkout@v4
 
@@ -69,7 +76,7 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
         with:
-          key: release-${{ matrix.name }}
+          key: release-${{ matrix.target }}
           cache-on-failure: true
 
       - name: Install Linux build tools
@@ -84,12 +91,12 @@ jobs:
         run: brew install cmake
 
       - name: Build release binaries
-        run: VERSION="${{ needs.resolve.outputs.version }}" OUTPUT_DIR=dist ./build-all.sh ${{ matrix.targets }}
+        run: VERSION="${{ needs.resolve.outputs.version }}" OUTPUT_DIR=dist ./build-all.sh ${{ matrix.target }}
 
       - name: Upload release binaries
         uses: actions/upload-artifact@v4
         with:
-          name: release-${{ matrix.name }}
+          name: release-${{ matrix.target }}
           path: |
             dist/edgepacer-*
             dist/edgepacer-manager-*
