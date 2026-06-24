@@ -44,7 +44,7 @@ httlib-hpack = { version = "0.1", default-features = false }
 # Wire format
 # Shared wire format for internal LogPacer traffic
 logpacer_wire = { path = "crates/logpacer_wire", version = "0.1.0" }
-prost = "0.13"
+prost = "0.14"
 
 # Trace proxy
 axum = "0.8"
