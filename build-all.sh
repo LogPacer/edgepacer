@@ -2,6 +2,8 @@
 
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
 unset RUSTUP_TOOLCHAIN
 
 VERSION="${VERSION:-$(grep '^version' Cargo.toml | head -1 | cut -d'"' -f2)}"
@@ -80,6 +82,7 @@ check_dependencies() {
     if needs_cross "$@"; then
         require_command cross "Install it with: cargo install cross"
         require_command docker "Docker must be installed and running for cross builds"
+        "${SCRIPT_DIR}/scripts/ci/verify-cross-runner.sh"
     fi
 }
 
