@@ -213,21 +213,16 @@ build_target() {
             local volume_opts="-v edgepacer-cargo-registry-${target_triple}:/usr/local/cargo/registry"
             volume_opts+=" -v edgepacer-cargo-git-${target_triple}:/usr/local/cargo/git"
             local cross_container_opts="${CROSS_CONTAINER_OPTS:-} ${volume_opts}"
-            local rustc_workspace_wrapper="${RUSTC_WORKSPACE_WRAPPER:-}"
-
             if [[ "$platform_name" == windows-* ]]; then
                 # Build-only runs do not need Wine; wineboot can hang under arm64 QEMU.
                 cross_container_opts+=" --entrypoint /usr/bin/env"
             fi
 
             if auditable_builds_enabled; then
-                rustc_workspace_wrapper="$(command -v cargo-auditable)"
-            fi
-
-            if [[ -n "${rustc_workspace_wrapper}" ]]; then
+                # Cargo overwrites CARGO for subcommands; invoke cargo-auditable directly so it can delegate to cross.
                 CROSS_CONTAINER_OPTS="${cross_container_opts}" \
-                    RUSTC_WORKSPACE_WRAPPER="${rustc_workspace_wrapper}" \
-                    cross build ${target_cargo_flags} --target "$target_triple" --bin edgepacer --bin edgepacer-manager
+                    CARGO=cross \
+                    cargo-auditable auditable build ${target_cargo_flags} --target "$target_triple" --bin edgepacer --bin edgepacer-manager
             else
                 CROSS_CONTAINER_OPTS="${cross_container_opts}" \
                     cross build ${target_cargo_flags} --target "$target_triple" --bin edgepacer --bin edgepacer-manager
