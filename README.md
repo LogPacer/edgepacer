@@ -62,7 +62,8 @@ cargo clippy --features ebpf --all-targets -- -D warnings
   `edgepacer-windows-amd64.exe`
 
 Release tags publish the container image, Helm chart, standalone binaries,
-checksums, Sigstore bundles, and `update-manifest.json` through GitHub Actions.
+checksums, Sigstore bundles, `LICENSE-3rdparty.csv`, and
+`update-manifest.json` through GitHub Actions.
 macOS binaries are not built by the automated release yet. To build them from a
 Mac when needed:
 
@@ -76,7 +77,8 @@ scripts/release-package.sh --version "${VERSION}" --skip-manifest darwin-amd64 d
 Release images, charts, and standalone binaries are signed keylessly with
 Sigstore from the GitHub Actions release workflow and receive GitHub provenance
 attestations. Standalone binaries are also listed in `checksums.txt` and in the
-Ed25519-signed `update-manifest.json` used by manager self-updates.
+Ed25519-signed `update-manifest.json` used by manager self-updates. Rust
+dependency attribution is published in `LICENSE-3rdparty.csv`.
 
 ```bash
 VERSION=0.1.9

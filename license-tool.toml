@@ -1,0 +1,3 @@
+[overrides]
+"bollard-stubs" = { origin = "https://github.com/fussybeaver/bollard" }
+"rsqlite-vfs" = { origin = "https://github.com/Spxg/sqlite-wasm-rs" }
