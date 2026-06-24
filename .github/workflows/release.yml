@@ -124,7 +124,6 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends cmake perl protobuf-compiler
-          cargo install cross --locked
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -135,7 +134,22 @@ jobs:
       - name: Install cosign
         uses: sigstore/cosign-installer@v3
         with:
-          cosign-release: "v3.0.2"
+          cosign-release: "v2.5.3"
+
+      - name: Download release binaries
+        uses: actions/download-artifact@v4
+        with:
+          pattern: release-*
+          path: dist
+          merge-multiple: true
+
+      - name: Stage image binaries
+        run: |
+          mkdir -p .docker-stage/amd64 .docker-stage/arm64
+          install -m 0555 dist/edgepacer-linux-amd64 .docker-stage/amd64/edgepacer
+          install -m 0555 dist/edgepacer-manager-linux-amd64 .docker-stage/amd64/edgepacer-manager
+          install -m 0555 dist/edgepacer-linux-arm64 .docker-stage/arm64/edgepacer
+          install -m 0555 dist/edgepacer-manager-linux-arm64 .docker-stage/arm64/edgepacer-manager
 
       - name: Login to GHCR
         run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
@@ -143,7 +157,6 @@ jobs:
       - name: Build and push image
         run: |
           scripts/container-image.sh \
-            --build-binaries \
             --push \
             --image "${IMAGE}" \
             --tag "${{ needs.resolve.outputs.version }}" \
@@ -203,13 +216,6 @@ jobs:
           subject-name: ${{ steps.chart.outputs.name }}
           subject-digest: ${{ steps.chart.outputs.digest }}
           push-to-registry: true
-
-      - name: Download release binaries
-        uses: actions/download-artifact@v4
-        with:
-          pattern: release-*
-          path: dist
-          merge-multiple: true
 
       - name: Generate signed update manifest
         env:
