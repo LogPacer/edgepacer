@@ -1,11 +1,11 @@
 [target.x86_64-unknown-linux-musl]
-image = "ghcr.io/cross-rs/x86_64-unknown-linux-musl:main"
+image = "ghcr.io/cross-rs/x86_64-unknown-linux-musl:0.2.5"
 pre-build = ["DEBIAN_FRONTEND=noninteractive apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y protobuf-compiler cmake perl"]
 
 [target.aarch64-unknown-linux-musl]
-image = "ghcr.io/cross-rs/aarch64-unknown-linux-musl:main"
+image = "ghcr.io/cross-rs/aarch64-unknown-linux-musl:0.2.5"
 pre-build = ["DEBIAN_FRONTEND=noninteractive apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y protobuf-compiler cmake perl clang"]
 
 [target.x86_64-pc-windows-gnu]
-image = "ghcr.io/cross-rs/x86_64-pc-windows-gnu:main"
+image = "ghcr.io/cross-rs/x86_64-pc-windows-gnu:0.2.5"
 pre-build = ["DEBIAN_FRONTEND=noninteractive apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y protobuf-compiler cmake perl"]
