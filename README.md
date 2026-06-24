@@ -63,8 +63,8 @@ cargo clippy --features ebpf --all-targets -- -D warnings
 
 Release tags publish the container image, Helm chart, standalone binaries,
 checksums, Sigstore bundles, and `update-manifest.json` through GitHub Actions.
-macOS binaries are skipped by default so releases do not allocate hosted macOS
-runners. To build them from a Mac when needed:
+macOS binaries are not built by the automated release yet. To build them from a
+Mac when needed:
 
 ```bash
 VERSION=0.1.9
