@@ -46,26 +46,26 @@ jobs:
   build-binaries:
     name: Build ${{ matrix.name }} Binary
     needs: resolve
-    runs-on: ${{ matrix.os }}
+    runs-on: ${{ fromJSON(matrix.runs_on) }}
     timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
         include:
           - name: Linux amd64
-            os: ubuntu-latest
+            runs_on: '["self-hosted","Linux","X64","logpacer-ci"]'
             target: linux-amd64
           - name: Linux arm64
-            os: ubuntu-latest
+            runs_on: '["self-hosted","Linux","X64","logpacer-ci"]'
             target: linux-arm64
           - name: macOS amd64
-            os: macos-latest
+            runs_on: '"macos-latest"'
             target: darwin-amd64
           - name: macOS arm64
-            os: macos-latest
+            runs_on: '"macos-latest"'
             target: darwin-arm64
           - name: Windows amd64
-            os: ubuntu-latest
+            runs_on: '["self-hosted","Linux","X64","logpacer-ci"]'
             target: windows-amd64
     steps:
       - uses: actions/checkout@v4
@@ -122,7 +122,7 @@ jobs:
     needs:
       - resolve
       - build-binaries
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, Linux, X64, logpacer-ci]
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
