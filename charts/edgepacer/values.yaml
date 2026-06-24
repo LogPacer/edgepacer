@@ -1,0 +1,162 @@
+image:
+  repository: ghcr.io/logpacer/edgepacer
+  tag: latest
+  pullPolicy: Always
+
+imagePullSecrets: []
+
+nameOverride: ""
+fullnameOverride: ""
+
+controlPlane:
+  railsUrl: https://app.logpacer.com
+
+auth:
+  existingSecret: edgepacer-auth
+  accountTokenKey: account-token
+  createSecret: false
+  accountToken: ""
+
+logLevel: info
+
+manager:
+  checkIntervalSeconds: 30
+  healthTimeoutSeconds: 60
+  updatePublicKey: ""
+  debug: false
+  forceUpdate: false
+
+agent:
+  resourceId: ""
+  pollIntervalSeconds: 30
+  bufferCacheMb: ""
+  shipBatchMaxMb: ""
+
+rbac:
+  create: true
+  extraRules: []
+
+serviceAccount:
+  create: true
+  name: ""
+  annotations: {}
+
+podAnnotations: {}
+podLabels: {}
+
+priorityClassName: ""
+
+hostNetwork: false
+hostPID: true
+dnsPolicy: ClusterFirst
+
+nodeSelector: {}
+
+tolerations:
+  - key: node-role.kubernetes.io/control-plane
+    operator: Exists
+    effect: NoSchedule
+  - key: node-role.kubernetes.io/master
+    operator: Exists
+    effect: NoSchedule
+
+affinity: {}
+
+podSecurityContext:
+  fsGroup: 65532
+  fsGroupChangePolicy: OnRootMismatch
+
+securityContext:
+  runAsUser: 65532
+  runAsGroup: 65532
+  readOnlyRootFilesystem: true
+  allowPrivilegeEscalation: false
+  privileged: false
+  capabilities:
+    drop:
+      - ALL
+    add:
+      - DAC_READ_SEARCH
+
+ebpf:
+  enabled: false
+  capabilities:
+    add:
+      - BPF
+      - PERFMON
+      - SYS_RESOURCE
+
+resources:
+  requests:
+    cpu: 100m
+    memory: 128Mi
+  limits:
+    cpu: 500m
+    memory: 512Mi
+
+state:
+  prepareImage:
+    repository: docker.io/library/alpine
+    tag: "3.22"
+    pullPolicy: IfNotPresent
+  hostPath:
+    enabled: true
+    path: /var/lib/edgepacer
+
+hostLogs:
+  varLog:
+    enabled: true
+    path: /var/log
+    mountPath: /var/log
+  podLogs:
+    enabled: false
+    path: /var/log/pods
+    mountPath: /var/log/pods
+  # Must point under one of the enabled host log mounts.
+  podLogsDir: /var/log/pods
+
+runtimeSockets:
+  crictl:
+    # containerd/CRI-O discovery shells out to crictl today. The default image
+    # includes cri-tools; set false when using a custom image without crictl.
+    imageHasBinary: true
+  docker:
+    enabled: false
+    path: /var/run/docker.sock
+  containerd:
+    enabled: false
+    path: /run/containerd/containerd.sock
+  crio:
+    enabled: false
+    path: /run/crio/crio.sock
+
+traces:
+  service:
+    enabled: false
+    type: ClusterIP
+    # Local routes each pod to the EdgePacer endpoint on its own node when the
+    # DaemonSet has one ready endpoint per node.
+    internalTrafficPolicy: Local
+    annotations: {}
+  otlpHttp:
+    # Publishes the OTLP HTTP port only. The trace proxy listener itself is
+    # started from LogPacer control-plane config. DaemonSet Service/hostPort
+    # exposure requires that listener to bind a non-loopback address such as
+    # 0.0.0.0:4318; 127.0.0.1 is for sidecar/localhost mode.
+    enabled: false
+    listenerConfiguredByControlPlane: false
+    port: 4318
+    hostPort: null
+  networkPolicy:
+    enabled: false
+    # Defaults to same-namespace pods only. Set an explicit namespace selector
+    # for workload namespaces that should reach the DaemonSet trace Service.
+    fromNamespaceSelector: null
+    fromPodSelector:
+      matchExpressions:
+        - key: logpacer.com/service-name
+          operator: Exists
+
+extraEnv: []
+extraVolumes: []
+extraVolumeMounts: []

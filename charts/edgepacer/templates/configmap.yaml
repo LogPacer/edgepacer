@@ -1,0 +1,15 @@
+{{- include "edgepacer.validateValues" . -}}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "edgepacer.fullname" . }}
+  labels:
+    {{- include "edgepacer.labels" . | nindent 4 }}
+data:
+  EDGEPACER_RAILS_URL: {{ .Values.controlPlane.railsUrl | quote }}
+  EDGEPACER_LOG_LEVEL: {{ .Values.logLevel | quote }}
+  EDGEPACER_CHECK_INTERVAL: {{ .Values.manager.checkIntervalSeconds | quote }}
+  EDGEPACER_HEALTH_TIMEOUT: {{ .Values.manager.healthTimeoutSeconds | quote }}
+  EDGEPACER_UPDATE_PUBLIC_KEY: {{ .Values.manager.updatePublicKey | quote }}
+  EDGEPACER_POLL_INTERVAL: {{ .Values.agent.pollIntervalSeconds | quote }}
+  POD_LOGS_DIR: {{ .Values.hostLogs.podLogsDir | quote }}

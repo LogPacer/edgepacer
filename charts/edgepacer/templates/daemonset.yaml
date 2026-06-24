@@ -1,0 +1,289 @@
+{{- include "edgepacer.validateValues" . -}}
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: {{ include "edgepacer.fullname" . }}
+  labels:
+    {{- include "edgepacer.labels" . | nindent 4 }}
+spec:
+  selector:
+    matchLabels:
+      {{- include "edgepacer.selectorLabels" . | nindent 6 }}
+  updateStrategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 1
+  template:
+    metadata:
+      labels:
+        {{- include "edgepacer.selectorLabels" . | nindent 8 }}
+        {{- with .Values.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      {{- with .Values.podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+    spec:
+      serviceAccountName: {{ include "edgepacer.serviceAccountName" . }}
+      hostNetwork: {{ .Values.hostNetwork }}
+      hostPID: {{ .Values.hostPID }}
+      dnsPolicy: {{ ternary "ClusterFirstWithHostNet" .Values.dnsPolicy .Values.hostNetwork }}
+      {{- with .Values.priorityClassName }}
+      priorityClassName: {{ . | quote }}
+      {{- end }}
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.podSecurityContext }}
+      securityContext:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- if and .Values.state.hostPath.enabled (ne (toString .Values.securityContext.runAsUser) "0") }}
+      initContainers:
+        - name: prepare-state
+          image: "{{ .Values.state.prepareImage.repository }}:{{ .Values.state.prepareImage.tag }}"
+          imagePullPolicy: {{ .Values.state.prepareImage.pullPolicy }}
+          command:
+            - /bin/sh
+            - -c
+            - chown -R {{ .Values.securityContext.runAsUser }}:{{ .Values.securityContext.runAsGroup }} /var/lib/edgepacer
+          securityContext:
+            runAsUser: 0
+            runAsGroup: 0
+            readOnlyRootFilesystem: true
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+              add:
+                - CHOWN
+                - DAC_OVERRIDE
+                - DAC_READ_SEARCH
+          volumeMounts:
+            - name: state
+              mountPath: /var/lib/edgepacer
+      {{- end }}
+      containers:
+        - name: edgepacer
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          {{- if or .Values.manager.debug .Values.manager.forceUpdate }}
+          args:
+            {{- if .Values.manager.debug }}
+            - --debug
+            {{- end }}
+            {{- if .Values.manager.forceUpdate }}
+            - --force-update
+            {{- end }}
+          {{- end }}
+          env:
+            - name: EDGEPACER_RAILS_URL
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "edgepacer.fullname" . }}
+                  key: EDGEPACER_RAILS_URL
+            - name: EDGEPACER_ACCOUNT_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "edgepacer.secretName" . }}
+                  key: {{ .Values.auth.accountTokenKey }}
+            - name: EDGEPACER_LOG_LEVEL
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "edgepacer.fullname" . }}
+                  key: EDGEPACER_LOG_LEVEL
+            - name: EDGEPACER_CHECK_INTERVAL
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "edgepacer.fullname" . }}
+                  key: EDGEPACER_CHECK_INTERVAL
+            - name: EDGEPACER_HEALTH_TIMEOUT
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "edgepacer.fullname" . }}
+                  key: EDGEPACER_HEALTH_TIMEOUT
+            - name: EDGEPACER_UPDATE_PUBLIC_KEY
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "edgepacer.fullname" . }}
+                  key: EDGEPACER_UPDATE_PUBLIC_KEY
+            - name: EDGEPACER_POLL_INTERVAL
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "edgepacer.fullname" . }}
+                  key: EDGEPACER_POLL_INTERVAL
+            - name: EDGEPACER_PATH
+              value: /app/edgepacer
+            - name: XDG_CACHE_HOME
+              value: /var/lib
+            - name: EDGEPACER_STATE_DIR
+              value: /var/lib/edgepacer
+            - name: POD_LOGS_DIR
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "edgepacer.fullname" . }}
+                  key: POD_LOGS_DIR
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            {{- with .Values.agent.resourceId }}
+            - name: EDGEPACER_RESOURCE_ID
+              value: {{ . | quote }}
+            {{- end }}
+            {{- with .Values.agent.bufferCacheMb }}
+            - name: EDGEPACER_BUFFER_CACHE_MB
+              value: {{ . | quote }}
+            {{- end }}
+            {{- with .Values.agent.shipBatchMaxMb }}
+            - name: EDGEPACER_SHIP_BATCH_MAX_MB
+              value: {{ . | quote }}
+            {{- end }}
+            {{- if and .Values.runtimeSockets.containerd.enabled .Values.runtimeSockets.crictl.imageHasBinary }}
+            - name: CONTAINER_RUNTIME_ENDPOINT
+              value: {{ printf "unix://%s" .Values.runtimeSockets.containerd.path | quote }}
+            {{- end }}
+            {{- if and .Values.runtimeSockets.crio.enabled .Values.runtimeSockets.crictl.imageHasBinary }}
+            - name: CONTAINER_RUNTIME_ENDPOINT
+              value: {{ printf "unix://%s" .Values.runtimeSockets.crio.path | quote }}
+            {{- end }}
+            {{- with .Values.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          {{- if and .Values.traces.otlpHttp.enabled .Values.traces.otlpHttp.listenerConfiguredByControlPlane }}
+          ports:
+            - name: otlp-http
+              containerPort: {{ .Values.traces.otlpHttp.port }}
+              protocol: TCP
+              {{- with .Values.traces.otlpHttp.hostPort }}
+              hostPort: {{ . }}
+              {{- end }}
+          {{- end }}
+          {{- $containerSecurityContext := deepCopy .Values.securityContext }}
+          {{- if .Values.ebpf.enabled }}
+          {{- $containerCapabilities := deepCopy (default dict $containerSecurityContext.capabilities) }}
+          {{- $containerCapabilityAdds := concat (default list $containerCapabilities.add) .Values.ebpf.capabilities.add | uniq }}
+          {{- $_ := set $containerCapabilities "add" $containerCapabilityAdds }}
+          {{- $_ = set $containerSecurityContext "capabilities" $containerCapabilities }}
+          {{- end }}
+          securityContext:
+            {{- toYaml $containerSecurityContext | nindent 12 }}
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+          volumeMounts:
+            - name: state
+              mountPath: /var/lib/edgepacer
+            - name: tmp
+              mountPath: /tmp
+            {{- if .Values.hostLogs.varLog.enabled }}
+            - name: host-var-log
+              mountPath: {{ .Values.hostLogs.varLog.mountPath }}
+              readOnly: true
+            {{- end }}
+            {{- if .Values.hostLogs.podLogs.enabled }}
+            - name: host-pod-logs
+              mountPath: {{ .Values.hostLogs.podLogs.mountPath }}
+              readOnly: true
+            {{- end }}
+            {{- if .Values.runtimeSockets.docker.enabled }}
+            - name: docker-sock
+              mountPath: {{ .Values.runtimeSockets.docker.path }}
+              readOnly: true
+            {{- end }}
+            {{- if and .Values.runtimeSockets.containerd.enabled .Values.runtimeSockets.crictl.imageHasBinary }}
+            - name: containerd-sock
+              mountPath: {{ .Values.runtimeSockets.containerd.path }}
+              readOnly: true
+            {{- end }}
+            {{- if and .Values.runtimeSockets.crio.enabled .Values.runtimeSockets.crictl.imageHasBinary }}
+            - name: crio-sock
+              mountPath: {{ .Values.runtimeSockets.crio.path }}
+              readOnly: true
+            {{- end }}
+            {{- with .Values.extraVolumeMounts }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          livenessProbe:
+            exec:
+              command:
+                - /bin/sh
+                - -c
+                - pidof edgepacer-manager >/dev/null
+            initialDelaySeconds: 30
+            periodSeconds: 30
+            timeoutSeconds: 5
+          readinessProbe:
+            exec:
+              command:
+                - /bin/sh
+                - -c
+                - ls /tmp/edgepacer-ready-* >/dev/null 2>&1
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            timeoutSeconds: 3
+      volumes:
+        - name: state
+          {{- if .Values.state.hostPath.enabled }}
+          hostPath:
+            path: {{ .Values.state.hostPath.path }}
+            type: DirectoryOrCreate
+          {{- else }}
+          emptyDir: {}
+          {{- end }}
+        - name: tmp
+          emptyDir: {}
+        {{- if .Values.hostLogs.varLog.enabled }}
+        - name: host-var-log
+          hostPath:
+            path: {{ .Values.hostLogs.varLog.path }}
+            type: Directory
+        {{- end }}
+        {{- if .Values.hostLogs.podLogs.enabled }}
+        - name: host-pod-logs
+          hostPath:
+            path: {{ .Values.hostLogs.podLogs.path }}
+            type: Directory
+        {{- end }}
+        {{- if .Values.runtimeSockets.docker.enabled }}
+        - name: docker-sock
+          hostPath:
+            path: {{ .Values.runtimeSockets.docker.path }}
+            type: Socket
+        {{- end }}
+        {{- if and .Values.runtimeSockets.containerd.enabled .Values.runtimeSockets.crictl.imageHasBinary }}
+        - name: containerd-sock
+          hostPath:
+            path: {{ .Values.runtimeSockets.containerd.path }}
+            type: Socket
+        {{- end }}
+        {{- if and .Values.runtimeSockets.crio.enabled .Values.runtimeSockets.crictl.imageHasBinary }}
+        - name: crio-sock
+          hostPath:
+            path: {{ .Values.runtimeSockets.crio.path }}
+            type: Socket
+        {{- end }}
+        {{- with .Values.extraVolumes }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}

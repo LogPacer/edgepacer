@@ -1,0 +1,10 @@
+target/
+dist/
+.docker-stage/
+.idea/
+.env
+.env.*
+/.worktrees
+.DS_Store
+*.tgz
+tmp/

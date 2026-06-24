@@ -1,0 +1,13 @@
+# Build this crate to BPF bytecode by default. `cargo +nightly build` here
+# produces target/bpfel-unknown-none/<profile>/proof-ebpf (a BPF ELF object).
+[build]
+target = "bpfel-unknown-none"
+
+[target.bpfel-unknown-none]
+linker = "bpf-linker"
+# Emit BTF for the program so aya can load map definitions and do CO-RE.
+rustflags = ["-C", "link-arg=--btf"]
+
+[unstable]
+# Compile `core` for the BPF target (requires the rust-src component on nightly).
+build-std = ["core"]

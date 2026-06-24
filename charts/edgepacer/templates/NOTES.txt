@@ -1,0 +1,19 @@
+EdgePacer DaemonSet chart rendered.
+
+If auth.createSecret=false, create the token secret before installing:
+
+  kubectl create secret generic {{ .Values.auth.existingSecret }} \
+    --namespace {{ .Release.Namespace }} \
+    --from-literal={{ .Values.auth.accountTokenKey }}=YOUR_LOGPACER_ACCOUNT_TOKEN
+
+Workloads are collected only when they opt in with explicit service metadata:
+
+  metadata:
+    annotations:
+      logpacer.com/service-name: checkout
+    labels:
+      logpacer.com/service-name: checkout
+
+Render raw YAML for review without applying it:
+
+  helm template {{ .Release.Name }} {{ .Chart.Name }} --namespace {{ .Release.Namespace }}

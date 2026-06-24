@@ -1,0 +1,27 @@
+[package]
+name = "edgepacer-ebpf"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+
+# Standalone workspace: this crate is built for `bpfel-unknown-none`, never for
+# the host, so it must not attach to the parent (host) workspace.
+[workspace]
+
+[[bin]]
+name = "edgepacer-ebpf"
+path = "src/main.rs"
+
+[dependencies]
+aya-ebpf = "0.1"
+edgepacer-ebpf-common = { path = "../bpf-common", version = "0.1.0" }
+
+# BPF programs must be optimized (the verifier rejects the unoptimized stack
+# blowup) and carry debuginfo so bpf-linker can emit BTF (`--btf` link-arg).
+[profile.dev]
+opt-level = 3
+debug = 2
+
+[profile.release]
+opt-level = 3
+debug = 2

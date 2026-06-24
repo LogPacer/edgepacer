@@ -1,0 +1,11 @@
+apiVersion: v2
+name: edgepacer
+description: EdgePacer Kubernetes DaemonSet agent for LogPacer
+type: application
+version: 0.1.0
+appVersion: "latest"
+home: https://logpacer.com
+sources:
+  - https://github.com/LogPacer/edgepacer
+annotations:
+  org.opencontainers.image.source: https://github.com/LogPacer/edgepacer
