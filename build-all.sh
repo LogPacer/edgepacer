@@ -219,6 +219,10 @@ build_target() {
             fi
 
             if auditable_builds_enabled; then
+                local cargo_auditable_bin_dir
+                cargo_auditable_bin_dir="$(cd "$(dirname "$(command -v cargo-auditable)")" && pwd)"
+                cross_container_opts+=" -v ${cargo_auditable_bin_dir}:${cargo_auditable_bin_dir}:ro"
+
                 # Cargo overwrites CARGO for subcommands; invoke cargo-auditable directly so it can delegate to cross.
                 CROSS_CONTAINER_OPTS="${cross_container_opts}" \
                     CARGO=cross \
