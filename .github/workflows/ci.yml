@@ -30,6 +30,10 @@ jobs:
           toolchain: "1.95.0"
           components: rustfmt, clippy
 
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+
       - name: Format
         run: cargo fmt --all -- --check
 
@@ -56,6 +60,10 @@ jobs:
           toolchain: "1.95.0"
           components: clippy
 
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+
       - name: Clippy eBPF feature
         run: cargo clippy --features ebpf --all-targets -- -D warnings
 
@@ -69,6 +77,12 @@ jobs:
         with:
           toolchain: nightly-2026-05-27
           components: rust-src, llvm-tools-preview
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            bpf -> target
+          cache-on-failure: true
 
       - name: Install bpf-linker
         uses: taiki-e/install-action@v2
