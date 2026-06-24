@@ -18,9 +18,22 @@ env:
 jobs:
   rust:
     name: Rust
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, Linux, X64, logpacer-ci]
     steps:
       - uses: actions/checkout@v4
+
+      - name: Normalize Linux Rust paths
+        run: |
+          export CARGO_HOME="${CARGO_HOME:-${HOME}/.cargo}"
+          export RUSTUP_HOME="${RUSTUP_HOME:-${HOME}/.rustup}"
+          export PATH="${CARGO_HOME}/bin:${PATH}"
+          echo "CARGO_HOME=${CARGO_HOME}" >> "$GITHUB_ENV"
+          echo "RUSTUP_HOME=${RUSTUP_HOME}" >> "$GITHUB_ENV"
+          echo "${CARGO_HOME}/bin" >> "$GITHUB_PATH"
+          if [ ! -x "${CARGO_HOME}/bin/cargo" ] || [ ! -x "${CARGO_HOME}/bin/rustup" ]; then
+            curl --proto '=https' --tlsv1.2 --retry 10 --retry-connrefused --location --silent --show-error --fail https://sh.rustup.rs |
+              sh -s -- --default-toolchain none -y
+          fi
 
       - name: Install system packages
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends cmake perl protobuf-compiler
@@ -48,9 +61,22 @@ jobs:
 
   ebpf:
     name: Rust eBPF Feature
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, Linux, X64, logpacer-ci]
     steps:
       - uses: actions/checkout@v4
+
+      - name: Normalize Linux Rust paths
+        run: |
+          export CARGO_HOME="${CARGO_HOME:-${HOME}/.cargo}"
+          export RUSTUP_HOME="${RUSTUP_HOME:-${HOME}/.rustup}"
+          export PATH="${CARGO_HOME}/bin:${PATH}"
+          echo "CARGO_HOME=${CARGO_HOME}" >> "$GITHUB_ENV"
+          echo "RUSTUP_HOME=${RUSTUP_HOME}" >> "$GITHUB_ENV"
+          echo "${CARGO_HOME}/bin" >> "$GITHUB_PATH"
+          if [ ! -x "${CARGO_HOME}/bin/cargo" ] || [ ! -x "${CARGO_HOME}/bin/rustup" ]; then
+            curl --proto '=https' --tlsv1.2 --retry 10 --retry-connrefused --location --silent --show-error --fail https://sh.rustup.rs |
+              sh -s -- --default-toolchain none -y
+          fi
 
       - name: Install system packages
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends cmake perl protobuf-compiler
@@ -69,9 +95,22 @@ jobs:
 
   bpf-object:
     name: BPF Object
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, Linux, X64, logpacer-ci]
     steps:
       - uses: actions/checkout@v4
+
+      - name: Normalize Linux Rust paths
+        run: |
+          export CARGO_HOME="${CARGO_HOME:-${HOME}/.cargo}"
+          export RUSTUP_HOME="${RUSTUP_HOME:-${HOME}/.rustup}"
+          export PATH="${CARGO_HOME}/bin:${PATH}"
+          echo "CARGO_HOME=${CARGO_HOME}" >> "$GITHUB_ENV"
+          echo "RUSTUP_HOME=${RUSTUP_HOME}" >> "$GITHUB_ENV"
+          echo "${CARGO_HOME}/bin" >> "$GITHUB_PATH"
+          if [ ! -x "${CARGO_HOME}/bin/cargo" ] || [ ! -x "${CARGO_HOME}/bin/rustup" ]; then
+            curl --proto '=https' --tlsv1.2 --retry 10 --retry-connrefused --location --silent --show-error --fail https://sh.rustup.rs |
+              sh -s -- --default-toolchain none -y
+          fi
 
       - uses: dtolnay/rust-toolchain@master
         with:
@@ -94,7 +133,7 @@ jobs:
 
   helm:
     name: Helm
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, Linux, X64, logpacer-ci]
     steps:
       - uses: actions/checkout@v4
 
@@ -109,9 +148,22 @@ jobs:
 
   supply-chain:
     name: Supply Chain
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, Linux, X64, logpacer-ci]
     steps:
       - uses: actions/checkout@v4
+
+      - name: Normalize Linux Rust paths
+        run: |
+          export CARGO_HOME="${CARGO_HOME:-${HOME}/.cargo}"
+          export RUSTUP_HOME="${RUSTUP_HOME:-${HOME}/.rustup}"
+          export PATH="${CARGO_HOME}/bin:${PATH}"
+          echo "CARGO_HOME=${CARGO_HOME}" >> "$GITHUB_ENV"
+          echo "RUSTUP_HOME=${RUSTUP_HOME}" >> "$GITHUB_ENV"
+          echo "${CARGO_HOME}/bin" >> "$GITHUB_PATH"
+          if [ ! -x "${CARGO_HOME}/bin/cargo" ] || [ ! -x "${CARGO_HOME}/bin/rustup" ]; then
+            curl --proto '=https' --tlsv1.2 --retry 10 --retry-connrefused --location --silent --show-error --fail https://sh.rustup.rs |
+              sh -s -- --default-toolchain none -y
+          fi
 
       - uses: taiki-e/install-action@v2
         with:
