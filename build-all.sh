@@ -80,9 +80,6 @@ check_dependencies() {
     if needs_cross "$@"; then
         require_command cross "Install it with: cargo install cross"
         require_command docker "Docker must be installed and running for cross builds"
-        if [[ -z "${CROSS_CONTAINER_IN_CONTAINER:-}" && -f /.dockerenv && -S /var/run/docker.sock ]]; then
-            export CROSS_CONTAINER_IN_CONTAINER=true
-        fi
     fi
 }
 
