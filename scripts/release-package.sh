@@ -128,6 +128,17 @@ build_assets() {
   VERSION="${version}" OUTPUT_DIR="${dist_dir}" "${repo_root}/build-all.sh" "${targets[@]}"
 }
 
+stage_release_metadata() {
+  if [[ "${skip_manifest}" -eq 1 ]]; then
+    return 0
+  fi
+
+  local third_party_licenses="${repo_root}/LICENSE-3rdparty.csv"
+  [[ -f "${third_party_licenses}" ]] || die "missing ${third_party_licenses}"
+
+  cp "${third_party_licenses}" "${dist_dir}/LICENSE-3rdparty.csv"
+}
+
 resolve_manifest_tool() {
   if [[ -n "${manifest_tool}" ]]; then
     [[ -x "${manifest_tool}" ]] || die "manifest tool is not executable: ${manifest_tool}"
@@ -181,7 +192,7 @@ sign_release_blobs() {
   require_cmd cosign
 
   find "${dist_dir}" -maxdepth 1 -type f \
-    \( -name 'edgepacer-*' -o -name 'edgepacer-manager-*' -o -name 'checksums.txt' -o -name 'update-manifest.json' \) \
+    \( -name 'edgepacer-*' -o -name 'edgepacer-manager-*' -o -name 'checksums.txt' -o -name 'update-manifest.json' -o -name 'LICENSE-3rdparty.csv' \) \
     ! -name '*.sha256' \
     ! -name '*.sigstore.json' \
     -print0 |
@@ -194,6 +205,7 @@ main() {
   parse_args "$@"
   normalize_args
   build_assets
+  stage_release_metadata
   generate_manifest
   sign_release_blobs
 

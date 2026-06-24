@@ -173,11 +173,20 @@ jobs:
         with:
           tool: cargo-audit
 
+      - name: Install third-party license tool
+        run: |
+          if ! cargo install --list | grep -q '^dd-rust-license-tool v1\.0\.4:'; then
+            cargo install dd-rust-license-tool --version 1.0.4 --locked --force
+          fi
+
       - name: Check root dependency policy
         run: cargo deny --locked check --hide-inclusion-graph -c deny.toml advisories bans licenses sources
 
       - name: Check BPF dependency policy
         run: cargo deny --manifest-path bpf/Cargo.toml --locked check --hide-inclusion-graph -c bpf/deny.toml advisories bans licenses sources
+
+      - name: Check third-party license inventory
+        run: scripts/third-party-licenses.sh check
 
       - name: Audit root lockfile
         run: cargo audit

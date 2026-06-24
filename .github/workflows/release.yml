@@ -267,7 +267,7 @@ jobs:
             --manifest-tool "${{ steps.manifest_tool.outputs.path }}" \
             --sign-blobs
 
-      - name: Attest release binary provenance
+      - name: Attest release artifact provenance
         if: ${{ github.event.repository.private == false }}
         uses: actions/attest@v4
         with:
@@ -275,6 +275,7 @@ jobs:
             dist/edgepacer-*
             dist/edgepacer-manager-*
             dist/checksums.txt
+            dist/LICENSE-3rdparty.csv
             dist/update-manifest.json
 
       - name: Create GitHub release
@@ -283,7 +284,7 @@ jobs:
         run: |
           tag="${{ needs.resolve.outputs.tag }}"
           notes_file="$(mktemp)"
-          printf 'EdgePacer %s\n\nArtifacts are signed with Sigstore bundles and listed in update-manifest.json.\n' "${tag}" > "${notes_file}"
+          printf 'EdgePacer %s\n\nRelease binaries are signed with Sigstore bundles and listed in update-manifest.json. Third-party dependency attribution is included in LICENSE-3rdparty.csv.\n' "${tag}" > "${notes_file}"
           mapfile -d '' release_assets < <(find dist -maxdepth 1 -type f -print0)
 
           if gh release view "${tag}" >/dev/null 2>&1; then
