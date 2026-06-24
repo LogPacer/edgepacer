@@ -77,11 +77,19 @@ jobs:
           tool: cargo-audit
 
       - name: Install release build tools
+        env:
+          CARGO_AUDITABLE_VERSION: "0.7.4"
+          CARGO_AUDITABLE_ARCHIVE_SHA256: "4a4f0c124543c065f03d89aee26550305143c6e4af3e46270dbabefeb79895d2"
         run: |
           docker version
-          if ! cargo install --list | grep -q '^cargo-auditable v0\.7\.4:'; then
-            cargo install cargo-auditable --version 0.7.4 --locked --force
-          fi
+          cargo_home="${CARGO_HOME:-${HOME}/.cargo}"
+          mkdir -p "${cargo_home}/bin"
+          cargo_auditable_archive="cargo-auditable-x86_64-unknown-linux-musl.tar.xz"
+          curl -fsSLO "https://github.com/rust-secure-code/cargo-auditable/releases/download/v${CARGO_AUDITABLE_VERSION}/${cargo_auditable_archive}"
+          printf '%s  %s\n' "${CARGO_AUDITABLE_ARCHIVE_SHA256}" "${cargo_auditable_archive}" | sha256sum -c -
+          tar -xJf "${cargo_auditable_archive}"
+          install -m 0555 "cargo-auditable-x86_64-unknown-linux-musl/cargo-auditable" "${cargo_home}/bin/cargo-auditable"
+          cargo auditable --version
           if ! cargo install --list | grep -q '^cross v0\.2\.5:'; then
             cargo install cross --version 0.2.5 --locked --force
           fi
