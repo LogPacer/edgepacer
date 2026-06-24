@@ -93,6 +93,13 @@ jobs:
       - name: Build release binaries
         run: VERSION="${{ needs.resolve.outputs.version }}" OUTPUT_DIR=dist ./build-all.sh ${{ matrix.target }}
 
+      - name: Build release manifest tool
+        if: matrix.target == 'linux-amd64'
+        run: |
+          cross build --locked --release --target x86_64-unknown-linux-musl --bin edgepacer-release-manifest
+          mkdir -p tools
+          install -m 0555 target/x86_64-unknown-linux-musl/release/edgepacer-release-manifest tools/release-manifest
+
       - name: Upload release binaries
         uses: actions/upload-artifact@v4
         with:
@@ -102,12 +109,21 @@ jobs:
             dist/edgepacer-manager-*
           if-no-files-found: error
 
+      - name: Upload release manifest tool
+        if: matrix.target == 'linux-amd64'
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-manifest-tool
+          path: tools/release-manifest
+          if-no-files-found: error
+
   publish:
     name: Publish Release
     needs:
       - resolve
       - build-binaries
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
 
@@ -227,7 +243,21 @@ jobs:
             echo "missing EDGEPACER_UPDATE_SIGNING_KEY repository secret" >&2
             exit 1
           fi
-          cargo run --locked --bin edgepacer-release-manifest -- \
+
+          manifest_tool=""
+          for candidate in dist/release-manifest dist/tools/release-manifest; do
+            if [ -x "${candidate}" ]; then
+              manifest_tool="${candidate}"
+              break
+            fi
+          done
+          if [ -z "${manifest_tool}" ]; then
+            echo "missing release manifest tool artifact" >&2
+            find dist -maxdepth 3 -type f -print >&2
+            exit 1
+          fi
+
+          "${manifest_tool}" \
             --version "${{ needs.resolve.outputs.version }}" \
             --release-tag "${{ needs.resolve.outputs.tag }}" \
             --repository "${{ github.repository }}" \
