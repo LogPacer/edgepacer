@@ -172,9 +172,10 @@ jobs:
 
       - name: Install third-party license tool
         run: |
-          if ! cargo install --list | grep -q '^dd-rust-license-tool v1\.0\.4:'; then
+          if ! command -v dd-rust-license-tool >/dev/null 2>&1 || ! cargo install --list | grep -q '^dd-rust-license-tool v1\.0\.4:'; then
             cargo install dd-rust-license-tool --version 1.0.4 --locked --force
           fi
+          command -v dd-rust-license-tool
 
       - name: Check root dependency policy
         run: cargo deny --locked check --hide-inclusion-graph -c deny.toml advisories bans licenses sources
