@@ -44,18 +44,18 @@ httlib-hpack = { version = "0.1", default-features = false }
 # Wire format
 # Shared wire format for internal LogPacer traffic
 logpacer_wire = { path = "crates/logpacer_wire", version = "0.1.0" }
-prost = "0.13"
+prost = "0.14"
 
 # Trace proxy
 axum = "0.8"
-opentelemetry-proto = { version = "0.27", features = ["gen-tonic-messages", "trace"], default-features = false }
+opentelemetry-proto = { version = "0.32", features = ["gen-tonic-messages", "trace"], default-features = false }
 
 # Logging
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["json", "env-filter", "registry"] }
 
 # Crypto (config change detection)
-sha2 = "0.10"
+sha2 = "0.11"
 hex = "0.4"
 ed25519-dalek = { version = "2.2", default-features = false, features = ["std"] }
 
@@ -72,7 +72,7 @@ chrono = { version = "0.4", features = ["serde"] }
 # Persistent storage: SQLite (WAL) backs all buffers and the checkpoint store.
 # redb remains ONLY for the one-shot legacy_migration read side; drop it (and the
 # module) once the fleet is past this revision.
-redb = "2"
+redb = "4"
 rusqlite = { version = "0.40", features = ["bundled"] }
 
 # Compression (historical import)
@@ -82,15 +82,15 @@ flate2 = "1"
 regex = "1"
 
 # System metrics (CPU, memory, disk, network, processes)
-sysinfo = "0.33"
+sysinfo = "0.39"
 
 # Docker discovery + streaming
-bollard = "0.18"
+bollard = "0.21"
 futures-util = "0.3"
 
 # Kubernetes discovery (optional — only used when running in-cluster)
-kube = { version = "0.98", features = ["client", "runtime"] }
-k8s-openapi = { version = "0.24", features = ["v1_32"] }
+kube = { version = "4.0", features = ["client", "runtime"] }
+k8s-openapi = { version = "0.28", features = ["v1_32"] }
 
 [features]
 # eBPF capture pillars (Linux only). Off by default. When enabled on Linux,
@@ -122,12 +122,12 @@ path = "src/bin/edgepacer-release-manifest.rs"
 
 # Linux /proc access (process/port discovery)
 [target.'cfg(target_os = "linux")'.dependencies]
-procfs = "0.17"
+procfs = "0.18"
 sdjournal = { version = "0.1.15", default-features = true }
 # jemalloc with a background purge thread: returns freed pages to the OS so RSS
 # tracks the working set instead of carrying glibc per-arena retention (the
 # customer-visible `ps`/`docker stats` number). Linux-only; macOS keeps system malloc.
-tikv-jemallocator = { version = "0.6", features = ["background_threads", "disable_initial_exec_tls"] }
+tikv-jemallocator = { version = "0.7", features = ["background_threads", "disable_initial_exec_tls"] }
 # Aya userspace eBPF loader (bpf syscall/netlink/epoll). Pulled in only by the
 # `ebpf` feature; Linux-only, so the feature is never enabled on macOS.
 aya = { version = "0.13", optional = true }
