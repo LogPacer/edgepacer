@@ -70,6 +70,20 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Normalize Linux Rust paths
+        if: runner.os == 'Linux'
+        run: |
+          export CARGO_HOME="${HOME}/.cargo"
+          export RUSTUP_HOME="${HOME}/.rustup"
+          export PATH="${CARGO_HOME}/bin:${PATH}"
+          echo "CARGO_HOME=${HOME}/.cargo" >> "$GITHUB_ENV"
+          echo "RUSTUP_HOME=${HOME}/.rustup" >> "$GITHUB_ENV"
+          echo "${HOME}/.cargo/bin" >> "$GITHUB_PATH"
+          if [ ! -x "${HOME}/.cargo/bin/cargo" ] || [ ! -x "${HOME}/.cargo/bin/rustup" ]; then
+            curl --proto '=https' --tlsv1.2 --retry 10 --retry-connrefused --location --silent --show-error --fail https://sh.rustup.rs |
+              sh -s -- --default-toolchain none -y
+          fi
+
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: "1.95.0"
@@ -89,8 +103,8 @@ jobs:
             sudo chmod a+rw /var/run/docker.sock
           fi
           docker version
-          if ! command -v cross >/dev/null 2>&1; then
-            cargo install cross --locked
+          if ! command -v cross >/dev/null 2>&1 || ! cross --version | grep -q 'cross 0.2.5'; then
+            cargo install cross --version 0.2.5 --locked --force
           fi
 
       - name: Install macOS build tools
@@ -133,6 +147,19 @@ jobs:
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
+
+      - name: Normalize Linux Rust paths
+        run: |
+          export CARGO_HOME="${HOME}/.cargo"
+          export RUSTUP_HOME="${HOME}/.rustup"
+          export PATH="${CARGO_HOME}/bin:${PATH}"
+          echo "CARGO_HOME=${HOME}/.cargo" >> "$GITHUB_ENV"
+          echo "RUSTUP_HOME=${HOME}/.rustup" >> "$GITHUB_ENV"
+          echo "${HOME}/.cargo/bin" >> "$GITHUB_PATH"
+          if [ ! -x "${HOME}/.cargo/bin/cargo" ] || [ ! -x "${HOME}/.cargo/bin/rustup" ]; then
+            curl --proto '=https' --tlsv1.2 --retry 10 --retry-connrefused --location --silent --show-error --fail https://sh.rustup.rs |
+              sh -s -- --default-toolchain none -y
+          fi
 
       - uses: dtolnay/rust-toolchain@master
         with:
