@@ -1,0 +1,41 @@
+[graph]
+all-features = true
+
+[advisories]
+version = 2
+yanked = "warn"
+ignore = [
+  { id = "RUSTSEC-2024-0384", reason = "Transitive through kube-runtime 0.98.0 -> backoff 0.4.0. No safe upgrade is available in the current kube line; revisit with a kube major upgrade." },
+  { id = "RUSTSEC-2025-0012", reason = "Transitive through kube-runtime 0.98.0. No safe upgrade is available in the current kube line; revisit with a kube major upgrade." },
+  { id = "RUSTSEC-2025-0134", reason = "Transitive through kube-client 0.98.0. No safe upgrade is available in the current kube line; revisit with a kube major upgrade." },
+]
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+highlight = "all"
+deny = []
+skip = []
+skip-tree = []
+
+[licenses]
+version = 2
+confidence-threshold = 0.93
+allow = [
+  "Apache-2.0",
+  "Apache-2.0 WITH LLVM-exception",
+  "BSD-2-Clause",
+  "BSD-3-Clause",
+  "ISC",
+  "MIT",
+  "Unicode-3.0",
+  "Zlib",
+]
+exceptions = [
+  { crate = "option-ext", allow = ["MPL-2.0"] },
+]
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

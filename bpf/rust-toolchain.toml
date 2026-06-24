@@ -1,0 +1,16 @@
+# Pinned toolchain for building the embedded BPF object
+# (src/ebpf/programs/edgepacer.bpf.o) via scripts/regen-bpf-object.sh. The agent's
+# musl/cross build does NOT use this — it embeds the prebuilt object (decision 4).
+# Only the regen script and the CI `bpf-object` job build here.
+#
+# Pinned to the exact nightly that built the committed object (rustc 1.98.0-nightly,
+# bundled LLVM 22, paired with bpf-linker 0.10.3). Bumping it is deliberate: change
+# the date here AND in the CI `bpf-object` job, run `scripts/regen-bpf-object.sh` to
+# regenerate the committed object, and commit them together.
+#
+# No `targets`: `bpfel-unknown-none` is a tier-3 target with no precompiled std, so
+# we compile `core` ourselves via build-std (.cargo/config.toml). Listing it under
+# `targets` would make rustup try to fetch a nonexistent `rust-std` and fail.
+[toolchain]
+channel = "nightly-2026-05-27"
+components = ["rust-src", "llvm-tools-preview"]

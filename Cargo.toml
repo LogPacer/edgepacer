@@ -1,0 +1,164 @@
+[package]
+name = "edgepacer"
+version = "0.1.9"
+edition = "2024"
+description = "Lightweight edge agent for the LogPacer platform"
+license = "Apache-2.0"
+repository = "https://github.com/LogPacer/edgepacer"
+publish = false
+
+[workspace]
+members = [".", "crates/logpacer_wire"]
+resolver = "3"
+
+[dependencies]
+# CLI
+clap = { version = "4", features = ["derive", "env"] }
+
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# HTTP client
+reqwest = { version = "0.12", features = ["json", "rustls-tls-native-roots", "stream"], default-features = false }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Shared #[repr(C)] BPF event layout (LogChunk / ConnectEvent / CHUNK_LEN) — one
+# source of truth shared with the kernel BPF crate (bpf/). Pulled only by `ebpf`.
+edgepacer-ebpf-common = { path = "bpf-common", version = "0.1.0", optional = true }
+
+# HTTP/1.x parsing for the eBPF L7 layer (zero-code APM, GAP 2). no_std, zero-dep,
+# incremental (Partial-aware); compiled under `cargo test` on every platform.
+httparse = "1"
+
+# HPACK header decompression for the HTTP/2 + gRPC L7 parser (GAP 2). HPACK is
+# stateful (a per-direction dynamic table mutated by every header block) and
+# Huffman-coded — the one genuinely hard part of HTTP/2 framing, not worth
+# hand-rolling. We still own the 9-byte frame parsing and stream-id pairing; this
+# crate only owns the HPACK codec. no-default-features keeps the encoder + its
+# tables out of release builds (we only decode; the encoder is test-only).
+httlib-hpack = { version = "0.1", default-features = false }
+
+# Wire format
+# Shared wire format for internal LogPacer traffic
+logpacer_wire = { path = "crates/logpacer_wire", version = "0.1.0" }
+prost = "0.13"
+
+# Trace proxy
+axum = "0.8"
+opentelemetry-proto = { version = "0.27", features = ["gen-tonic-messages", "trace"], default-features = false }
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["json", "env-filter", "registry"] }
+
+# Crypto (config change detection)
+sha2 = "0.10"
+hex = "0.4"
+ed25519-dalek = { version = "2.2", default-features = false, features = ["std"] }
+
+# Error handling
+anyhow = "1"
+thiserror = "2"
+
+# Utilities
+uuid = { version = "1", features = ["v4"] }
+gethostname = "1"
+dirs = "6"
+chrono = { version = "0.4", features = ["serde"] }
+
+# Persistent storage: SQLite (WAL) backs all buffers and the checkpoint store.
+# redb remains ONLY for the one-shot legacy_migration read side; drop it (and the
+# module) once the fleet is past this revision.
+redb = "2"
+rusqlite = { version = "0.40", features = ["bundled"] }
+
+# Compression (historical import)
+flate2 = "1"
+
+# Regex (multiline entry assembler, per-source start patterns)
+regex = "1"
+
+# System metrics (CPU, memory, disk, network, processes)
+sysinfo = "0.33"
+
+# Docker discovery + streaming
+bollard = "0.18"
+futures-util = "0.3"
+
+# Kubernetes discovery (optional — only used when running in-cluster)
+kube = { version = "0.98", features = ["client", "runtime"] }
+k8s-openapi = { version = "0.24", features = ["v1_32"] }
+
+[features]
+# eBPF capture pillars (Linux only). Off by default. When enabled on Linux,
+# `ebpf::BUILD_SUPPORT` is true and the kernel program-loading path compiles in.
+# Capability detection and the eBPF stats contract work without this feature.
+# Enabling `ebpf` pulls in aya (declared under the Linux target table), so the
+# feature is only ever enabled on Linux builds; macOS uses the default build.
+ebpf = ["dep:aya", "dep:edgepacer-ebpf-common"]
+
+[[bin]]
+name = "edgepacer"
+path = "src/main.rs"
+
+[[bin]]
+name = "edgepacer-manager"
+path = "src/manager/main.rs"
+
+[[bin]]
+name = "mock-logrelay"
+path = "test/tools/mock_logrelay.rs"
+
+[[bin]]
+name = "loggen"
+path = "test/tools/loggen.rs"
+
+[[bin]]
+name = "edgepacer-release-manifest"
+path = "src/bin/edgepacer-release-manifest.rs"
+
+# Linux /proc access (process/port discovery)
+[target.'cfg(target_os = "linux")'.dependencies]
+procfs = "0.17"
+sdjournal = { version = "0.1.15", default-features = true }
+# jemalloc with a background purge thread: returns freed pages to the OS so RSS
+# tracks the working set instead of carrying glibc per-arena retention (the
+# customer-visible `ps`/`docker stats` number). Linux-only; macOS keeps system malloc.
+tikv-jemallocator = { version = "0.6", features = ["background_threads", "disable_initial_exec_tls"] }
+# Aya userspace eBPF loader (bpf syscall/netlink/epoll). Pulled in only by the
+# `ebpf` feature; Linux-only, so the feature is never enabled on macOS.
+aya = { version = "0.13", optional = true }
+
+# libc for process group management (manager)
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[dev-dependencies]
+tokio-test = "0.4"
+wiremock = "0.6"
+tempfile = "3"
+
+[lints.rust]
+warnings = "deny"
+elided_lifetimes_in_paths = "deny"
+unused_must_use = "deny"
+
+[lints.clippy]
+all = { level = "deny", priority = -1 }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+panic = "abort"
+strip = true
+opt-level = 3
+
+# Optimize build scripts and proc-macros (serde/clap/prost derives, etc.) even in
+# dev builds. They run at compile time, so optimizing them speeds the whole dev
+# iteration loop without touching the unoptimized, fast-to-codegen agent crate or
+# the release artifact.
+[profile.dev.build-override]
+opt-level = 3

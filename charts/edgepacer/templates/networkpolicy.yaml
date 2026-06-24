@@ -1,0 +1,29 @@
+{{- include "edgepacer.validateValues" . -}}
+{{- if and .Values.traces.networkPolicy.enabled .Values.traces.service.enabled .Values.traces.otlpHttp.enabled .Values.traces.otlpHttp.listenerConfiguredByControlPlane }}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "edgepacer.fullname" . }}-traces
+  labels:
+    {{- include "edgepacer.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "edgepacer.selectorLabels" . | nindent 6 }}
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        {{- if .Values.traces.networkPolicy.fromNamespaceSelector }}
+        - namespaceSelector:
+            {{- toYaml .Values.traces.networkPolicy.fromNamespaceSelector | nindent 12 }}
+          podSelector:
+            {{- toYaml .Values.traces.networkPolicy.fromPodSelector | nindent 12 }}
+        {{- else }}
+        - podSelector:
+            {{- toYaml .Values.traces.networkPolicy.fromPodSelector | nindent 12 }}
+        {{- end }}
+      ports:
+        - protocol: TCP
+          port: {{ .Values.traces.otlpHttp.port }}
+{{- end }}

@@ -1,0 +1,9 @@
+[package]
+name = "edgepacer-ebpf-common"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+
+# Shared, layout-stable event type. `no_std` so the kernel crate can use it;
+# a `no_std` lib links fine into the std userspace loader too.
+[dependencies]

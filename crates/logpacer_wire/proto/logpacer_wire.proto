@@ -1,0 +1,180 @@
+// LogPacer Wire Protocol v1
+//
+// Internal wire format for first-party LogPacer traffic.
+//
+// Owner: logpacer_wire (shared crate)
+// Consumers: edgepacer (producer), LogPacer ingest services (consumer)
+//
+// Active endpoint:
+//   POST /v1/logpacer-wire  — routed native batches (WireRequest)
+//
+// LogRelay also exposes OTLP HTTP (/v1/logs, /v1/traces) for optional third-party
+// compatibility. Nothing in the LogPacer ecosystem currently depends on those paths.
+
+syntax = "proto3";
+package logpacer.wire.v1;
+
+// Top-level request for the native routed endpoint (/v1/logpacer-wire).
+//
+// The URL identifies the protocol. The batch envelope identifies routing and
+// payload type.
+message WireRequest {
+  repeated RoutedBatch batches = 1;
+}
+
+// Response from the native routed endpoint.
+message WireResponse {
+  uint32 accepted = 1;
+  uint32 rejected = 2;
+  string error_message = 3;
+}
+
+// A payload batch routed by tenant and repo.
+message RoutedBatch {
+  string archive_id = 1;           // required — tenant routing
+  string repo_id = 2;              // required — repo/source routing within tenant
+  uint32 schema_version = 15;      // wire format version (currently 1)
+
+  oneof payload {
+    WireLogBatch logs = 10;
+    WireTraceBatch traces = 11;
+    WireMetricBatch metrics = 12;
+    WireGraphBatch graph = 13;
+    WireEbpfBatch ebpf = 14;
+  }
+}
+
+// Shared event envelope for payload entries.
+//
+// logtime_ms is the canonical output logtime when the producer is confident.
+// If absent, consumers may infer from structured entry timestamps, recipes,
+// source_at_ms, or receive time. captured_at is stamped by LogRelay on receipt.
+message EventEnvelope {
+  optional int64 logtime_ms = 1;
+  optional int64 source_at_ms = 2;
+  bytes metadata_json = 4;         // optional JSON object for downstream gating/correlation
+}
+
+// Structured log payloads for the routed endpoint.
+message WireLogBatch {
+  repeated WireLogEvent entries = 1;
+}
+
+// A log event with an envelope plus either structured or raw content.
+message WireLogEvent {
+  EventEnvelope envelope = 1;
+
+  oneof body {
+    bytes entry_json = 10;         // JSON object only, not a {logtime, entry} wrapper
+    string raw_text = 11;          // parse with tenant recipe when configured
+    bytes raw_bytes = 12;          // preserve losslessly via base64
+  }
+}
+
+// A structured event that mirrors LogRelay's normalized output shape:
+// {logtime, metadata, entry, embeds?}. The envelope produces logtime/metadata,
+// entry_json supplies the entry object, and embeds_json carries producer-curated
+// embed text (e.g. {"text":"..."}) when present.
+message WireJsonEvent {
+  EventEnvelope envelope = 1;
+  bytes entry_json = 2;            // JSON object only, not a {logtime, entry} wrapper
+  bytes embeds_json = 3;           // optional JSON object, e.g. {"text":"..."}; omit when not embeddable
+}
+
+// Reserved first-class payloads for the routed endpoint.
+message WireTraceBatch {
+  repeated bytes entries_json = 1;
+}
+
+message WireMetricBatch {
+  repeated bytes entries_json = 1;
+}
+
+message WireGraphBatch {
+  repeated WireJsonEvent entries = 1;
+}
+
+// eBPF-captured signals: kernel-visible network flows, security events, and
+// request signals, captured at the edge and routed through the same envelope as
+// logs. "If we can log it, we can use it" — these are first-class typed payloads,
+// not opaque JSON, so high-volume flow records stay compact and routable.
+message WireEbpfBatch {
+  repeated WireEbpfEvent entries = 1;
+}
+
+// A single eBPF event. `kind` duplicates the inner oneof tag so consumers can
+// route/sample/count without decoding the inner message.
+message WireEbpfEvent {
+  EventEnvelope envelope = 1;
+  EbpfEventKind kind = 2;
+
+  oneof event {
+    NetworkFlow flow = 10;
+    SecurityEvent security = 11;
+    RequestSignal request = 12;
+  }
+}
+
+enum EbpfEventKind {
+  EBPF_EVENT_KIND_UNSPECIFIED = 0;
+  EBPF_EVENT_KIND_NETWORK_FLOW = 1;
+  EBPF_EVENT_KIND_SECURITY = 2;
+  EBPF_EVENT_KIND_REQUEST = 3;
+}
+
+// A network flow record (Hubble / Datadog-NPM class). Addresses are raw bytes so
+// the same field holds IPv4 (4 bytes) or IPv6 (16 bytes). cgroup_id is the kernel
+// id; human container/pod identity rides envelope.metadata_json after enrichment.
+message NetworkFlow {
+  bytes saddr = 1;
+  bytes daddr = 2;
+  uint32 sport = 3;
+  uint32 dport = 4;
+  uint32 protocol = 5;       // IPPROTO_* (6=TCP, 17=UDP)
+  uint64 bytes_tx = 6;
+  uint64 bytes_rx = 7;
+  uint64 packets_tx = 8;
+  uint64 packets_rx = 9;
+  uint32 pid = 10;
+  uint64 cgroup_id = 11;
+  uint32 netns_ino = 12;
+  uint32 direction = 13;     // 0=unknown, 1=egress, 2=ingress
+}
+
+// A runtime security observation (Tetragon / Falco class) — telemetry, not enforcement.
+message SecurityEvent {
+  SecurityKind kind = 1;
+  uint32 pid = 2;
+  uint32 ppid = 3;
+  uint32 uid = 4;
+  uint64 cgroup_id = 5;
+  string comm = 6;
+  string filename = 7;
+  repeated string argv = 8;
+  int64 syscall_nr = 9;
+  int64 ret = 10;
+}
+
+enum SecurityKind {
+  SECURITY_KIND_UNSPECIFIED = 0;
+  SECURITY_KIND_EXEC = 1;
+  SECURITY_KIND_FILE = 2;
+  SECURITY_KIND_SYSCALL = 3;
+}
+
+// A request signal (Beyla / Pixie class): a span-like record recovered from the
+// wire without an app SDK. trace/span ids are raw bytes (W3C: 16 / 8 bytes) so
+// they can fan out to the traces arm or LogPacer ingest without re-encoding.
+message RequestSignal {
+  bytes trace_id = 1;
+  bytes span_id = 2;
+  bytes parent_span_id = 3;
+  string service_name = 4;
+  string operation = 5;          // e.g. "GET /api/users"
+  int64 start_unix_nano = 6;
+  int64 duration_nano = 7;
+  uint32 status_code = 8;        // HTTP/gRPC status
+  uint32 pid = 9;
+  uint64 cgroup_id = 10;
+  map<string, string> attributes = 11;
+}

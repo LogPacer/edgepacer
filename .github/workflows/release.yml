@@ -1,0 +1,245 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Release version without the leading v
+        required: true
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  attestations: write
+  contents: write
+  id-token: write
+  packages: write
+
+env:
+  IMAGE: ghcr.io/logpacer/edgepacer
+  CHART_REPOSITORY: oci://ghcr.io/logpacer/charts
+
+jobs:
+  resolve:
+    name: Resolve Version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      tag: ${{ steps.version.outputs.tag }}
+    steps:
+      - name: Resolve version
+        id: version
+        run: |
+          if [ -n "${{ inputs.version }}" ]; then
+            version="${{ inputs.version }}"
+          else
+            version="${GITHUB_REF_NAME#v}"
+          fi
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+          echo "tag=v${version}" >> "$GITHUB_OUTPUT"
+
+  build-binaries:
+    name: Build ${{ matrix.name }} Binaries
+    needs: resolve
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Linux
+            os: ubuntu-latest
+            targets: linux-amd64 linux-arm64
+          - name: macOS
+            os: macos-latest
+            targets: darwin-amd64 darwin-arm64
+          - name: Windows
+            os: ubuntu-latest
+            targets: windows-amd64
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.95.0"
+
+      - name: Install Linux build tools
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends cmake perl
+          cargo install cross --locked
+
+      - name: Install macOS build tools
+        if: runner.os == 'macOS'
+        run: brew install cmake
+
+      - name: Build release binaries
+        run: VERSION="${{ needs.resolve.outputs.version }}" OUTPUT_DIR=dist ./build-all.sh ${{ matrix.targets }}
+
+      - name: Upload release binaries
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.name }}
+          path: |
+            dist/edgepacer-*
+            dist/edgepacer-manager-*
+          if-no-files-found: error
+
+  publish:
+    name: Publish Release
+    needs:
+      - resolve
+      - build-binaries
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.95.0"
+
+      - name: Install build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends cmake perl protobuf-compiler
+          cargo install cross --locked
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Set up Helm
+        uses: azure/setup-helm@v4
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v3
+        with:
+          cosign-release: "v3.0.2"
+
+      - name: Login to GHCR
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+
+      - name: Build and push image
+        run: |
+          scripts/container-image.sh \
+            --build-binaries \
+            --push \
+            --image "${IMAGE}" \
+            --tag "${{ needs.resolve.outputs.version }}" \
+            --version "${{ needs.resolve.outputs.version }}" \
+            --latest
+
+      - name: Resolve image digest
+        id: image
+        run: |
+          digest="$(docker buildx imagetools inspect "${IMAGE}:${{ needs.resolve.outputs.version }}" | awk '/Digest:/ { print $2; exit }')"
+          if [ -z "${digest}" ]; then
+            echo "failed to resolve image digest" >&2
+            exit 1
+          fi
+          echo "digest=${digest}" >> "$GITHUB_OUTPUT"
+          echo "ref=${IMAGE}@${digest}" >> "$GITHUB_OUTPUT"
+
+      - name: Sign image
+        run: cosign sign --yes "${{ steps.image.outputs.ref }}"
+
+      - name: Attest image provenance
+        uses: actions/attest@v4
+        with:
+          subject-name: ${{ env.IMAGE }}
+          subject-digest: ${{ steps.image.outputs.digest }}
+          push-to-registry: true
+
+      - name: Login Helm to GHCR
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | helm registry login ghcr.io -u "${{ github.actor }}" --password-stdin
+
+      - name: Package and push chart
+        id: chart
+        run: |
+          mkdir -p dist/charts
+          helm package charts/edgepacer \
+            --version "${{ needs.resolve.outputs.version }}" \
+            --app-version "${{ needs.resolve.outputs.version }}" \
+            --destination dist/charts
+          push_output="$(helm push "dist/charts/edgepacer-${{ needs.resolve.outputs.version }}.tgz" "${CHART_REPOSITORY}" 2>&1)"
+          printf '%s\n' "${push_output}"
+          digest="$(printf '%s\n' "${push_output}" | awk '/Digest:/ { print $2; exit }')"
+          if [ -z "${digest}" ]; then
+            echo "failed to resolve chart digest" >&2
+            exit 1
+          fi
+          chart_ref="ghcr.io/logpacer/charts/edgepacer@${digest}"
+          echo "digest=${digest}" >> "$GITHUB_OUTPUT"
+          echo "ref=${chart_ref}" >> "$GITHUB_OUTPUT"
+          echo "name=ghcr.io/logpacer/charts/edgepacer" >> "$GITHUB_OUTPUT"
+
+      - name: Sign chart
+        run: cosign sign --yes "${{ steps.chart.outputs.ref }}"
+
+      - name: Attest chart provenance
+        uses: actions/attest@v4
+        with:
+          subject-name: ${{ steps.chart.outputs.name }}
+          subject-digest: ${{ steps.chart.outputs.digest }}
+          push-to-registry: true
+
+      - name: Download release binaries
+        uses: actions/download-artifact@v4
+        with:
+          pattern: release-*
+          path: dist
+          merge-multiple: true
+
+      - name: Generate signed update manifest
+        env:
+          EDGEPACER_UPDATE_SIGNING_KEY: ${{ secrets.EDGEPACER_UPDATE_SIGNING_KEY }}
+        run: |
+          if [ -z "${EDGEPACER_UPDATE_SIGNING_KEY}" ]; then
+            echo "missing EDGEPACER_UPDATE_SIGNING_KEY repository secret" >&2
+            exit 1
+          fi
+          cargo run --locked --bin edgepacer-release-manifest -- \
+            --version "${{ needs.resolve.outputs.version }}" \
+            --release-tag "${{ needs.resolve.outputs.tag }}" \
+            --repository "${{ github.repository }}" \
+            --dist-dir dist
+
+      - name: Attest release binary provenance
+        uses: actions/attest@v4
+        with:
+          subject-path: |
+            dist/edgepacer-*
+            dist/edgepacer-manager-*
+            dist/checksums.txt
+            dist/update-manifest.json
+
+      - name: Sign release blobs
+        run: |
+          while IFS= read -r -d '' artifact; do
+            case "${artifact}" in
+              *.sha256|*.sigstore.json) continue ;;
+            esac
+            cosign sign-blob --yes "${artifact}" --bundle "${artifact}.sigstore.json"
+          done < <(find dist -maxdepth 1 -type f \( -name 'edgepacer-*' -o -name 'edgepacer-manager-*' -o -name 'checksums.txt' -o -name 'update-manifest.json' \) -print0)
+
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          tag="${{ needs.resolve.outputs.tag }}"
+          notes_file="$(mktemp)"
+          printf 'EdgePacer %s\n\nArtifacts are signed with Sigstore bundles and listed in update-manifest.json.\n' "${tag}" > "${notes_file}"
+          mapfile -d '' release_assets < <(find dist -maxdepth 1 -type f -print0)
+
+          if gh release view "${tag}" >/dev/null 2>&1; then
+            gh release upload "${tag}" "${release_assets[@]}" --clobber
+          else
+            gh release create "${tag}" "${release_assets[@]}" \
+              --target "${GITHUB_SHA}" \
+              --title "EdgePacer ${tag}" \
+              --notes-file "${notes_file}"
+          fi

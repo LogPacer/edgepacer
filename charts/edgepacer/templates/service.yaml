@@ -1,0 +1,25 @@
+{{- include "edgepacer.validateValues" . -}}
+{{- if and .Values.traces.service.enabled .Values.traces.otlpHttp.enabled .Values.traces.otlpHttp.listenerConfiguredByControlPlane }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "edgepacer.fullname" . }}
+  labels:
+    {{- include "edgepacer.labels" . | nindent 4 }}
+  {{- with .Values.traces.service.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  type: {{ .Values.traces.service.type }}
+  {{- with .Values.traces.service.internalTrafficPolicy }}
+  internalTrafficPolicy: {{ . }}
+  {{- end }}
+  selector:
+    {{- include "edgepacer.selectorLabels" . | nindent 4 }}
+  ports:
+    - name: otlp-http
+      port: {{ .Values.traces.otlpHttp.port }}
+      targetPort: otlp-http
+      protocol: TCP
+{{- end }}
