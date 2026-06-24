@@ -59,11 +59,17 @@ cargo clippy --features ebpf --all-targets -- -D warnings
 - Chart source: `charts/edgepacer`
 - GitHub Release binaries:
   `edgepacer-linux-amd64`, `edgepacer-linux-arm64`,
-  `edgepacer-darwin-amd64`, `edgepacer-darwin-arm64`,
   `edgepacer-windows-amd64.exe`
 
 Release tags publish the container image, Helm chart, standalone binaries,
 checksums, Sigstore bundles, and `update-manifest.json` through GitHub Actions.
+macOS binaries are skipped by default so releases do not allocate hosted macOS
+runners. To build them from a Mac when needed:
+
+```bash
+VERSION=0.1.9
+scripts/release-package.sh --version "${VERSION}" --skip-manifest darwin-amd64 darwin-arm64
+```
 
 ## Verify Releases
 

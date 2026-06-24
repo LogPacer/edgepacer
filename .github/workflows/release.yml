@@ -9,6 +9,11 @@ on:
       version:
         description: Release version without the leading v
         required: true
+      include_macos:
+        description: Build hosted macOS release binaries
+        required: false
+        default: false
+        type: boolean
 
 concurrency:
   group: release-${{ github.ref }}
@@ -27,10 +32,11 @@ env:
 jobs:
   resolve:
     name: Resolve Version
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, Linux, X64, logpacer-ci]
     outputs:
       version: ${{ steps.version.outputs.version }}
       tag: ${{ steps.version.outputs.tag }}
+      build_matrix: ${{ steps.matrix.outputs.build_matrix }}
     steps:
       - name: Resolve version
         id: version
@@ -43,6 +49,25 @@ jobs:
           echo "version=${version}" >> "$GITHUB_OUTPUT"
           echo "tag=v${version}" >> "$GITHUB_OUTPUT"
 
+      - name: Resolve build matrix
+        id: matrix
+        env:
+          INCLUDE_MACOS: ${{ inputs.include_macos }}
+        run: |
+          include_macos="${INCLUDE_MACOS:-false}"
+
+          if [ "${include_macos}" = "true" ]; then
+            matrix_json='{"include":[{"name":"Linux amd64","runs_on":"[\"self-hosted\",\"Linux\",\"X64\",\"logpacer-ci\"]","target":"linux-amd64"},{"name":"Linux arm64","runs_on":"[\"self-hosted\",\"Linux\",\"X64\",\"logpacer-ci\"]","target":"linux-arm64"},{"name":"macOS amd64","runs_on":"\"macos-latest\"","target":"darwin-amd64"},{"name":"macOS arm64","runs_on":"\"macos-latest\"","target":"darwin-arm64"},{"name":"Windows amd64","runs_on":"[\"self-hosted\",\"Linux\",\"X64\",\"logpacer-ci\"]","target":"windows-amd64"}]}'
+          else
+            matrix_json='{"include":[{"name":"Linux amd64","runs_on":"[\"self-hosted\",\"Linux\",\"X64\",\"logpacer-ci\"]","target":"linux-amd64"},{"name":"Linux arm64","runs_on":"[\"self-hosted\",\"Linux\",\"X64\",\"logpacer-ci\"]","target":"linux-arm64"},{"name":"Windows amd64","runs_on":"[\"self-hosted\",\"Linux\",\"X64\",\"logpacer-ci\"]","target":"windows-amd64"}]}'
+          fi
+
+          {
+            echo 'build_matrix<<JSON'
+            printf '%s\n' "${matrix_json}"
+            echo 'JSON'
+          } >> "$GITHUB_OUTPUT"
+
   build-binaries:
     name: Build ${{ matrix.name }} Binary
     needs: resolve
@@ -50,23 +75,7 @@ jobs:
     timeout-minutes: 45
     strategy:
       fail-fast: false
-      matrix:
-        include:
-          - name: Linux amd64
-            runs_on: '["self-hosted","Linux","X64","logpacer-ci"]'
-            target: linux-amd64
-          - name: Linux arm64
-            runs_on: '["self-hosted","Linux","X64","logpacer-ci"]'
-            target: linux-arm64
-          - name: macOS amd64
-            runs_on: '"macos-latest"'
-            target: darwin-amd64
-          - name: macOS arm64
-            runs_on: '"macos-latest"'
-            target: darwin-arm64
-          - name: Windows amd64
-            runs_on: '["self-hosted","Linux","X64","logpacer-ci"]'
-            target: windows-amd64
+      matrix: ${{ fromJSON(needs.resolve.outputs.build_matrix) }}
     steps:
       - uses: actions/checkout@v4
 
