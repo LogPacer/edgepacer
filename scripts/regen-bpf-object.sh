@@ -8,9 +8,8 @@
 # Decision 4: the object is checked in so the agent's musl/cross build needs no
 # BPF toolchain. This script is the *only* place that toolchain is used — the BPF
 # source lives in the top-level `bpf/` crate, built with the nightly pinned by
-# `bpf/rust-toolchain.toml` + bpf-linker. Run it where nightly + bpf-linker live
-# (e.g. a Linux validation VM). CI runs `--check` in the `bpf-object` job
-# (.github/workflows/ci.yml).
+# `bpf/rust-toolchain.toml` + bpf-linker. Regeneration is canonical on Linux
+# amd64, matching the CI `bpf-object` job (.github/workflows/ci.yml).
 set -euo pipefail
 
 unset RUSTUP_TOOLCHAIN
@@ -19,12 +18,27 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 SRC_DIR="$ROOT/bpf"
 BUILT="$SRC_DIR/target/bpfel-unknown-none/release/edgepacer-ebpf"
 EMBEDDED="$ROOT/src/ebpf/programs/edgepacer.bpf.o"
+MODE="${1:-regen}"
+
+if [ "$(uname -s)" != "Linux" ] || [ "$(uname -m)" != "x86_64" ]; then
+  case "$MODE" in
+    --check)
+      echo "skip --check: canonical BPF object verification requires Linux x86_64" >&2
+      exit 0
+      ;;
+    regen)
+      echo "refusing to regenerate BPF object outside Linux x86_64" >&2
+      echo "Use the CI bpf-object job environment or an amd64 Linux container." >&2
+      exit 1
+      ;;
+  esac
+fi
 
 echo ">> building BPF object (pinned nightly + bpf-linker)"
 # `cargo build` (not `+nightly`) so bpf/rust-toolchain.toml's pinned channel wins.
 ( cd "$SRC_DIR" && cargo build --release )
 
-case "${1:-regen}" in
+case "$MODE" in
   regen)
     cp "$BUILT" "$EMBEDDED"
     echo "OK: embedded $EMBEDDED ($(wc -c <"$EMBEDDED") bytes)"
