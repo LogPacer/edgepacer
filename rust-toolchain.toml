@@ -1,5 +1,5 @@
 # Pin the build toolchain so cross/cargo don't silently fall back to the
-# machine's rustup default (which lagged at 1.91 while sdjournal needs 1.95).
+# machine's rustup default. Keep this aligned with CI and release builds.
 # build-all.sh unsets RUSTUP_TOOLCHAIN, so this file is what wins there.
 [toolchain]
-channel = "1.95.0"
+channel = "1.96.0"
