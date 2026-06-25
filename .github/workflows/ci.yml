@@ -20,7 +20,7 @@ jobs:
     name: Rust
     runs-on: [self-hosted, Linux, X64, logpacer-ci]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Normalize Linux Rust paths
         run: |
@@ -60,7 +60,7 @@ jobs:
     name: Rust eBPF Feature
     runs-on: [self-hosted, Linux, X64, logpacer-ci]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Normalize Linux Rust paths
         run: |
@@ -94,7 +94,7 @@ jobs:
     name: BPF Object
     runs-on: [self-hosted, Linux, X64, logpacer-ci]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Normalize Linux Rust paths
         run: |
@@ -132,10 +132,10 @@ jobs:
     name: Helm
     runs-on: [self-hosted, Linux, X64, logpacer-ci]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Set up Helm
-        uses: azure/setup-helm@v4
+        uses: azure/setup-helm@v5
 
       - name: Lint chart
         run: helm lint charts/edgepacer
@@ -147,7 +147,7 @@ jobs:
     name: Supply Chain
     runs-on: [self-hosted, Linux, X64, logpacer-ci]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Normalize Linux Rust paths
         run: |
