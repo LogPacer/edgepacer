@@ -4,7 +4,7 @@
 //! Data flow:
 //! POST /v1/traces (protobuf body, <=10MB)
 //!   -> deserialize ExportTraceServiceRequest
-//!   -> for each span: serialize to the LogPacer ingest trace JSON contract
+//!   -> for each span: serialize to a JSON object (the Sublogger contract)
 //!   -> pack the JSON objects into a WireTraceBatch, encode the WireRequest
 //!   -> ship the encoded bytes VERBATIM to subbox_endpoint (the wire URL)
 //!   -> on retryable failure: buffer the encoded bytes to disk for replay
@@ -938,6 +938,86 @@ mod tests {
         proxy.start().await.expect("proxy should start");
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         proxy.stop().await;
+    }
+
+    #[tokio::test]
+    async fn proxy_accepts_otlp_and_forwards_wire_traces() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path(WIRE_PATH))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_raw(wire_response(1, 0, ""), "application/x-protobuf"),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let listen_address = listener.local_addr().unwrap();
+        drop(listener);
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = test_config(
+            format!("{}{WIRE_PATH}", server.uri()),
+            &dir.path().join("trace-buffer.sqlite"),
+        );
+        config.listen_address = listen_address;
+
+        let mut proxy = TraceProxy::new(config);
+        proxy.start().await.expect("proxy should start");
+
+        let body = encode_trace_request(vec![resource_span_with_service(Some("checkout"))]);
+        let url = format!("http://{listen_address}/v1/traces");
+        let client = reqwest::Client::new();
+        let response = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                match client
+                    .post(&url)
+                    .header("content-type", "application/x-protobuf")
+                    .body(body.clone())
+                    .send()
+                    .await
+                {
+                    Ok(response) => break response,
+                    Err(_) => tokio::time::sleep(std::time::Duration::from_millis(50)).await,
+                }
+            }
+        })
+        .await
+        .expect("trace proxy should accept the OTLP request before timeout");
+
+        let requests = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let requests = server.received_requests().await.unwrap();
+                if !requests.is_empty() {
+                    break requests;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("wire relay should receive forwarded traces before timeout");
+
+        proxy.stop().await;
+
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        assert_eq!(requests.len(), 1, "exactly one payload should be forwarded");
+
+        let forwarded =
+            WireRequest::decode(&requests[0].body[..]).expect("forwarded body decodes as wire");
+        assert_eq!(forwarded.batches.len(), 1);
+        assert_eq!(forwarded.batches[0].archive_id, "arc_test");
+        assert_eq!(forwarded.batches[0].repo_id, "repo_test");
+
+        let Some(routed_batch::Payload::Traces(traces)) = &forwarded.batches[0].payload else {
+            panic!("expected routed traces payload");
+        };
+        assert_eq!(traces.entries_json.len(), 1);
+
+        let span: serde_json::Value = serde_json::from_slice(&traces.entries_json[0]).unwrap();
+        assert_eq!(span["name"], serde_json::json!("sample"));
+        assert_eq!(span["service_name"], serde_json::json!("checkout"));
     }
 
     #[tokio::test]

@@ -132,6 +132,9 @@ tikv-jemallocator = { version = "0.6", features = ["background_threads", "disabl
 # `ebpf` feature; Linux-only, so the feature is never enabled on macOS.
 aya = { version = "0.13", optional = true }
 
+[target.'cfg(target_os = "windows")'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_ProcessStatus"] }
+
 # libc for process group management (manager)
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

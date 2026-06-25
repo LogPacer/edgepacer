@@ -79,7 +79,7 @@ pub fn load_token(filename: &str) -> Option<String> {
 
 /// Persist a token to disk with atomic write and security checks.
 ///
-/// Security model (matching legacy EdgePacer manager):
+/// Security model (matching Go edgepacer manager):
 /// - Directory created with 0700 permissions (Unix)
 /// - Symlink check before write (prevents symlink attacks)
 /// - Write to temp file with 0600 permissions, then atomic rename
@@ -182,7 +182,9 @@ fn write_secure_file(path: &std::path::Path, contents: &str) -> anyhow::Result<(
 mod tests {
     use super::*;
     use std::cell::RefCell;
+    #[cfg(unix)]
     use std::ffi::OsString;
+    #[cfg(unix)]
     use std::path::{Path, PathBuf};
 
     #[test]

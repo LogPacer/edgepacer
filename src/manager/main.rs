@@ -3,15 +3,20 @@
 //! Handles bootstrap token persistence, process lifecycle (start/stop/restart),
 //! auto-updates with rollback, and health monitoring.
 //!
-//! Mirrors legacy EdgePacer's `cmd/edgepacer-manager/main.go`.
+//! Mirrors Go edgepacer's `cmd/edgepacer-manager/main.go`.
 
-use clap::Parser;
+use clap::{Args, Parser, Subcommand};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 
-use edgepacer::manager::{auth::ManagerAuth, process::ProcessManager, updater::Updater};
+use edgepacer::manager::{
+    auth::ManagerAuth,
+    process::ProcessManager,
+    updater::Updater,
+    windows_service::{self, InstallConfig},
+};
 use edgepacer::token_store;
 
 /// CLI arguments for edgepacer-manager.
@@ -22,17 +27,26 @@ use edgepacer::token_store;
     about = "EdgePacer supervisor — manages agent lifecycle and updates"
 )]
 struct Cli {
+    #[command(subcommand)]
+    command: Option<ManagerCommand>,
+
+    #[command(flatten)]
+    run: RunArgs,
+}
+
+#[derive(Args, Debug)]
+struct RunArgs {
     /// Path to the edgepacer binary
     #[arg(long, default_value = "./edgepacer", env = "EDGEPACER_PATH")]
     edgepacer: PathBuf,
 
     /// Rails control-plane URL
     #[arg(long, env = "EDGEPACER_RAILS_URL")]
-    rails: String,
+    rails: Option<String>,
 
     /// Account bootstrap token (for initial setup)
     #[arg(long, env = "EDGEPACER_ACCOUNT_TOKEN")]
-    account_token: String,
+    account_token: Option<String>,
 
     /// Platform identifier (auto-detected if not set)
     #[arg(long, default_value_t = detect_platform())]
@@ -59,6 +73,54 @@ struct Cli {
     force_update: bool,
 }
 
+#[derive(Subcommand, Debug)]
+enum ManagerCommand {
+    /// Install, remove, and control the Windows Service wrapper
+    Service(ServiceArgs),
+}
+
+#[derive(Args, Debug)]
+struct ServiceArgs {
+    #[command(subcommand)]
+    command: ServiceCommand,
+}
+
+#[derive(Subcommand, Debug)]
+enum ServiceCommand {
+    /// Register edgepacer-manager as a Windows Service
+    Install(ServiceInstallArgs),
+    /// Delete the Windows Service registration
+    Uninstall(ServiceNameArgs),
+    /// Start the Windows Service
+    Start(ServiceNameArgs),
+    /// Stop the Windows Service
+    Stop(ServiceNameArgs),
+    /// Query Windows Service status
+    Status(ServiceNameArgs),
+}
+
+#[derive(Args, Debug)]
+struct ServiceInstallArgs {
+    /// Windows Service name
+    #[arg(long, default_value = windows_service::DEFAULT_SERVICE_NAME)]
+    name: String,
+
+    /// Windows Service display name
+    #[arg(long, default_value = windows_service::DEFAULT_DISPLAY_NAME)]
+    display_name: String,
+
+    /// Path to the edgepacer-manager binary registered in the service binPath
+    #[arg(long)]
+    manager_path: Option<PathBuf>,
+}
+
+#[derive(Args, Debug)]
+struct ServiceNameArgs {
+    /// Windows Service name
+    #[arg(long, default_value = windows_service::DEFAULT_SERVICE_NAME)]
+    name: String,
+}
+
 fn detect_platform() -> String {
     go_platform_name(std::env::consts::OS, std::env::consts::ARCH)
 }
@@ -81,6 +143,7 @@ fn go_platform_name(os: &str, arch: &str) -> String {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
+    let run = cli.run;
 
     // Initialize logging
     let filter = EnvFilter::try_new("info").unwrap();
@@ -89,54 +152,65 @@ async fn main() -> anyhow::Result<()> {
         .with_target(false)
         .init();
 
+    if let Some(command) = cli.command {
+        handle_manager_command(command, &run).await?;
+        return Ok(());
+    }
+
+    let rails = required_arg(run.rails.as_deref(), "--rails / EDGEPACER_RAILS_URL")?;
+    let account_token = required_arg(
+        run.account_token.as_deref(),
+        "--account-token / EDGEPACER_ACCOUNT_TOKEN",
+    )?;
+
     info!(
         version = env!("CARGO_PKG_VERSION"),
-        platform = %cli.platform,
-        edgepacer_path = %cli.edgepacer.display(),
+        platform = %run.platform,
+        edgepacer_path = %run.edgepacer.display(),
         "[manager] edgepacer-manager starting"
     );
 
     // Step 1: Ensure bootstrap token
-    edgepacer::common::validate_control_plane_url(&cli.rails)?;
-    let mut auth = ManagerAuth::new(&cli.rails, &cli.account_token);
+    edgepacer::common::validate_control_plane_url(rails)?;
+    let mut auth = ManagerAuth::new(rails, account_token);
     auth.ensure_bootstrap_token().await?;
 
     // Step 2: Ensure edgepacer binary exists
     let installation_id = token_store::load_or_create_installation_id().unwrap_or_default();
     let updater = Updater::new(
-        &cli.rails,
+        rails,
         auth.token(),
-        &cli.platform,
+        &run.platform,
         &installation_id,
-        cli.update_public_key.as_deref(),
+        run.update_public_key.as_deref(),
     )?;
 
-    if !cli.edgepacer.exists() || cli.force_update {
+    if !run.edgepacer.exists() || run.force_update {
         info!("[manager] downloading edgepacer binary");
-        let current_version = if cli.edgepacer.exists() {
-            get_binary_version(&cli.edgepacer).await.unwrap_or_default()
+        let current_version = if run.edgepacer.exists() {
+            get_binary_version(&run.edgepacer).await.unwrap_or_default()
         } else {
             String::new()
         };
 
         if let Some(update) = updater.check_for_update(&current_version).await? {
-            let new_path = updater.download_and_verify(&update, &cli.edgepacer).await?;
-            Updater::install_new(&new_path, &cli.edgepacer)?;
+            let new_path = updater.download_and_verify(&update, &run.edgepacer).await?;
+            Updater::install_new(&new_path, &run.edgepacer)?;
             info!(version = %update.version, "[manager] edgepacer binary installed");
-        } else if !cli.edgepacer.exists() {
+        } else if !run.edgepacer.exists() {
             anyhow::bail!(
                 "edgepacer binary not found at {} and no update available",
-                cli.edgepacer.display()
+                run.edgepacer.display()
             );
         }
     }
 
     // Step 3: Start the agent
-    let mut process = ProcessManager::new(&cli.edgepacer, &cli.rails, cli.debug);
+    let mut process = ProcessManager::new(&run.edgepacer, rails, run.debug);
     process.start(auth.token()).await?;
 
     // Step 4: Wait for health check
-    let health_timeout = Duration::from_secs(cli.health_timeout);
+    let health_timeout = Duration::from_secs(run.health_timeout);
     process.wait_healthy(health_timeout).await?;
 
     // Step 5: Set up signal handling
@@ -147,7 +221,7 @@ async fn main() -> anyhow::Result<()> {
     });
 
     // Step 6: Enter update check loop
-    let check_interval = Duration::from_secs(cli.check_interval);
+    let check_interval = Duration::from_secs(run.check_interval);
     info!(
         interval_secs = check_interval.as_secs(),
         "[manager] entering update check loop"
@@ -195,7 +269,7 @@ async fn main() -> anyhow::Result<()> {
                     &mut process,
                     &updater,
                     &update,
-                    &cli.edgepacer,
+                    &run.edgepacer,
                     &current_version,
                     auth.token(),
                     health_timeout,
@@ -220,6 +294,67 @@ async fn main() -> anyhow::Result<()> {
     info!("[manager] edgepacer-manager stopped");
 
     Ok(())
+}
+
+fn required_arg<'a>(value: Option<&'a str>, name: &str) -> anyhow::Result<&'a str> {
+    value
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| anyhow::anyhow!("{name} is required"))
+}
+
+async fn handle_manager_command(command: ManagerCommand, run: &RunArgs) -> anyhow::Result<()> {
+    match command {
+        ManagerCommand::Service(args) => handle_service_command(args.command, run).await,
+    }
+}
+
+async fn handle_service_command(command: ServiceCommand, run: &RunArgs) -> anyhow::Result<()> {
+    let output = match command {
+        ServiceCommand::Install(args) => {
+            let config = service_install_config(args, run)?;
+            windows_service::install_service(&config).await?
+        }
+        ServiceCommand::Uninstall(args) => windows_service::uninstall_service(&args.name).await?,
+        ServiceCommand::Start(args) => windows_service::start_service(&args.name).await?,
+        ServiceCommand::Stop(args) => windows_service::stop_service(&args.name).await?,
+        ServiceCommand::Status(args) => windows_service::status_service(&args.name).await?,
+    };
+
+    if !output.is_empty() {
+        println!("{output}");
+    }
+    Ok(())
+}
+
+fn service_install_config(
+    args: ServiceInstallArgs,
+    run: &RunArgs,
+) -> anyhow::Result<InstallConfig> {
+    let rails = required_arg(run.rails.as_deref(), "--rails / EDGEPACER_RAILS_URL")?;
+    let account_token = required_arg(
+        run.account_token.as_deref(),
+        "--account-token / EDGEPACER_ACCOUNT_TOKEN",
+    )?;
+    let manager_path = match args.manager_path {
+        Some(path) => path,
+        None => std::env::current_exe()
+            .map_err(|e| anyhow::anyhow!("failed to detect current manager path: {e}"))?,
+    };
+
+    Ok(InstallConfig {
+        service_name: args.name,
+        display_name: args.display_name,
+        manager_path,
+        edgepacer_path: run.edgepacer.clone(),
+        rails_url: rails.to_string(),
+        account_token: account_token.to_string(),
+        platform: run.platform.clone(),
+        check_interval: run.check_interval,
+        health_timeout: run.health_timeout,
+        update_public_key: run.update_public_key.clone(),
+        debug: run.debug,
+        force_update: run.force_update,
+    })
 }
 
 /// Perform a full update with rollback on failure.
@@ -326,8 +461,8 @@ async fn get_binary_version(path: &PathBuf) -> anyhow::Result<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Cli, detect_platform, go_platform_name};
-    use clap::CommandFactory;
+    use super::{Cli, ServiceCommand, detect_platform, go_platform_name, service_install_config};
+    use clap::{CommandFactory, Parser};
 
     #[test]
     fn detect_platform_uses_go_style_names_on_current_host() {
@@ -361,5 +496,44 @@ mod tests {
     #[test]
     fn cli_exposes_version_flag() {
         assert!(Cli::command().get_version().is_some());
+    }
+
+    #[test]
+    fn cli_parses_service_status_without_run_credentials() {
+        let cli = Cli::try_parse_from(["edgepacer-manager", "service", "status"]).unwrap();
+
+        let Some(super::ManagerCommand::Service(service)) = cli.command else {
+            panic!("expected service command");
+        };
+        let ServiceCommand::Status(args) = service.command else {
+            panic!("expected service status command");
+        };
+        assert_eq!(
+            args.name,
+            edgepacer::manager::windows_service::DEFAULT_SERVICE_NAME
+        );
+    }
+
+    #[test]
+    fn service_install_requires_run_credentials() {
+        let run = super::RunArgs {
+            edgepacer: "./edgepacer".into(),
+            rails: None,
+            account_token: Some("account-token".into()),
+            platform: "windows-amd64".into(),
+            check_interval: 30,
+            health_timeout: 60,
+            update_public_key: None,
+            debug: false,
+            force_update: false,
+        };
+        let args = super::ServiceInstallArgs {
+            name: "EdgePacerTest".into(),
+            display_name: "EdgePacer Test".into(),
+            manager_path: Some("./edgepacer-manager".into()),
+        };
+
+        let err = service_install_config(args, &run).unwrap_err();
+        assert!(err.to_string().contains("--rails"));
     }
 }
