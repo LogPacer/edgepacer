@@ -23,6 +23,7 @@ pub struct Client {
     bearer_token: Arc<RwLock<String>>,
     bootstrap_token: String,
     installation_id: String,
+    host_mode: bool,
 }
 
 /// Response from POST /api/v1/agents/auth (token exchange)
@@ -152,12 +153,13 @@ async fn require_success(
 fn build_auth_payload(
     hostname: String,
     installation_id: String,
+    host_mode: bool,
     runtime_context: crate::bootstrap::RuntimeContext,
 ) -> AuthPayload {
     AuthPayload {
         hostname,
         installation_id,
-        host_mode: true,
+        host_mode,
         runtime_context,
     }
 }
@@ -191,6 +193,7 @@ impl Client {
             bearer_token: Arc::new(RwLock::new(bootstrap_token.clone())),
             bootstrap_token,
             installation_id,
+            host_mode: config.host_mode,
         })
     }
 
@@ -242,6 +245,7 @@ impl Client {
         let payload = build_auth_payload(
             hostname,
             self.installation_id.clone(),
+            self.host_mode,
             crate::bootstrap::collect_runtime_context(),
         );
 
@@ -693,6 +697,7 @@ mod tests {
             readiness_file: None,
             local_mode: false,
             directive_file: None,
+            host_mode: true,
         }
     }
 
@@ -857,6 +862,7 @@ mod tests {
         let payload = build_auth_payload(
             "host-1".into(),
             "installation-1".into(),
+            true,
             RuntimeContext {
                 in_container: true,
                 container_runtime: Some("docker".into()),
@@ -872,9 +878,34 @@ mod tests {
         let json = serde_json::to_value(payload).unwrap();
         assert_eq!(json["hostname"], "host-1");
         assert_eq!(json["installation_id"], "installation-1");
+        assert_eq!(json["host_mode"], true);
         assert_eq!(json["runtime_context"]["in_container"], true);
         assert_eq!(json["runtime_context"]["container_runtime"], "docker");
         assert_eq!(json["runtime_context"]["deployment_type"], "host");
+    }
+
+    #[test]
+    fn auth_payload_serializes_service_mode_override() {
+        let payload = build_auth_payload(
+            "sidecar-1".into(),
+            "installation-1".into(),
+            false,
+            RuntimeContext {
+                in_container: true,
+                container_runtime: Some("docker".into()),
+                deployment_type: "container".into(),
+                namespace: None,
+                deployment: None,
+                pod_name: None,
+                node_name: None,
+                container: None,
+            },
+        );
+
+        let json = serde_json::to_value(payload).unwrap();
+
+        assert_eq!(json["host_mode"], false);
+        assert_eq!(json["runtime_context"]["deployment_type"], "container");
     }
 
     #[test]
@@ -919,6 +950,7 @@ mod tests {
             readiness_file: None,
             local_mode: false,
             directive_file: None,
+            host_mode: true,
         };
         let client = Client::new_for_test(&config, "installation-1").unwrap();
         let shared_token = client.shared_token();

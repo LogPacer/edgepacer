@@ -44,9 +44,10 @@ pub struct Cli {
     pub directive_file: Option<std::path::PathBuf>,
 
     // Legacy flags passed unconditionally by manager <= 0.1.x. Accepted and
-    // ignored so a new agent can start under an old manager — agent
-    // auto-updates roll independently of the manager binary, so rejecting
-    // these turns every update under an old manager into a crash loop.
+    // treated as host-mode so a new agent can start under an old manager —
+    // agent auto-updates roll independently of the manager binary, so rejecting
+    // this turns every update under an old manager into a crash loop. Use
+    // EDGEPACER_HOST_MODE=false for sidecar/service-mode containers.
     #[arg(long, hide = true)]
     pub host_mode: bool,
     #[arg(long, hide = true)]
@@ -67,6 +68,7 @@ pub struct AppConfig {
     pub readiness_file: Option<String>,
     pub local_mode: bool,
     pub directive_file: Option<std::path::PathBuf>,
+    pub host_mode: bool,
 }
 
 impl AppConfig {
@@ -74,7 +76,23 @@ impl AppConfig {
     where
         F: Fn(&str) -> Option<String>,
     {
+        Self::try_from_with_loader_and_host_mode_env(
+            cli,
+            load_token,
+            std::env::var("EDGEPACER_HOST_MODE").ok(),
+        )
+    }
+
+    fn try_from_with_loader_and_host_mode_env<F>(
+        cli: Cli,
+        load_token: F,
+        host_mode_env: Option<String>,
+    ) -> anyhow::Result<Self>
+    where
+        F: Fn(&str) -> Option<String>,
+    {
         let (token, is_account_token) = resolve_bootstrap_token(&cli, load_token)?;
+        let host_mode = resolve_host_mode(host_mode_env.as_deref())?;
         if !cli.local_mode {
             crate::common::validate_control_plane_url(&cli.rails)?;
         }
@@ -89,6 +107,7 @@ impl AppConfig {
             readiness_file: cli.readiness_file,
             local_mode: cli.local_mode,
             directive_file: cli.directive_file,
+            host_mode,
         })
     }
 }
@@ -149,6 +168,27 @@ fn normalize_stored_token(token: &str) -> Option<String> {
     (!token.is_empty()).then(|| token.to_string())
 }
 
+fn resolve_host_mode(host_mode_env: Option<&str>) -> anyhow::Result<bool> {
+    if let Some(value) = host_mode_env.and_then(non_empty_str) {
+        return parse_host_mode(value);
+    }
+
+    Ok(true)
+}
+
+fn non_empty_str(value: &str) -> Option<&str> {
+    let value = value.trim();
+    (!value.is_empty()).then_some(value)
+}
+
+fn parse_host_mode(value: &str) -> anyhow::Result<bool> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Ok(true),
+        "0" | "false" | "no" | "off" => Ok(false),
+        _ => anyhow::bail!("EDGEPACER_HOST_MODE must be true/false, 1/0, yes/no, or on/off"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -168,6 +208,17 @@ mod tests {
             log_format: None,
             debug: false,
         }
+    }
+
+    fn config_with_host_mode_env(
+        cli: Cli,
+        host_mode_env: Option<&str>,
+    ) -> anyhow::Result<AppConfig> {
+        AppConfig::try_from_with_loader_and_host_mode_env(
+            cli,
+            |_| None,
+            host_mode_env.map(str::to_string),
+        )
     }
 
     #[test]
@@ -195,6 +246,7 @@ mod tests {
 
         assert_eq!(config.token.as_deref(), Some("account-token"));
         assert!(config.is_account_token);
+        assert!(config.host_mode);
     }
 
     #[test]
@@ -217,6 +269,47 @@ mod tests {
 
         assert_eq!(config.token.as_deref(), Some("server-token"));
         assert!(!config.is_account_token);
+    }
+
+    #[test]
+    fn host_mode_defaults_to_true() {
+        let mut cli = base_cli();
+        cli.server_token = Some("server-token".into());
+
+        let config = config_with_host_mode_env(cli, None).unwrap();
+
+        assert!(config.host_mode);
+    }
+
+    #[test]
+    fn host_mode_can_be_disabled_by_environment() {
+        let mut cli = base_cli();
+        cli.server_token = Some("server-token".into());
+
+        let config = config_with_host_mode_env(cli, Some("false")).unwrap();
+
+        assert!(!config.host_mode);
+    }
+
+    #[test]
+    fn host_mode_environment_overrides_legacy_flag() {
+        let mut cli = base_cli();
+        cli.server_token = Some("server-token".into());
+        cli.host_mode = true;
+
+        let config = config_with_host_mode_env(cli, Some("0")).unwrap();
+
+        assert!(!config.host_mode);
+    }
+
+    #[test]
+    fn host_mode_rejects_invalid_environment_value() {
+        let mut cli = base_cli();
+        cli.server_token = Some("server-token".into());
+
+        let err = config_with_host_mode_env(cli, Some("sometimes")).unwrap_err();
+
+        assert!(err.to_string().contains("EDGEPACER_HOST_MODE"));
     }
 
     #[test]
