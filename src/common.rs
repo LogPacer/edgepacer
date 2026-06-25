@@ -18,13 +18,20 @@ pub fn new_request_id() -> String {
 
 /// Build a `Bearer` `Authorization` header value from a token.
 ///
-/// Returns `None` (and warns) when the token contains bytes that are invalid in
-/// an HTTP header — e.g. a stray newline from a corrupted on-disk token file or
-/// a malformed Rails response. A long-running agent must degrade to an
-/// unauthenticated request (which surfaces as 401 → token refresh) rather than
-/// panic, so this never unwraps. The value is marked sensitive so it is redacted
-/// from header debug output.
+/// Leading/trailing whitespace is ignored so Kubernetes Secret files and
+/// copied tokens with a final newline still authenticate. Returns `None` (and
+/// warns) when the normalized token is empty or contains bytes that are invalid
+/// in an HTTP header. A long-running agent must degrade to an unauthenticated
+/// request (which surfaces as 401 → token refresh) rather than panic, so this
+/// never unwraps. The value is marked sensitive so it is redacted from header
+/// debug output.
 pub fn bearer_header(token: &str) -> Option<reqwest::header::HeaderValue> {
+    let token = token.trim();
+    if token.is_empty() {
+        tracing::warn!("empty bearer token, sending request without Authorization header");
+        return None;
+    }
+
     match reqwest::header::HeaderValue::from_str(&format!("Bearer {token}")) {
         Ok(mut value) => {
             value.set_sensitive(true);
@@ -126,6 +133,19 @@ mod url_tests {
     #[test]
     fn control_plane_url_rejects_remote_http() {
         assert!(validate_control_plane_url("http://app.logpacer.com").is_err());
+    }
+
+    #[test]
+    fn bearer_header_trims_secret_file_newline() {
+        let value = bearer_header("token-from-secret\n").unwrap();
+
+        assert_eq!(value.to_str().unwrap(), "Bearer token-from-secret");
+        assert!(value.is_sensitive());
+    }
+
+    #[test]
+    fn bearer_header_rejects_blank_token() {
+        assert!(bearer_header(" \n\t").is_none());
     }
 }
 

@@ -111,11 +111,11 @@ where
         );
     }
 
-    if let Some(token) = cli.account_token.clone() {
+    if let Some(token) = normalize_configured_token(cli.account_token.as_deref(), "account")? {
         return Ok((Some(token), true));
     }
 
-    if let Some(token) = cli.server_token.clone() {
+    if let Some(token) = normalize_configured_token(cli.server_token.as_deref(), "server")? {
         return Ok((Some(token), false));
     }
 
@@ -123,13 +123,30 @@ where
         return Ok((None, false));
     }
 
-    if let Some(token) = load_token("server_bootstrap_token") {
+    if let Some(token) =
+        load_token("server_bootstrap_token").and_then(|token| normalize_stored_token(&token))
+    {
         return Ok((Some(token), false));
     }
 
     anyhow::bail!(
         "no bootstrap token available; set EDGEPACER_ACCOUNT_TOKEN or EDGEPACER_SERVER_TOKEN, or persist server_bootstrap_token to disk"
     )
+}
+
+fn normalize_configured_token(token: Option<&str>, source: &str) -> anyhow::Result<Option<String>> {
+    let Some(token) = token else {
+        return Ok(None);
+    };
+
+    normalize_stored_token(token)
+        .map(Some)
+        .ok_or_else(|| anyhow::anyhow!("{source} bootstrap token cannot be empty"))
+}
+
+fn normalize_stored_token(token: &str) -> Option<String> {
+    let token = token.trim();
+    (!token.is_empty()).then(|| token.to_string())
 }
 
 #[cfg(test)]
@@ -181,9 +198,31 @@ mod tests {
     }
 
     #[test]
+    fn trims_account_token_secret_file_newline() {
+        let mut cli = base_cli();
+        cli.account_token = Some("account-token\n".into());
+
+        let config = AppConfig::try_from_with_loader(cli, |_| None).unwrap();
+
+        assert_eq!(config.token.as_deref(), Some("account-token"));
+        assert!(config.is_account_token);
+    }
+
+    #[test]
     fn uses_server_token_when_present() {
         let mut cli = base_cli();
         cli.server_token = Some("server-token".into());
+
+        let config = AppConfig::try_from_with_loader(cli, |_| None).unwrap();
+
+        assert_eq!(config.token.as_deref(), Some("server-token"));
+        assert!(!config.is_account_token);
+    }
+
+    #[test]
+    fn trims_server_token_secret_file_newline() {
+        let mut cli = base_cli();
+        cli.server_token = Some("server-token\n".into());
 
         let config = AppConfig::try_from_with_loader(cli, |_| None).unwrap();
 
@@ -203,11 +242,34 @@ mod tests {
     }
 
     #[test]
+    fn rejects_blank_configured_token() {
+        let mut cli = base_cli();
+        cli.account_token = Some(" \n".into());
+
+        let err = AppConfig::try_from_with_loader(cli, |_| None).unwrap_err();
+
+        assert!(err.to_string().contains("cannot be empty"));
+    }
+
+    #[test]
     fn falls_back_to_persisted_server_bootstrap_token() {
         let cli = base_cli();
 
         let config = AppConfig::try_from_with_loader(cli, |name| {
             (name == "server_bootstrap_token").then(|| "persisted-server-token".into())
+        })
+        .unwrap();
+
+        assert_eq!(config.token.as_deref(), Some("persisted-server-token"));
+        assert!(!config.is_account_token);
+    }
+
+    #[test]
+    fn trims_persisted_server_bootstrap_token() {
+        let cli = base_cli();
+
+        let config = AppConfig::try_from_with_loader(cli, |name| {
+            (name == "server_bootstrap_token").then(|| "persisted-server-token\n".into())
         })
         .unwrap();
 

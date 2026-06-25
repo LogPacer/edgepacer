@@ -298,6 +298,7 @@ async fn main() -> anyhow::Result<()> {
 
 fn required_arg<'a>(value: Option<&'a str>, name: &str) -> anyhow::Result<&'a str> {
     value
+        .map(str::trim)
         .filter(|value| !value.is_empty())
         .ok_or_else(|| anyhow::anyhow!("{name} is required"))
 }
@@ -535,5 +536,12 @@ mod tests {
 
         let err = service_install_config(args, &run).unwrap_err();
         assert!(err.to_string().contains("--rails"));
+    }
+
+    #[test]
+    fn required_arg_trims_secret_file_newline() {
+        let value = super::required_arg(Some("account-token\n"), "--account-token").unwrap();
+
+        assert_eq!(value, "account-token");
     }
 }
