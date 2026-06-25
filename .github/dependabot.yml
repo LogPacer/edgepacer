@@ -7,22 +7,161 @@ updates:
       day: monday
       time: "09:00"
       timezone: Etc/UTC
-    open-pull-requests-limit: 3
+    open-pull-requests-limit: 10
     groups:
       rust-patch:
+        applies-to: version-updates
         patterns:
           - "*"
         update-types:
           - patch
-      rust-minor:
+      rust-kubernetes:
+        applies-to: version-updates
         patterns:
-          - "*"
+          - "kube"
+          - "kube-*"
+          - "k8s-openapi"
         update-types:
           - minor
-      rust-major:
+          - major
+      rust-opentelemetry:
+        applies-to: version-updates
         patterns:
-          - "*"
+          - "opentelemetry*"
         update-types:
+          - minor
+          - major
+      rust-wire:
+        applies-to: version-updates
+        patterns:
+          - "prost"
+          - "prost-*"
+          - "protobuf-src"
+        update-types:
+          - minor
+          - major
+      rust-digests:
+        applies-to: version-updates
+        patterns:
+          - "sha2"
+          - "hex"
+        update-types:
+          - minor
+          - major
+      rust-signing:
+        applies-to: version-updates
+        patterns:
+          - "ed25519-dalek"
+        update-types:
+          - minor
+          - major
+      rust-docker:
+        applies-to: version-updates
+        patterns:
+          - "bollard"
+        update-types:
+          - minor
+          - major
+      rust-legacy-storage:
+        applies-to: version-updates
+        patterns:
+          - "redb"
+        update-types:
+          - minor
+          - major
+      rust-sqlite-storage:
+        applies-to: version-updates
+        patterns:
+          - "rusqlite"
+        update-types:
+          - minor
+          - major
+      rust-host-metrics:
+        applies-to: version-updates
+        patterns:
+          - "sysinfo"
+        update-types:
+          - minor
+          - major
+      rust-linux-runtime:
+        applies-to: version-updates
+        patterns:
+          - "aya"
+          - "libc"
+          - "procfs"
+          - "sdjournal"
+          - "tikv-jemallocator"
+        update-types:
+          - minor
+          - major
+      rust-async-runtime:
+        applies-to: version-updates
+        patterns:
+          - "futures-util"
+          - "tokio"
+          - "tokio-*"
+        update-types:
+          - minor
+          - major
+      rust-http:
+        applies-to: version-updates
+        patterns:
+          - "axum"
+          - "httparse"
+          - "httlib-hpack"
+          - "reqwest"
+        update-types:
+          - minor
+          - major
+      rust-serialization:
+        applies-to: version-updates
+        patterns:
+          - "serde"
+          - "serde-*"
+          - "serde_*"
+          - "serde_json"
+        update-types:
+          - minor
+          - major
+      rust-cli:
+        applies-to: version-updates
+        patterns:
+          - "clap"
+          - "clap-*"
+          - "clap_*"
+        update-types:
+          - minor
+          - major
+      rust-logging:
+        applies-to: version-updates
+        patterns:
+          - "tracing"
+          - "tracing-*"
+        update-types:
+          - minor
+          - major
+      rust-test:
+        applies-to: version-updates
+        patterns:
+          - "tempfile"
+          - "tokio-test"
+          - "wiremock"
+        update-types:
+          - minor
+          - major
+      rust-utilities:
+        applies-to: version-updates
+        patterns:
+          - "anyhow"
+          - "chrono"
+          - "dirs"
+          - "flate2"
+          - "gethostname"
+          - "regex"
+          - "thiserror"
+          - "uuid"
+        update-types:
+          - minor
           - major
   - package-ecosystem: github-actions
     directory: "/"
