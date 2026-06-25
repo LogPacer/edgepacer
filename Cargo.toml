@@ -82,7 +82,7 @@ flate2 = "1"
 regex = "1"
 
 # System metrics (CPU, memory, disk, network, processes)
-sysinfo = "0.33"
+sysinfo = "0.39"
 
 # Docker discovery + streaming
 bollard = "0.18"
