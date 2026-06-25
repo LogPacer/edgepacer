@@ -108,11 +108,16 @@ setup_target() {
 
 sha256_file() {
     local file_path="$1"
+    local file_dir
+    local file_name
+
+    file_dir="$(cd "$(dirname "$file_path")" && pwd)"
+    file_name="$(basename "$file_path")"
 
     if command -v shasum >/dev/null 2>&1; then
-        shasum -a 256 "$file_path" > "${file_path}.sha256"
+        (cd "$file_dir" && shasum -a 256 "$file_name" > "${file_name}.sha256")
     elif command -v sha256sum >/dev/null 2>&1; then
-        sha256sum "$file_path" > "${file_path}.sha256"
+        (cd "$file_dir" && sha256sum "$file_name" > "${file_name}.sha256")
     else
         log_error "No SHA256 tool found (expected shasum or sha256sum)"
         exit 1
