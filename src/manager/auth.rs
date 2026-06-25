@@ -147,7 +147,7 @@ impl ManagerAuth {
             return false;
         }
 
-        match self.validate_token(&persisted).await {
+        match self.validate_token(persisted).await {
             Ok(()) => {
                 info!("[manager] using persisted server bootstrap token");
                 if backfill_fingerprint {
