@@ -18,7 +18,7 @@ env:
 jobs:
   rust:
     name: Rust
-    runs-on: [self-hosted, Linux, X64, logpacer-ci]
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7
 
@@ -58,7 +58,7 @@ jobs:
 
   ebpf:
     name: Rust eBPF Feature
-    runs-on: [self-hosted, Linux, X64, logpacer-ci]
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7
 
@@ -92,7 +92,7 @@ jobs:
 
   bpf-object:
     name: BPF Object
-    runs-on: [self-hosted, Linux, X64, logpacer-ci]
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7
 
@@ -130,7 +130,7 @@ jobs:
 
   helm:
     name: Helm
-    runs-on: [self-hosted, Linux, X64, logpacer-ci]
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7
 
@@ -145,7 +145,7 @@ jobs:
 
   supply-chain:
     name: Supply Chain
-    runs-on: [self-hosted, Linux, X64, logpacer-ci]
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7
 
