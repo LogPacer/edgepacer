@@ -12,6 +12,7 @@ use crate::config::{StreamAccessMethod, StreamingSourceConfig};
 use crate::docker_stream;
 use crate::journald_stream;
 use crate::streaming_actor::StreamHandle;
+use crate::windows_event_log;
 
 const MAX_BACKOFF: Duration = Duration::from_secs(30);
 
@@ -60,6 +61,19 @@ pub async fn run_streaming_reader(
                     unit,
                     &config.log_source_id,
                     cursor,
+                    &mut shutdown,
+                )
+                .await;
+            }
+            StreamAccessMethod::WindowsEventLog { channel } => {
+                let record_id = checkpoint
+                    .as_ref()
+                    .and_then(|cp| cp.windows_event_record_id(channel));
+                windows_event_log::stream_event_log(
+                    &handle,
+                    channel,
+                    &config.log_source_id,
+                    record_id,
                     &mut shutdown,
                 )
                 .await;

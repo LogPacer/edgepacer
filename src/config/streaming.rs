@@ -3,6 +3,7 @@
 pub enum StreamAccessMethod {
     DockerApi { container_id: String },
     Journald { unit: String },
+    WindowsEventLog { channel: String },
 }
 
 /// A streaming log source extracted from unified config.

@@ -54,6 +54,7 @@ pub enum MatchVia {
     ContainerId,
     SystemdUnit,
     FilePath,
+    WindowsEventLog,
 }
 
 impl MatchVia {
@@ -66,6 +67,7 @@ impl MatchVia {
             MatchVia::ContainerId => "container_id",
             MatchVia::SystemdUnit => "systemd_unit",
             MatchVia::FilePath => "file_path",
+            MatchVia::WindowsEventLog => "windows_event_log",
         }
     }
 
@@ -76,9 +78,10 @@ impl MatchVia {
             MatchVia::StableInstanceId | MatchVia::StableId | MatchVia::ServiceName => {
                 Confidence::Explicit
             }
-            MatchVia::ContainerName | MatchVia::SystemdUnit | MatchVia::FilePath => {
-                Confidence::Strong
-            }
+            MatchVia::ContainerName
+            | MatchVia::SystemdUnit
+            | MatchVia::FilePath
+            | MatchVia::WindowsEventLog => Confidence::Strong,
             MatchVia::ContainerId => Confidence::Weak,
         }
     }
@@ -325,7 +328,9 @@ impl DiscoveryCache {
 
     fn resolve_systemd(&self, identifier: &str) -> CollectMatch {
         match self.systemd_services.get(identifier) {
-            Some(service) if service.load_state == "loaded" => {
+            Some(service)
+                if service.load_state == "loaded" && service.name.ends_with(".service") =>
+            {
                 CollectMatch::Matched(ResolvedAccess {
                     access_method: AccessMethod::Journald,
                     matched_via: MatchVia::SystemdUnit,
@@ -662,6 +667,28 @@ mod tests {
         let cache = DiscoveryCache::new();
         assert_eq!(
             cache.resolve("/no/such.log", "file"),
+            CollectMatch::NotFound
+        );
+    }
+
+    #[test]
+    fn windows_service_inventory_does_not_resolve_to_journald() {
+        let mut census = Census::default();
+        census.systemd_services.push(SystemdService {
+            name: "EventLog".into(),
+            load_state: "installed".into(),
+            active_state: "running".into(),
+            sub_state: "win32".into(),
+            description: "Windows Event Log".into(),
+            service_name: "EventLog".into(),
+            main_pid: 2112,
+        });
+        let mut cache = DiscoveryCache::new();
+        cache.update_all(&census);
+
+        assert_eq!(cache.stats().systemd_services, 1);
+        assert_eq!(
+            cache.resolve("EventLog", "systemd_service"),
             CollectMatch::NotFound
         );
     }

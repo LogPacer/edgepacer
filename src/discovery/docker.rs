@@ -1,6 +1,6 @@
 //! Docker container discovery via bollard.
 //!
-//! Mirrors legacy EdgePacer's Docker discovery surface:
+//! Mirrors Go edgepacer's Docker discovery surface:
 //! 1. List all containers (running + stopped)
 //! 2. Inspect running containers for log path, env vars
 //! 3. Extract service name from labels (compose/swarm/k8s priority)
@@ -290,7 +290,7 @@ fn default_docker_host() -> Option<String> {
 }
 
 /// Extract service name from container labels (the non-explicit sources).
-/// Priority matches legacy EdgePacer; the LOGPACER_SERVICE_NAME env var is
+/// Priority matches Go edgepacer; the LOGPACER_SERVICE_NAME env var is
 /// applied by the caller after inspect and overrides all of these:
 /// 1. com.docker.compose.service
 /// 2. com.docker.swarm.service.name
@@ -333,6 +333,11 @@ fn clean_name(name: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    const PLATFORM_DEFAULT_DOCKER_HOST: &str = DEFAULT_UNIX_DOCKER_HOST;
+    #[cfg(windows)]
+    const PLATFORM_DEFAULT_DOCKER_HOST: &str = DEFAULT_WINDOWS_DOCKER_HOST;
 
     #[test]
     fn service_name_priority() {
@@ -390,7 +395,7 @@ mod tests {
             Some("unix:///tmp/docker.sock"),
             Some("unix:///tmp/podman.sock"),
             Some("unix:///tmp/context.sock"),
-            Some(DEFAULT_UNIX_DOCKER_HOST),
+            Some(PLATFORM_DEFAULT_DOCKER_HOST),
         );
 
         assert_eq!(
@@ -405,7 +410,7 @@ mod tests {
             None,
             Some("unix:///tmp/podman.sock"),
             Some("unix:///tmp/context.sock"),
-            Some(DEFAULT_UNIX_DOCKER_HOST),
+            Some(PLATFORM_DEFAULT_DOCKER_HOST),
         );
 
         assert_eq!(
@@ -422,7 +427,7 @@ mod tests {
             None,
             None,
             Some("unix:///tmp/context.sock"),
-            Some(DEFAULT_UNIX_DOCKER_HOST),
+            Some(PLATFORM_DEFAULT_DOCKER_HOST),
         );
 
         assert_eq!(
@@ -456,6 +461,31 @@ mod tests {
         assert_eq!(
             docker_context_host_from_meta(meta, "colima").as_deref(),
             Some("unix:///Users/tester/.colima/default/docker.sock")
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a reachable Docker-compatible daemon"]
+    async fn live_docker_discovery_lists_containers() {
+        let containers = discover_containers()
+            .await
+            .expect("live Docker discovery should succeed");
+
+        assert!(
+            !containers.is_empty(),
+            "live Docker discovery should list at least one container"
+        );
+        assert!(
+            containers
+                .iter()
+                .all(|container| container.runtime == "docker"),
+            "live Docker discovery should tag discovered containers as docker runtime"
+        );
+        assert!(
+            containers
+                .iter()
+                .any(|container| !container.id.is_empty() && !container.name.is_empty()),
+            "live Docker discovery should populate stable container identity fields"
         );
     }
 }

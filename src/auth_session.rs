@@ -256,6 +256,7 @@ mod tests {
             readiness_file: None,
             local_mode: false,
             directive_file: None,
+            host_mode: true,
         }
     }
 

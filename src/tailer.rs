@@ -6,7 +6,7 @@
 //! - Resume from persisted checkpoint on startup
 //! - Reports read position for downstream checkpoint advancement
 //!
-//! Reliability guarantees:
+//! Bulletproofness guarantees (goal 60):
 //! - On rotation, the previous fd is kept alive and drained to EOF before
 //!   the new file becomes active. No unread bytes in the rotated file are lost.
 //! - Rotation is detected via three signals: inode change (Unix), mtime moving
@@ -46,14 +46,14 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 #[cfg(test)]
-use state::inode_of;
+use state::identity_of_path;
 use state::{PendingOpen, TailerState};
 
 use crate::checkpoint::Checkpoint;
 
 /// Default cap on the bytes captured for a single log line.
 ///
-/// Matches legacy EdgePacer's practical `bufio.Reader` behavior and keeps a
+/// Matches Go edgepacer's practical `bufio.Reader` behavior and keeps a
 /// single pathological line without a trailing newline from exhausting
 /// memory. Over-cap lines are truncated in the output; the reader advances
 /// past the full on-disk line so the next read starts fresh.
@@ -302,8 +302,7 @@ mod tests {
         std::fs::write(&path, "line1\nline2\nline3\n").unwrap();
 
         // Get the inode
-        let meta = std::fs::metadata(&path).unwrap();
-        let inode = inode_of(&meta);
+        let inode = identity_of_path(&path).unwrap();
 
         // Checkpoint at offset after "line1\n" (6 bytes)
         let cp = Checkpoint {
@@ -349,8 +348,7 @@ mod tests {
         let path = dir.path().join("test.log");
         std::fs::write(&path, "short\n").unwrap();
 
-        let meta = std::fs::metadata(&path).unwrap();
-        let inode = inode_of(&meta);
+        let inode = identity_of_path(&path).unwrap();
 
         // Checkpoint at offset way past current file size
         let cp = Checkpoint {
