@@ -3,6 +3,7 @@ set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 output="${repo_root}/LICENSE-3rdparty.csv"
+license_config="${repo_root}/third-party-overrides.toml"
 command="${1:-check}"
 
 tmpdir="$(mktemp -d)"
@@ -16,8 +17,8 @@ bpf_dump="${tmpdir}/bpf.csv"
 generated="${tmpdir}/LICENSE-3rdparty.csv"
 
 cd "${repo_root}"
-dd-rust-license-tool --manifest-path Cargo.toml dump > "${root_dump}"
-dd-rust-license-tool --manifest-path bpf/Cargo.toml dump > "${bpf_dump}"
+dd-rust-license-tool --config "${license_config}" --manifest-path Cargo.toml dump > "${root_dump}"
+dd-rust-license-tool --config "${license_config}" --manifest-path bpf/Cargo.toml dump > "${bpf_dump}"
 
 head -n 1 "${root_dump}" > "${generated}"
 {
