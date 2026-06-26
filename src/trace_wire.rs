@@ -179,6 +179,7 @@ fn anyvalue_to_json(value: Option<&AnyValue>) -> Value {
                 .collect(),
         ),
         Some(AnyValueKind::KvlistValue(kv)) => attrs_to_json(&kv.values),
+        Some(AnyValueKind::StringValueStrindex(_)) => Value::Null,
         None => Value::Null,
     }
 }
@@ -192,6 +193,7 @@ mod tests {
     fn str_attr(key: &str, value: &str) -> KeyValue {
         KeyValue {
             key: key.to_string(),
+            key_strindex: 0,
             value: Some(AnyValue {
                 value: Some(AnyValueKind::StringValue(value.to_string())),
             }),
@@ -216,6 +218,7 @@ mod tests {
                 str_attr("http.method", "GET"),
                 KeyValue {
                     key: "http.status_code".into(),
+                    key_strindex: 0,
                     value: Some(any(AnyValueKind::IntValue(200))),
                 },
             ],
@@ -328,6 +331,7 @@ mod tests {
         assert_eq!(
             service_name_from_attrs(&[KeyValue {
                 key: "service.name".into(),
+                key_strindex: 0,
                 value: Some(any(AnyValueKind::IntValue(0))),
             }]),
             ""

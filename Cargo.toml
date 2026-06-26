@@ -48,7 +48,8 @@ prost = "0.13"
 
 # Trace proxy
 axum = "0.8"
-opentelemetry-proto = { version = "0.27", features = ["gen-tonic-messages", "trace"], default-features = false }
+opentelemetry-proto = { version = "0.32.0", features = ["gen-tonic-messages", "trace"], default-features = false }
+prost14 = { package = "prost", version = "0.14" }
 
 # Logging
 tracing = "0.1"

@@ -28,7 +28,7 @@ use axum::{
     http::{HeaderMap, StatusCode},
     routing::post,
 };
-use prost::Message;
+use prost14::Message as OtelMessage;
 use tokio::sync::{Mutex, watch};
 use tokio::task::JoinHandle;
 use tracing::{debug, error, info, warn};
@@ -188,6 +188,7 @@ fn ensure_service_name(resource_span: &mut ResourceSpans, fallback: &str) -> boo
     resource.attributes.retain(|kv| kv.key != SERVICE_NAME_KEY);
     resource.attributes.push(KeyValue {
         key: SERVICE_NAME_KEY.to_string(),
+        key_strindex: 0,
         value: Some(AnyValue {
             value: Some(AnyValueKind::StringValue(fallback.to_string())),
         }),
@@ -598,6 +599,7 @@ mod tests {
 
     use logpacer_wire::{WireRequest, WireResponse, routed_batch};
     use opentelemetry_proto::tonic::trace::v1::{ScopeSpans, Span};
+    use prost::Message as WireMessage;
     use wiremock::matchers::{header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -713,6 +715,7 @@ mod tests {
             resource: Some(Resource {
                 attributes: vec![KeyValue {
                     key: SERVICE_NAME_KEY.to_string(),
+                    key_strindex: 0,
                     value: Some(AnyValue {
                         value: Some(AnyValueKind::StringValue("checkout".into())),
                     }),
@@ -1194,6 +1197,7 @@ mod tests {
             rs.resource = Some(Resource {
                 attributes: vec![KeyValue {
                     key: SERVICE_NAME_KEY.to_string(),
+                    key_strindex: 0,
                     value: Some(AnyValue {
                         value: Some(AnyValueKind::StringValue(name.to_string())),
                     }),
@@ -1257,6 +1261,7 @@ mod tests {
             resource: Some(Resource {
                 attributes: vec![KeyValue {
                     key: SERVICE_NAME_KEY.to_string(),
+                    key_strindex: 0,
                     value: Some(AnyValue {
                         value: Some(AnyValueKind::IntValue(0)),
                     }),
