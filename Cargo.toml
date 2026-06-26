@@ -90,8 +90,8 @@ bollard = "0.18"
 futures-util = "0.3"
 
 # Kubernetes discovery (optional — only used when running in-cluster)
-kube = { version = "0.98", features = ["client", "runtime"] }
-k8s-openapi = { version = "0.24", features = ["v1_32"] }
+kube = { version = "4.0", features = ["client", "runtime"] }
+k8s-openapi = { version = "0.28", features = ["v1_32"] }
 
 [features]
 # eBPF capture pillars (Linux only). Off by default. When enabled on Linux,

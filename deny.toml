@@ -4,11 +4,7 @@ all-features = true
 [advisories]
 version = 2
 yanked = "warn"
-ignore = [
-  { id = "RUSTSEC-2024-0384", reason = "Transitive through kube-runtime 0.98.0 -> backoff 0.4.0. No safe upgrade is available in the current kube line; revisit with a kube major upgrade." },
-  { id = "RUSTSEC-2025-0012", reason = "Transitive through kube-runtime 0.98.0. No safe upgrade is available in the current kube line; revisit with a kube major upgrade." },
-  { id = "RUSTSEC-2025-0134", reason = "Transitive through kube-client 0.98.0. No safe upgrade is available in the current kube line; revisit with a kube major upgrade." },
-]
+ignore = []
 
 [bans]
 multiple-versions = "warn"
