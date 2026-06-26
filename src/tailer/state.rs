@@ -16,12 +16,22 @@ struct ObservedFileState {
 }
 
 impl ObservedFileState {
+    #[cfg(not(windows))]
     fn from_metadata(meta: &std::fs::Metadata) -> Self {
         Self {
             inode: inode_of(meta),
             size: meta.len(),
             modtime: meta.modified().unwrap_or(UNIX_EPOCH),
         }
+    }
+
+    fn from_file(file: &std::fs::File) -> io::Result<Self> {
+        let meta = file.metadata()?;
+        Ok(Self {
+            inode: file_identity(file, &meta),
+            size: meta.len(),
+            modtime: meta.modified().unwrap_or(UNIX_EPOCH),
+        })
     }
 }
 
@@ -86,10 +96,10 @@ impl TailerState {
             }
             Err(e) => return Err(e),
         };
-        let meta = file.metadata()?;
-        let inode = inode_of(&meta);
-        let modtime = meta.modified().unwrap_or(UNIX_EPOCH);
-        let current_size = meta.len();
+        let observed = ObservedFileState::from_file(&file)?;
+        let inode = observed.inode;
+        let modtime = observed.modtime;
+        let current_size = observed.size;
 
         let mut reader = BufReader::new(file);
         let (offset, size, description) = match mode {
@@ -197,8 +207,8 @@ impl TailerState {
             return Ok(());
         }
 
-        let meta = match std::fs::metadata(path) {
-            Ok(m) => m,
+        let current = match observed_path_state(path) {
+            Ok(state) => state,
             Err(e) if is_retryable_io_error(&e) => {
                 debug!(
                     path = %path.display(),
@@ -209,8 +219,6 @@ impl TailerState {
             }
             Err(e) => return Err(e),
         };
-
-        let current = ObservedFileState::from_metadata(&meta);
 
         let inode_changed = current.inode != 0 && self.inode != 0 && current.inode != self.inode;
         let mtime_went_back = current.modtime < self.modtime;
@@ -308,13 +316,90 @@ fn is_retryable_io_error(e: &io::Error) -> bool {
     )
 }
 
+#[cfg(windows)]
+fn observed_path_state(path: &Path) -> io::Result<ObservedFileState> {
+    let file = std::fs::File::open(path)?;
+    ObservedFileState::from_file(&file)
+}
+
+#[cfg(not(windows))]
+fn observed_path_state(path: &Path) -> io::Result<ObservedFileState> {
+    let meta = std::fs::metadata(path)?;
+    Ok(ObservedFileState::from_metadata(&meta))
+}
+
+#[cfg(test)]
+pub(super) fn identity_of_path(path: &Path) -> io::Result<u64> {
+    Ok(observed_path_state(path)?.inode)
+}
+
 #[cfg(unix)]
 pub(super) fn inode_of(meta: &std::fs::Metadata) -> u64 {
     use std::os::unix::fs::MetadataExt;
     meta.ino()
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+pub(super) fn inode_of(meta: &std::fs::Metadata) -> u64 {
+    use std::os::windows::fs::MetadataExt;
+    meta.creation_time()
+}
+
+#[cfg(not(any(unix, windows)))]
 pub(super) fn inode_of(_meta: &std::fs::Metadata) -> u64 {
     0
+}
+
+#[cfg(windows)]
+fn file_identity(file: &std::fs::File, meta: &std::fs::Metadata) -> u64 {
+    use std::mem::MaybeUninit;
+    use std::os::windows::io::AsRawHandle;
+
+    // Stable Rust exposes Windows creation time, but not the file index. Use
+    // the handle API so rename-create rotation has a true file identity signal.
+    let mut info = MaybeUninit::<ByHandleFileInformation>::uninit();
+    let ok = unsafe { GetFileInformationByHandle(file.as_raw_handle(), info.as_mut_ptr()) };
+    if ok == 0 {
+        return inode_of(meta);
+    }
+
+    let info = unsafe { info.assume_init() };
+    let index = ((info.file_index_high as u64) << 32) | info.file_index_low as u64;
+    if index == 0 { inode_of(meta) } else { index }
+}
+
+#[cfg(not(windows))]
+fn file_identity(_file: &std::fs::File, meta: &std::fs::Metadata) -> u64 {
+    inode_of(meta)
+}
+
+#[cfg(windows)]
+#[repr(C)]
+struct FileTime {
+    low_date_time: u32,
+    high_date_time: u32,
+}
+
+#[cfg(windows)]
+#[repr(C)]
+struct ByHandleFileInformation {
+    file_attributes: u32,
+    creation_time: FileTime,
+    last_access_time: FileTime,
+    last_write_time: FileTime,
+    volume_serial_number: u32,
+    file_size_high: u32,
+    file_size_low: u32,
+    number_of_links: u32,
+    file_index_high: u32,
+    file_index_low: u32,
+}
+
+#[cfg(windows)]
+#[link(name = "kernel32")]
+unsafe extern "system" {
+    fn GetFileInformationByHandle(
+        file: *mut std::ffi::c_void,
+        file_information: *mut ByHandleFileInformation,
+    ) -> i32;
 }

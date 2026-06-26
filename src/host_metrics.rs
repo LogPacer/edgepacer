@@ -4,7 +4,7 @@
 //! platform-specific parsers for load averages, TCP states, file
 //! descriptors, and disk I/O counters.
 //!
-//! Mirrors legacy EdgePacer's `internal/stats/hostmetrics.go`.
+//! Mirrors Go edgepacer's `internal/stats/hostmetrics.go`.
 
 use std::time::Instant;
 
@@ -24,22 +24,27 @@ pub use crate::host_metrics_darwin::{
     collect_disk_io_counters, collect_fd_stats, collect_load_avg, collect_tcp_stats,
 };
 
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+#[cfg(target_os = "windows")]
+pub use crate::host_metrics_windows::{
+    collect_disk_io_counters, collect_fd_stats, collect_load_avg, collect_tcp_stats,
+};
+
+#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
 pub fn collect_load_avg() -> (f64, f64, f64) {
     (-1.0, -1.0, -1.0)
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
 pub fn collect_tcp_stats() -> (i64, i64, i64) {
     (-1, -1, -1)
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
 pub fn collect_fd_stats() -> (i64, i64) {
     (-1, -1)
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
 pub fn collect_disk_io_counters() -> (u64, u64, u64, u64) {
     (0, 0, 0, 0)
 }
@@ -166,21 +171,17 @@ impl MetricsCollector {
             ..Default::default()
         };
 
-        // Disk — find root mount
-        for disk in self.disks.list() {
-            if disk.mount_point() == std::path::Path::new("/") {
-                let total = disk.total_space();
-                let available = disk.available_space();
-                let used = total.saturating_sub(available);
-                m.disk_total_gb = total as f64 / (1024.0 * 1024.0 * 1024.0);
-                m.disk_used_gb = used as f64 / (1024.0 * 1024.0 * 1024.0);
-                m.disk_used_percent = if total > 0 {
-                    (used as f64 / total as f64) * 100.0
-                } else {
-                    0.0
-                };
-                break;
-            }
+        // Disk — prefer the OS root/system drive, then fall back to the largest
+        // visible disk so Windows hosts do not report zero capacity.
+        if let Some((total, available)) = selected_capacity_disk(&self.disks) {
+            let used = total.saturating_sub(available);
+            m.disk_total_gb = total as f64 / (1024.0 * 1024.0 * 1024.0);
+            m.disk_used_gb = used as f64 / (1024.0 * 1024.0 * 1024.0);
+            m.disk_used_percent = if total > 0 {
+                (used as f64 / total as f64) * 100.0
+            } else {
+                0.0
+            };
         }
 
         // Network I/O — aggregate all interfaces (sysinfo total counters)
@@ -328,6 +329,48 @@ pub fn delta(current: u64, previous: u64) -> u64 {
     current.saturating_sub(previous)
 }
 
+fn selected_capacity_disk(disks: &Disks) -> Option<(u64, u64)> {
+    disks
+        .list()
+        .iter()
+        .find(|disk| is_root_disk_mount(disk.mount_point()))
+        .or_else(|| {
+            disks
+                .list()
+                .iter()
+                .filter(|disk| disk.total_space() > 0)
+                .max_by_key(|disk| disk.total_space())
+        })
+        .map(|disk| (disk.total_space(), disk.available_space()))
+}
+
+#[cfg(not(target_os = "windows"))]
+fn is_root_disk_mount(mount_point: &std::path::Path) -> bool {
+    mount_point == std::path::Path::new("/")
+}
+
+#[cfg(target_os = "windows")]
+fn is_root_disk_mount(mount_point: &std::path::Path) -> bool {
+    let Some(mount_drive) = windows_drive_root(mount_point.as_os_str().to_string_lossy().as_ref())
+    else {
+        return false;
+    };
+
+    let system_drive = std::env::var("SystemDrive").unwrap_or_else(|_| "C:".to_string());
+    windows_drive_root(&system_drive).is_some_and(|drive| drive == mount_drive)
+}
+
+#[cfg(target_os = "windows")]
+fn windows_drive_root(path: &str) -> Option<String> {
+    let normalized = path.trim().replace('/', "\\");
+    let mut chars = normalized.chars();
+    let drive = chars.next()?.to_ascii_uppercase();
+    if !drive.is_ascii_alphabetic() || chars.next()? != ':' {
+        return None;
+    }
+    Some(format!("{drive}:\\"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -392,5 +435,14 @@ mod tests {
         assert!(json.contains("\"memory_total_mb\""));
         assert!(json.contains("\"tcp_established\""));
         assert!(json.contains("\"fd_open\""));
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_drive_root_normalizes_system_drive() {
+        assert_eq!(windows_drive_root("c:"), Some("C:\\".to_string()));
+        assert_eq!(windows_drive_root("C:\\"), Some("C:\\".to_string()));
+        assert_eq!(windows_drive_root("c:/logs"), Some("C:\\".to_string()));
+        assert_eq!(windows_drive_root("\\\\server\\share"), None);
     }
 }

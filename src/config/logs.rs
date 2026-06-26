@@ -160,8 +160,9 @@ pub fn all_collect_streams(config: &UnifiedConfig) -> Vec<CollectStreamConfig> {
                 required_config_string::<WireEndpoint>(entry, "subbox_endpoint", ctx)?;
             let archive_id = required_config_string::<ArchiveId>(entry, "archive_id", ctx)?;
             let repo_id = required_config_string::<RepoId>(entry, "repo_id", ctx)?;
-            let matching_strategy =
-                optional_string_field(entry, "matching_strategy").unwrap_or_default();
+            let matching_strategy = optional_string_field(entry, "matching_strategy")
+                .or_else(|| optional_string_field(entry, "access_method"))
+                .unwrap_or_default();
             let container_identifier =
                 optional_string_field(entry, "container_identifier").unwrap_or_default();
             let stamp_resource_identifier =
@@ -215,6 +216,19 @@ pub fn resolve_collect_streams(
             resolved
                 .diagnostics
                 .push(not_found(stream, "missing locator".into()));
+            continue;
+        }
+
+        if is_windows_event_log_method(&stream.matching_strategy) {
+            resolved.streaming_sources.push(streaming_source(
+                stream,
+                StreamAccessMethod::WindowsEventLog {
+                    channel: identifier.to_string(),
+                },
+            ));
+            resolved
+                .diagnostics
+                .push(matched(stream, MatchVia::WindowsEventLog));
             continue;
         }
 
@@ -317,6 +331,13 @@ fn streaming_source(
         stamp_resource_identifier: stream.stamp_resource_identifier,
         config_hash: stream.config_hash.clone(),
     }
+}
+
+fn is_windows_event_log_method(method: &str) -> bool {
+    matches!(
+        method,
+        "windows_event" | "windows_event_log" | "event_log" | "eventlog"
+    )
 }
 
 fn matched(stream: &CollectStreamConfig, via: MatchVia) -> CollectDiagnostic {
@@ -561,6 +582,42 @@ mod tests {
         assert_eq!(stream.endpoint, "https://collect.example.com/wire");
         assert_eq!(stream.archive_id, "arc_stream");
         assert_eq!(stream.repo_id, "repo_stream");
+    }
+
+    #[test]
+    fn windows_event_log_collect_source_resolves_directly() {
+        let unified = unified(json!({
+            "collect": {
+                "windows-application": {
+                    "locator": "Application",
+                    "access_method": "windows_event_log",
+                    "subbox_endpoint": "https://collect.example.com/wire",
+                    "archive_id": "arc_win",
+                    "repo_id": "repo_win"
+                }
+            }
+        }));
+        let cache = DiscoveryCache::new();
+
+        let resolved = resolved_collect_from_config(&unified, &cache);
+
+        assert!(resolved.file_streams.is_empty());
+        assert_eq!(resolved.streaming_sources.len(), 1);
+        let stream = &resolved.streaming_sources[0];
+        assert_eq!(stream.log_source_id, "windows-application");
+        assert_eq!(
+            stream.access_method,
+            StreamAccessMethod::WindowsEventLog {
+                channel: "Application".into()
+            }
+        );
+        assert_eq!(stream.endpoint, "https://collect.example.com/wire");
+        assert_eq!(stream.archive_id, "arc_win");
+        assert_eq!(stream.repo_id, "repo_win");
+
+        assert_eq!(resolved.diagnostics.len(), 1);
+        assert_eq!(resolved.diagnostics[0].status, MatchStatus::Matched);
+        assert!(resolved.diagnostics[0].detail.contains("windows_event_log"));
     }
 
     #[test]

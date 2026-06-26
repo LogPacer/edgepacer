@@ -25,6 +25,8 @@ pub mod host_metrics;
 pub mod host_metrics_darwin;
 #[cfg(target_os = "linux")]
 pub mod host_metrics_linux;
+#[cfg(target_os = "windows")]
+pub mod host_metrics_windows;
 pub mod identity;
 pub mod importer;
 mod journal;
@@ -56,3 +58,4 @@ pub mod trace_proxy_manager;
 pub mod trace_wire;
 pub mod tracker;
 pub mod upload_token_store;
+mod windows_event_log;

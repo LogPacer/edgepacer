@@ -49,6 +49,14 @@ pub enum StreamingSourceType {
         /// Journald cursor string for exact resume.
         cursor: String,
     },
+    /// Windows Event Log. Resume token is the last delivered record ID.
+    /// Exact replay: `wevtutil` can query records after this ID.
+    WindowsEventLog {
+        /// Event Log channel, e.g. "Application" or "System".
+        channel: String,
+        /// Last seen EventRecordID.
+        record_id: u64,
+    },
 }
 
 impl StreamingCheckpoint {
@@ -75,6 +83,18 @@ impl StreamingCheckpoint {
         }
     }
 
+    /// Create a Windows Event Log streaming checkpoint.
+    pub fn windows_event_log(source_id: &str, channel: &str, record_id: u64) -> Self {
+        Self {
+            source_id: source_id.to_string(),
+            source_type: StreamingSourceType::WindowsEventLog {
+                channel: channel.to_string(),
+                record_id,
+            },
+            updated_at: SystemTime::now(),
+        }
+    }
+
     /// Extract the Docker `since` parameter for API reconnect, if this is a Docker checkpoint.
     pub fn docker_since(&self) -> Option<&str> {
         match &self.source_type {
@@ -87,6 +107,18 @@ impl StreamingCheckpoint {
     pub fn journald_cursor(&self) -> Option<&str> {
         match &self.source_type {
             StreamingSourceType::Journald { cursor } => Some(cursor.as_str()),
+            _ => None,
+        }
+    }
+
+    /// Extract the last Windows Event Log record ID, if this checkpoint belongs
+    /// to the requested channel.
+    pub fn windows_event_record_id(&self, channel: &str) -> Option<u64> {
+        match &self.source_type {
+            StreamingSourceType::WindowsEventLog {
+                channel: checkpoint_channel,
+                record_id,
+            } if checkpoint_channel.eq_ignore_ascii_case(channel) => Some(*record_id),
             _ => None,
         }
     }
@@ -126,6 +158,18 @@ mod tests {
     }
 
     #[test]
+    fn windows_event_checkpoint_roundtrip() {
+        let cp = StreamingCheckpoint::windows_event_log("src-win", "Application", 42);
+
+        assert_eq!(cp.windows_event_record_id("application"), Some(42));
+        assert_eq!(cp.windows_event_record_id("System"), None);
+
+        let json = serde_json::to_string(&cp).unwrap();
+        let restored: StreamingCheckpoint = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored.windows_event_record_id("Application"), Some(42));
+    }
+
+    #[test]
     fn source_types_are_distinct() {
         let docker = StreamingSourceType::Docker {
             last_timestamp: "2026-01-01T00:00:00Z".into(),
@@ -134,6 +178,11 @@ mod tests {
         let journald = StreamingSourceType::Journald {
             cursor: "s=abc".into(),
         };
+        let windows_event = StreamingSourceType::WindowsEventLog {
+            channel: "Application".into(),
+            record_id: 1,
+        };
         assert_ne!(docker, journald);
+        assert_ne!(journald, windows_event);
     }
 }

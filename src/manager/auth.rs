@@ -52,7 +52,7 @@ pub struct ManagerAuth {
     rails_url: String,
     /// Current bearer token (account bootstrap → server bootstrap after auth).
     token: String,
-    /// The configured account token, kept verbatim for re-auth and change
+    /// The configured account token, kept normalized for re-auth and change
     /// detection even after `token` becomes the server bootstrap token.
     account_token: String,
     installation_id: String,
@@ -60,6 +60,7 @@ pub struct ManagerAuth {
 
 impl ManagerAuth {
     pub fn new(rails_url: &str, account_token: &str) -> Self {
+        let account_token = account_token.trim();
         let http = reqwest::Client::builder()
             .timeout(Duration::from_secs(30))
             .connect_timeout(Duration::from_secs(10))
@@ -141,7 +142,12 @@ impl ManagerAuth {
         let Some(persisted) = token_store::load_token(SERVER_TOKEN_FILE) else {
             return false;
         };
-        match self.validate_token(&persisted).await {
+        let persisted = persisted.trim();
+        if persisted.is_empty() {
+            return false;
+        }
+
+        match self.validate_token(persisted).await {
             Ok(()) => {
                 info!("[manager] using persisted server bootstrap token");
                 if backfill_fingerprint {
@@ -150,7 +156,7 @@ impl ManagerAuth {
                     // are detected.
                     record_fingerprint(fingerprint);
                 }
-                self.token = persisted;
+                self.token = persisted.to_string();
                 true
             }
             Err(e) => {
@@ -171,12 +177,18 @@ impl ManagerAuth {
                  include it, or write the token to the state dir manually"
             );
         };
+        let server_token = server_token.trim();
+        if server_token.is_empty() {
+            anyhow::bail!(
+                "Rails accepted the account token but returned an empty server_bootstrap_token"
+            );
+        }
 
-        token_store::persist_token(SERVER_TOKEN_FILE, &server_token)?;
+        token_store::persist_token(SERVER_TOKEN_FILE, server_token)?;
         record_fingerprint(fingerprint);
         info!("[manager] server bootstrap token persisted to disk");
 
-        self.token = server_token;
+        self.token = server_token.to_string();
         Ok(())
     }
 

@@ -132,6 +132,9 @@ tikv-jemallocator = { version = "0.6", features = ["background_threads", "disabl
 # `ebpf` feature; Linux-only, so the feature is never enabled on macOS.
 aya = { version = "0.13", optional = true }
 
+[target.'cfg(target_os = "windows")'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_ProcessStatus"] }
+
 # libc for process group management (manager)
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
@@ -148,17 +151,3 @@ unused_must_use = "deny"
 
 [lints.clippy]
 all = { level = "deny", priority = -1 }
-
-[profile.release]
-lto = "thin"
-codegen-units = 1
-panic = "abort"
-strip = true
-opt-level = 3
-
-# Optimize build scripts and proc-macros (serde/clap/prost derives, etc.) even in
-# dev builds. They run at compile time, so optimizing them speeds the whole dev
-# iteration loop without touching the unoptimized, fast-to-codegen agent crate or
-# the release artifact.
-[profile.dev.build-override]
-opt-level = 3

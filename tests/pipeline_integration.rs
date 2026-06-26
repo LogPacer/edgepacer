@@ -148,20 +148,12 @@ fn tailer_checkpoint_resume_detects_rotation() {
     let dir = tempfile::tempdir().unwrap();
     let log_path = dir.path().join("app.log");
 
-    // Write initial content and get inode.
+    // Write initial content and get the platform file identity.
     std::fs::write(&log_path, "line1\nline2\nline3\n").unwrap();
-    let meta = std::fs::metadata(&log_path).unwrap();
-    let original_inode = {
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::MetadataExt;
-            meta.ino()
-        }
-        #[cfg(not(unix))]
-        {
-            0u64
-        }
-    };
+    let original_inode = FileTailer::open_from_start(&log_path)
+        .unwrap()
+        .position()
+        .inode;
 
     // Create checkpoint at offset 12 (after "line1\nline2\n").
     let cp = Checkpoint {

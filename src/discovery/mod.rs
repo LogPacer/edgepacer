@@ -1,6 +1,6 @@
 //! System discovery — enumerates containers, log files, services, and ports.
 //!
-//! Mirrors legacy EdgePacer's `internal/discovery/` package.
+//! Mirrors Go edgepacer's `internal/discovery/` package.
 //! Each backend runs in parallel; failures are best-effort (recorded in Census.errors).
 
 use std::sync::Arc;
@@ -15,6 +15,7 @@ pub mod packages;
 pub mod ports;
 pub mod processes;
 pub mod systemd;
+pub mod windows_services;
 
 use serde::Serialize;
 use std::collections::HashMap;
@@ -343,6 +344,7 @@ pub async fn discover() -> Census {
         processes_result,
         ports_result,
         packages_result,
+        windows_services_result,
     ) = tokio::join!(
         docker::discover_containers(),
         files::discover_log_files(&["/var/log"]),
@@ -352,6 +354,7 @@ pub async fn discover() -> Census {
         processes::discover_processes(),
         ports::discover_ports(),
         packages::discover_packages(),
+        windows_services::discover_services(),
     );
 
     match docker_result {
@@ -406,6 +409,19 @@ pub async fn discover() -> Census {
         Err(e) => {
             warn!(error = %e, "systemd discovery failed");
             census.errors.insert("systemd".into(), e.to_string());
+        }
+    }
+
+    match windows_services_result {
+        Ok(services) => {
+            debug!(count = services.len(), "discovered windows services");
+            census.systemd_services.extend(services);
+        }
+        Err(e) => {
+            warn!(error = %e, "windows service discovery failed");
+            census
+                .errors
+                .insert("windows_services".into(), e.to_string());
         }
     }
 
@@ -463,6 +479,7 @@ pub async fn discover_with_paths(scan_paths: &[&str]) -> Census {
         processes_result,
         ports_result,
         packages_result,
+        windows_services_result,
     ) = tokio::join!(
         docker::discover_containers(),
         files::discover_log_files(scan_paths),
@@ -472,6 +489,7 @@ pub async fn discover_with_paths(scan_paths: &[&str]) -> Census {
         processes::discover_processes(),
         ports::discover_ports(),
         packages::discover_packages(),
+        windows_services::discover_services(),
     );
 
     match docker_result {
@@ -526,6 +544,19 @@ pub async fn discover_with_paths(scan_paths: &[&str]) -> Census {
         Err(e) => {
             warn!(error = %e, "systemd discovery failed");
             census.errors.insert("systemd".into(), e.to_string());
+        }
+    }
+
+    match windows_services_result {
+        Ok(services) => {
+            debug!(count = services.len(), "discovered windows services");
+            census.systemd_services.extend(services);
+        }
+        Err(e) => {
+            warn!(error = %e, "windows service discovery failed");
+            census
+                .errors
+                .insert("windows_services".into(), e.to_string());
         }
     }
 
