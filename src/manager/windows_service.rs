@@ -153,7 +153,7 @@ async fn run_sc(args: &[String]) -> anyhow::Result<String> {
 
     if !output.status.success() {
         let detail = if stderr.is_empty() { stdout } else { stderr };
-        anyhow::bail!("sc {} failed: {detail}", args.join(" "));
+        anyhow::bail!("{}", format_sc_failure(args, &detail));
     }
 
     Ok(if stderr.is_empty() {
@@ -163,6 +163,55 @@ async fn run_sc(args: &[String]) -> anyhow::Result<String> {
     } else {
         format!("{stdout}\n{stderr}")
     })
+}
+
+fn format_sc_failure(args: &[String], detail: &str) -> String {
+    format!("sc {} failed: {detail}", redact_sc_args(args).join(" "))
+}
+
+fn redact_sc_args(args: &[String]) -> Vec<String> {
+    args.iter()
+        .map(|arg| redact_following_arg(arg, "--account-token"))
+        .collect()
+}
+
+fn redact_following_arg(text: &str, flag: &str) -> String {
+    let Some(flag_start) = text.find(flag) else {
+        return text.to_string();
+    };
+
+    let after_flag = flag_start + flag.len();
+    let Some(relative_value_start) = text[after_flag..].find(|ch: char| !ch.is_whitespace()) else {
+        return text.to_string();
+    };
+    let value_start = after_flag + relative_value_start;
+    let value_end = command_line_arg_end(text, value_start);
+
+    format!("{}<redacted>{}", &text[..value_start], &text[value_end..])
+}
+
+fn command_line_arg_end(text: &str, start: usize) -> usize {
+    let Some(first) = text[start..].chars().next() else {
+        return start;
+    };
+
+    if first != '"' {
+        return text[start..]
+            .char_indices()
+            .find_map(|(index, ch)| ch.is_whitespace().then_some(start + index))
+            .unwrap_or(text.len());
+    }
+
+    let mut backslashes = 0usize;
+    for (relative_index, ch) in text[start + 1..].char_indices() {
+        match ch {
+            '\\' => backslashes += 1,
+            '"' if backslashes.is_multiple_of(2) => return start + 1 + relative_index + 1,
+            _ => backslashes = 0,
+        }
+    }
+
+    text.len()
 }
 
 #[cfg(test)]
@@ -224,5 +273,19 @@ mod tests {
             quote_windows_arg(OsStr::new(r#"a "quoted" arg"#)),
             r#""a \"quoted\" arg""#
         );
+    }
+
+    #[test]
+    fn sc_failure_message_redacts_account_token() {
+        let mut config = config();
+        config.account_token = "secret-bootstrap-token".into();
+        let args = install_args(&config);
+
+        let message = format_sc_failure(&args, "Access is denied.");
+
+        assert!(message.contains("--account-token <redacted>"));
+        assert!(!message.contains("secret-bootstrap-token"));
+        assert!(message.contains("sc create EdgePacerManager"));
+        assert!(message.contains("Access is denied."));
     }
 }
