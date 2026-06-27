@@ -189,6 +189,17 @@ prepare_defaults() {
   tag="${tag:-sha-${short_revision}}"
   version="${version:-$(default_version)}"
   created="${created:-$(date -u '+%Y-%m-%dT%H:%M:%SZ')}"
+  guard_publishable_version
+}
+
+# A dev-marked build must never reach a public registry. The dev marker doubles
+# as a publish guard: a -dev version aborts any push (including its :latest and
+# channel tags), so a local build cannot clobber published artifacts by accident.
+guard_publishable_version() {
+  if [[ "${push}" -eq 1 && "${version}" == *-dev* ]]; then
+    echo "error: refusing to publish a dev-marked version: ${version}" >&2
+    exit 1
+  fi
 }
 
 ensure_builder() {
