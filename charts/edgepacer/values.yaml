@@ -1,5 +1,11 @@
 image:
   repository: ghcr.io/logpacer/edgepacer
+  # Pin to a channel tag (stable or edge) to follow a LogPacer-governed release
+  # channel: the channel's floating tag is moved onto the promoted release digest
+  # on each repoint, so pods adopt the channel target on their next restart
+  # (next-restart, not continuous — use Keel/Argo Image Updater or a rollout
+  # restart for active reconciliation). Pin an exact version (e.g. 1.4.3) to opt
+  # out of channels entirely.
   tag: latest
   pullPolicy: Always
 
