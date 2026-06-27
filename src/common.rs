@@ -3,8 +3,14 @@
 use crate::delivery::ErrorClass;
 use thiserror::Error;
 
-/// EdgePacer version string
-pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+/// EdgePacer version string. Set by build.rs via `cargo:rustc-env`: clean on
+/// release builds (`EDGEPACER_RELEASE_VERSION`), `<version>-dev+<sha>[.dirty]`
+/// on local/untagged builds. Falls back to the Cargo version if build.rs did
+/// not run.
+pub const VERSION: &str = match option_env!("EDGEPACER_VERSION") {
+    Some(version) => version,
+    None => env!("CARGO_PKG_VERSION"),
+};
 
 /// User-Agent header value
 pub fn user_agent() -> String {

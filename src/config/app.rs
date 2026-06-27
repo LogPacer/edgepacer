@@ -4,7 +4,7 @@ use crate::token_store;
 
 /// CLI arguments - mirrors legacy EdgePacer's cobra flags.
 #[derive(Parser, Debug, Clone)]
-#[command(name = "edgepacer", version, about = "LogPacer edge agent")]
+#[command(name = "edgepacer", version = crate::common::VERSION, about = "LogPacer edge agent")]
 pub struct Cli {
     /// Resource identifier (agent_key from Rails, not required in --local-mode)
     #[arg(short = 'r', long, env = "EDGEPACER_RESOURCE_ID", default_value = "")]

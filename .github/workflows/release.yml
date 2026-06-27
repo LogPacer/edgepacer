@@ -38,6 +38,12 @@ jobs:
           else
             version="${GITHUB_REF_NAME#v}"
           fi
+          case "${version}" in
+            *-dev*)
+              echo "refusing to publish a dev-marked version: ${version}" >&2
+              exit 1
+              ;;
+          esac
           echo "version=${version}" >> "$GITHUB_OUTPUT"
           echo "tag=v${version}" >> "$GITHUB_OUTPUT"
 
@@ -49,6 +55,9 @@ jobs:
       contents: read
     env:
       AUDITABLE_RELEASE_BUILDS: "1"
+      # Clean, resolved version for release builds so build.rs stamps e.g. 1.4.3
+      # instead of a -dev marker. Local/untagged builds (without this env) get -dev.
+      EDGEPACER_RELEASE_VERSION: ${{ needs.resolve.outputs.version }}
     timeout-minutes: 45
     strategy:
       fail-fast: false
