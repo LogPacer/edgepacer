@@ -1,0 +1,72 @@
+name: Promote
+
+# Moves a floating channel tag (stable/edge) onto an already-published release
+# digest — the k8s lane of a LogPacer channel repoint. No rebuild and no
+# re-sign: cosign signs the digest, not the tag, so the moved tag inherits the
+# release's existing signature. Dispatched by LogPacer (or manually) via the
+# GitHub API.
+
+on:
+  workflow_dispatch:
+    inputs:
+      from_tag:
+        description: Published release tag to promote (e.g. v0.1.9)
+        required: true
+      to_channel:
+        description: Channel tag to move onto the release (e.g. stable, edge)
+        required: true
+
+env:
+  IMAGE: ghcr.io/logpacer/edgepacer
+
+jobs:
+  promote:
+    name: Promote ${{ inputs.from_tag }} to ${{ inputs.to_channel }}
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+    steps:
+      - name: Resolve release digest
+        id: image
+        env:
+          FROM_TAG: ${{ inputs.from_tag }}
+        run: |
+          version="${FROM_TAG#v}"
+          case "${version}" in
+            *-dev*)
+              echo "refusing to promote a dev-marked tag: ${FROM_TAG}" >&2
+              exit 1
+              ;;
+          esac
+          digest="$(docker buildx imagetools inspect "${IMAGE}:${version}" | awk '/Digest:/ { print $2; exit }')"
+          if [ -z "${digest}" ]; then
+            echo "no published image found for ${IMAGE}:${version}" >&2
+            exit 1
+          fi
+          echo "digest=${digest}" >> "$GITHUB_OUTPUT"
+
+      - name: Login to GHCR
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+
+      - name: Move channel tag onto the release digest
+        env:
+          TO_CHANNEL: ${{ inputs.to_channel }}
+          DIGEST: ${{ steps.image.outputs.digest }}
+        run: |
+          docker buildx imagetools create \
+            --tag "${IMAGE}:${TO_CHANNEL}" \
+            "${IMAGE}@${DIGEST}"
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v3
+
+      - name: Verify the moved channel tag
+        env:
+          TO_CHANNEL: ${{ inputs.to_channel }}
+        run: |
+          cosign verify \
+            --certificate-identity-regexp "^https://github.com/LogPacer/edgepacer/" \
+            --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
+            "${IMAGE}:${TO_CHANNEL}"
