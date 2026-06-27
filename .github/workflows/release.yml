@@ -44,7 +44,7 @@ jobs:
   build-binaries:
     name: Build ${{ matrix.name }} Binary
     needs: resolve
-    runs-on: ubuntu-24.04
+    runs-on: ${{ matrix.runs-on }}
     permissions:
       contents: read
     env:
@@ -56,10 +56,19 @@ jobs:
         include:
           - name: Linux amd64
             target: linux-amd64
+            runs-on: ubuntu-24.04
           - name: Linux arm64
             target: linux-arm64
+            runs-on: ubuntu-24.04
           - name: Windows amd64
             target: windows-amd64
+            runs-on: ubuntu-24.04
+          - name: macOS amd64
+            target: darwin-amd64
+            runs-on: macos-14
+          - name: macOS arm64
+            target: darwin-arm64
+            runs-on: macos-14
     steps:
       - uses: actions/checkout@v7
 
@@ -74,22 +83,12 @@ jobs:
 
       - uses: taiki-e/install-action@v2
         with:
-          tool: cargo-audit
+          tool: cargo-audit,cargo-auditable@0.7.4
 
-      - name: Install release build tools
-        env:
-          CARGO_AUDITABLE_VERSION: "0.7.4"
-          CARGO_AUDITABLE_ARCHIVE_SHA256: "4a4f0c124543c065f03d89aee26550305143c6e4af3e46270dbabefeb79895d2"
+      - name: Install cross
+        if: runner.os == 'Linux'
         run: |
           docker version
-          cargo_home="${CARGO_HOME:-${HOME}/.cargo}"
-          mkdir -p "${cargo_home}/bin"
-          cargo_auditable_archive="cargo-auditable-x86_64-unknown-linux-musl.tar.xz"
-          curl -fsSLO "https://github.com/rust-secure-code/cargo-auditable/releases/download/v${CARGO_AUDITABLE_VERSION}/${cargo_auditable_archive}"
-          printf '%s  %s\n' "${CARGO_AUDITABLE_ARCHIVE_SHA256}" "${cargo_auditable_archive}" | sha256sum -c -
-          tar -xJf "${cargo_auditable_archive}"
-          install -m 0555 "cargo-auditable-x86_64-unknown-linux-musl/cargo-auditable" "${cargo_home}/bin/cargo-auditable"
-          cargo auditable --version
           if ! cargo install --list | grep -q '^cross v0\.2\.5:'; then
             cargo install cross --version 0.2.5 --locked --force
           fi
@@ -99,7 +98,10 @@ jobs:
 
       - name: Verify auditable release binaries
         run: |
-          mapfile -d '' release_binaries < <(
+          release_binaries=()
+          while IFS= read -r -d '' release_binary; do
+            release_binaries+=("${release_binary}")
+          done < <(
             find dist -maxdepth 1 -type f \
               \( -name 'edgepacer-${{ matrix.target }}*' -o -name 'edgepacer-manager-${{ matrix.target }}*' \) \
               ! -name '*.sha256' \
