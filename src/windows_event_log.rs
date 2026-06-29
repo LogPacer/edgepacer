@@ -333,7 +333,12 @@ fn parse_event(event_xml: &str) -> Option<Value> {
                 }
             }
             Ok(XmlEvent::Eof) => break,
-            Err(_) => return None,
+            Err(error) => {
+                // Drop the malformed event but say so — a silently missing event
+                // during a pilot is a "why is this gone?" mystery otherwise.
+                warn!(error = %error, "skipping unparseable Windows Event Log XML");
+                return None;
+            }
             _ => {}
         }
     }
@@ -497,6 +502,40 @@ mod tests {
         assert_eq!(records.len(), 1);
         let event = parsed_json(&records[0]);
         assert_eq!(event["EventData"]["Path"], "C:\\Temp & <logs>");
+    }
+
+    #[test]
+    fn resolves_numeric_character_references() {
+        // Decimal &#65; and hex &#x41; both denote 'A'; the value also mixes
+        // literal text with the references to exercise multi-segment buffering.
+        let xml = "\
+<Event xmlns='http://schemas.microsoft.com/win/2004/08/events/event'>\
+<System><EventRecordID>7</EventRecordID></System>\
+<EventData><Data Name='Code'>x&#65;y&#x41;z</Data></EventData>\
+</Event>";
+
+        let records = parse_event_xml_batch(xml);
+
+        assert_eq!(records.len(), 1);
+        let event = parsed_json(&records[0]);
+        assert_eq!(event["EventData"]["Code"], "xAyAz");
+    }
+
+    #[test]
+    fn concatenates_text_split_across_entities() {
+        // quick-xml emits this value as several events (Text / GeneralRef / Text);
+        // the joined result must preserve every literal segment and its spacing.
+        let xml = "\
+<Event xmlns='http://schemas.microsoft.com/win/2004/08/events/event'>\
+<System><EventRecordID>8</EventRecordID></System>\
+<EventData><Data Name='Msg'>start &amp; middle &lt;end&gt; done</Data></EventData>\
+</Event>";
+
+        let records = parse_event_xml_batch(xml);
+
+        assert_eq!(records.len(), 1);
+        let event = parsed_json(&records[0]);
+        assert_eq!(event["EventData"]["Msg"], "start & middle <end> done");
     }
 
     #[cfg(windows)]
