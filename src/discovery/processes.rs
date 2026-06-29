@@ -75,6 +75,7 @@ fn discover_processes_native() -> Result<Vec<Process>, String> {
 }
 
 /// Shell-out fallback: parse `ps aux` output.
+#[cfg(not(target_os = "windows"))]
 fn discover_processes_shellout() -> Result<Vec<Process>, String> {
     let output = std::process::Command::new("ps")
         .args(["aux"])
@@ -96,6 +97,7 @@ fn discover_processes_shellout() -> Result<Vec<Process>, String> {
 ///
 /// Fields: USER PID %CPU %MEM VSZ RSS TT STAT STARTED TIME COMMAND
 /// Command is everything after field 10 (index 10+), preserving spaces.
+#[cfg(any(not(target_os = "windows"), test))]
 fn parse_ps_aux(output: &str) -> Vec<Process> {
     output
         .lines()
@@ -104,6 +106,7 @@ fn parse_ps_aux(output: &str) -> Vec<Process> {
         .collect()
 }
 
+#[cfg(any(not(target_os = "windows"), test))]
 fn parse_ps_aux_line(line: &str) -> Option<Process> {
     let trimmed = line.trim();
     if trimmed.is_empty() {
@@ -149,7 +152,45 @@ fn discover_processes_sync() -> Result<Vec<Process>, String> {
     })
 }
 
-#[cfg(not(target_os = "linux"))]
+/// Windows: enumerate via `sysinfo` (no `ps`/`wmic` shell-out).
+#[cfg(target_os = "windows")]
+fn discover_processes_sync() -> Result<Vec<Process>, String> {
+    use sysinfo::{ProcessesToUpdate, System};
+
+    let mut system = System::new();
+    system.refresh_processes(ProcessesToUpdate::All, true);
+
+    let processes = system
+        .processes()
+        .values()
+        .map(|proc| {
+            let command = if proc.cmd().is_empty() {
+                proc.name().to_string_lossy().into_owned()
+            } else {
+                proc.cmd()
+                    .iter()
+                    .map(|arg| arg.to_string_lossy())
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            };
+            Process {
+                pid: proc.pid().as_u32(),
+                user: proc
+                    .user_id()
+                    .map(|uid| uid.to_string())
+                    .unwrap_or_default(),
+                cpu: format!("{:.1}", proc.cpu_usage()),
+                mem: format!("{:.1}", proc.memory() as f64 / (1024.0 * 1024.0)),
+                command,
+            }
+        })
+        .collect::<Vec<_>>();
+
+    debug!(count = processes.len(), "discovered processes via sysinfo");
+    Ok(processes)
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "windows")))]
 fn discover_processes_sync() -> Result<Vec<Process>, String> {
     discover_processes_shellout()
 }
