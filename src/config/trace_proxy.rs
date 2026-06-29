@@ -17,6 +17,8 @@ pub struct TraceProxyStreamConfig {
     /// Unique identifier from Rails for this proxy instance.
     pub log_source_id: String,
     pub listen_address: SocketAddr,
+    /// Optional OTLP/gRPC listener (`:4317`). Absent in config leaves gRPC off.
+    pub grpc_listen_address: Option<SocketAddr>,
     pub subbox_endpoint: String,
     pub archive_id: String,
     pub repo_id: String,
@@ -31,6 +33,7 @@ impl TraceProxyStreamConfig {
     /// Compute hash of fields that matter for proxy restart.
     pub fn compute_hash(
         listen_address: &str,
+        grpc_listen_address: Option<&str>,
         subbox_endpoint: &str,
         archive_id: &str,
         repo_id: &str,
@@ -39,6 +42,9 @@ impl TraceProxyStreamConfig {
     ) -> String {
         let mut input = String::new();
         append_hash_field(&mut input, listen_address);
+        // Empty stands for "no gRPC listener" — distinct from any real address,
+        // so adding, removing, or changing the gRPC port restarts the proxy.
+        append_hash_field(&mut input, grpc_listen_address.unwrap_or(""));
         append_hash_field(&mut input, subbox_endpoint);
         append_hash_field(&mut input, archive_id);
         append_hash_field(&mut input, repo_id);
@@ -102,6 +108,7 @@ fn trace_proxy_from_entry(
     let trace_proxy_id = required_config_key_result::<TraceProxyId>(log_source_id, ctx)?;
     let listen_address = required_string_field_result(proxy, "listen_address", ctx)?;
     let parsed_listen_address = parse_listen_address(&listen_address, ctx)?;
+    let grpc_listen_address = optional_listen_address_field(proxy, "grpc_listen_address", ctx)?;
     let subbox_endpoint =
         required_config_string_result::<WireEndpoint>(proxy, "subbox_endpoint", ctx)?;
     let archive_id = required_config_string_result::<ArchiveId>(proxy, "archive_id", ctx)?;
@@ -112,6 +119,7 @@ fn trace_proxy_from_entry(
 
     let config_hash = TraceProxyStreamConfig::compute_hash(
         &listen_address,
+        grpc_listen_address.map(|addr| addr.to_string()).as_deref(),
         subbox_endpoint.0.as_str(),
         archive_id.0.as_str(),
         repo_id.0.as_str(),
@@ -122,6 +130,7 @@ fn trace_proxy_from_entry(
     Ok(TraceProxyStreamConfig {
         log_source_id: trace_proxy_id.0,
         listen_address: parsed_listen_address,
+        grpc_listen_address,
         subbox_endpoint: subbox_endpoint.0,
         archive_id: archive_id.0,
         repo_id: repo_id.0,
@@ -137,6 +146,37 @@ fn parse_listen_address(raw: &str, ctx: FieldContext<'_>) -> Result<SocketAddr, 
         Err(_) => Err(ConfigFieldError::invalid_field_value(
             ctx,
             "listen_address",
+            "socket address",
+            raw,
+        )),
+    }
+}
+
+/// Parse an optional socket-address field. Absent leaves the listener off; a
+/// present-but-unparseable value is an error so a typo'd gRPC port is rejected
+/// rather than silently dropping the listener.
+fn optional_listen_address_field(
+    proxy: &Value,
+    field: &'static str,
+    ctx: FieldContext<'_>,
+) -> Result<Option<SocketAddr>, ConfigFieldError> {
+    let Some(raw) = proxy.get(field) else {
+        return Ok(None);
+    };
+
+    let Some(raw) = raw.as_str() else {
+        return Err(ConfigFieldError::invalid_field(
+            ctx,
+            field,
+            "socket address",
+        ));
+    };
+
+    match raw.parse() {
+        Ok(address) => Ok(Some(address)),
+        Err(_) => Err(ConfigFieldError::invalid_field_value(
+            ctx,
+            field,
             "socket address",
             raw,
         )),
@@ -326,6 +366,7 @@ mod tests {
     fn trace_proxy_config_hash_changes_when_restart_fields_change() {
         let base = TraceProxyStreamConfig::compute_hash(
             "127.0.0.1:4318",
+            None,
             "https://subbox.example",
             "arc_123",
             "repo_456",
@@ -334,6 +375,7 @@ mod tests {
         );
         let changed_address = TraceProxyStreamConfig::compute_hash(
             "127.0.0.1:4319",
+            None,
             "https://subbox.example",
             "arc_123",
             "repo_456",
@@ -342,6 +384,7 @@ mod tests {
         );
         let changed_endpoint = TraceProxyStreamConfig::compute_hash(
             "127.0.0.1:4318",
+            None,
             "https://subbox-alt.example",
             "arc_123",
             "repo_456",
@@ -350,6 +393,7 @@ mod tests {
         );
         let changed_archive = TraceProxyStreamConfig::compute_hash(
             "127.0.0.1:4318",
+            None,
             "https://subbox.example",
             "arc_999",
             "repo_456",
@@ -358,6 +402,7 @@ mod tests {
         );
         let changed_repo = TraceProxyStreamConfig::compute_hash(
             "127.0.0.1:4318",
+            None,
             "https://subbox.example",
             "arc_123",
             "repo_999",
@@ -366,11 +411,21 @@ mod tests {
         );
         let changed_policy = TraceProxyStreamConfig::compute_hash(
             "127.0.0.1:4318",
+            None,
             "https://subbox.example",
             "arc_123",
             "repo_456",
             true,
             &BTreeSet::from(["checkout".to_string()]),
+        );
+        let added_grpc = TraceProxyStreamConfig::compute_hash(
+            "127.0.0.1:4318",
+            Some("127.0.0.1:4317"),
+            "https://subbox.example",
+            "arc_123",
+            "repo_456",
+            false,
+            &BTreeSet::new(),
         );
 
         assert_ne!(base, changed_address);
@@ -378,9 +433,11 @@ mod tests {
         assert_ne!(base, changed_archive);
         assert_ne!(base, changed_repo);
         assert_ne!(base, changed_policy);
+        assert_ne!(base, added_grpc);
 
         let comma_literal = TraceProxyStreamConfig::compute_hash(
             "127.0.0.1:4318",
+            None,
             "https://subbox.example",
             "arc_123",
             "repo_456",
@@ -389,6 +446,7 @@ mod tests {
         );
         let split_names = TraceProxyStreamConfig::compute_hash(
             "127.0.0.1:4318",
+            None,
             "https://subbox.example",
             "arc_123",
             "repo_456",
@@ -396,5 +454,79 @@ mod tests {
             &BTreeSet::from(["a".to_string(), "b".to_string()]),
         );
         assert_ne!(comma_literal, split_names);
+    }
+
+    #[test]
+    fn extracts_grpc_listen_address_when_present() {
+        let unified = unified(json!({
+            "traces": {
+                "traces-proxy-agent-123": {
+                    "listen_address": "127.0.0.1:4318",
+                    "grpc_listen_address": "127.0.0.1:4317",
+                    "subbox_endpoint": "https://subbox.example",
+                    "archive_id": "arc_123",
+                    "repo_id": "repo_456"
+                }
+            }
+        }));
+
+        let proxies = all_trace_proxies(&unified);
+
+        assert_eq!(proxies.len(), 1);
+        assert_eq!(
+            proxies[0].grpc_listen_address,
+            Some("127.0.0.1:4317".parse::<SocketAddr>().unwrap())
+        );
+    }
+
+    #[test]
+    fn grpc_listen_address_defaults_to_none() {
+        let unified = unified(json!({
+            "traces": {
+                "traces-proxy-agent-123": {
+                    "listen_address": "127.0.0.1:4318",
+                    "subbox_endpoint": "https://subbox.example",
+                    "archive_id": "arc_123",
+                    "repo_id": "repo_456"
+                }
+            }
+        }));
+
+        let proxies = all_trace_proxies(&unified);
+
+        assert_eq!(proxies.len(), 1);
+        assert_eq!(proxies[0].grpc_listen_address, None);
+    }
+
+    #[test]
+    fn skips_proxy_with_invalid_grpc_listen_address() {
+        let unified = unified(json!({
+            "traces": {
+                "bad-grpc-address": {
+                    "listen_address": "127.0.0.1:4318",
+                    "grpc_listen_address": "not-an-address",
+                    "subbox_endpoint": "https://subbox.example",
+                    "archive_id": "arc_bad_grpc",
+                    "repo_id": "repo_bad_grpc"
+                }
+            }
+        }));
+
+        let report = all_trace_proxies_with_diagnostics(&unified);
+
+        assert!(report.values.is_empty());
+        assert!(report.errors.iter().any(|error| {
+            matches!(
+                error,
+                ConfigFieldError::InvalidField {
+                    section: "traces",
+                    entry_id: Some(entry_id),
+                    field: "grpc_listen_address",
+                    expected: "socket address",
+                    actual: Some(actual),
+                    ..
+                } if entry_id == "bad-grpc-address" && actual == "not-an-address"
+            )
+        }));
     }
 }
