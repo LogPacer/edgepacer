@@ -146,6 +146,19 @@ fn read_memory_mb() -> u64 {
         }
     }
 
+    // Windows: sysinfo wraps GlobalMemoryStatusEx for total physical RAM
+    // (same source host_metrics.rs uses; returns bytes).
+    #[cfg(target_os = "windows")]
+    {
+        use sysinfo::System;
+        let mut sys = System::new();
+        sys.refresh_memory();
+        let total = sys.total_memory();
+        if total > 0 {
+            return total / (1024 * 1024);
+        }
+    }
+
     0
 }
 
