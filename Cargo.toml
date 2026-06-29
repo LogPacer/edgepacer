@@ -44,12 +44,11 @@ httlib-hpack = { version = "0.1", default-features = false }
 # Wire format
 # Shared wire format for internal LogPacer traffic
 logpacer_wire = { path = "crates/logpacer_wire", version = "0.1.0" }
-prost = "0.13"
+prost = "0.14"
 
 # Trace proxy
 axum = "0.8"
 opentelemetry-proto = { version = "0.32.0", features = ["gen-tonic-messages", "trace"], default-features = false }
-prost14 = { package = "prost", version = "0.14" }
 
 # Logging
 tracing = "0.1"
