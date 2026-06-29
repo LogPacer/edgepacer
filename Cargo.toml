@@ -48,7 +48,13 @@ prost = "0.14"
 
 # Trace proxy
 axum = "0.8"
-opentelemetry-proto = { version = "0.32.0", features = ["gen-tonic-messages", "trace"], default-features = false }
+opentelemetry-proto = { version = "0.32.0", features = ["gen-tonic", "trace"], default-features = false }
+# OTLP/gRPC receiver on :4317 — `transport` + `router` run the server, `codegen`
+# backs opentelemetry-proto's generated TraceService. No TLS feature: the gRPC
+# listener is plaintext, mirroring the :4318 HTTP listener (both terminate on
+# localhost). tonic 0.14 pairs with the unified prost 0.14 and reuses the axum
+# 0.8 already in the tree.
+tonic = { version = "0.14", default-features = false, features = ["transport", "codegen", "router"] }
 
 # Logging
 tracing = "0.1"
