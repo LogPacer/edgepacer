@@ -90,6 +90,7 @@ impl TraceProxyManager {
 
         let proxy_config = TraceProxyConfig {
             listen_address: cfg.listen_address,
+            grpc_listen_address: cfg.grpc_listen_address,
             subbox_endpoint: cfg.subbox_endpoint.clone(),
             archive_id: cfg.archive_id.clone(),
             repo_id: cfg.repo_id.clone(),

@@ -50,6 +50,11 @@ pub const DEFAULT_TRACE_BUFFER_MAX_MB: u64 = 100;
 
 type ExportTraceServiceRequest =
     opentelemetry_proto::tonic::collector::trace::v1::ExportTraceServiceRequest;
+type ExportTraceServiceResponse =
+    opentelemetry_proto::tonic::collector::trace::v1::ExportTraceServiceResponse;
+use opentelemetry_proto::tonic::collector::trace::v1::trace_service_server::{
+    TraceService, TraceServiceServer,
+};
 type ResourceSpans = opentelemetry_proto::tonic::trace::v1::ResourceSpans;
 type Resource = opentelemetry_proto::tonic::resource::v1::Resource;
 type KeyValue = opentelemetry_proto::tonic::common::v1::KeyValue;
@@ -63,6 +68,10 @@ const SERVICE_NAME_KEY: &str = "service.name";
 #[derive(Debug, Clone)]
 pub struct TraceProxyConfig {
     pub listen_address: SocketAddr,
+    /// Optional OTLP/gRPC listener (`:4317`), the sibling of the HTTP listener.
+    /// `None` (the default) leaves gRPC off; the control plane opts in by
+    /// setting it, mirroring how every other proxy field is server-driven.
+    pub grpc_listen_address: Option<SocketAddr>,
     pub subbox_endpoint: String,
     pub archive_id: String,
     pub repo_id: String,
@@ -421,25 +430,27 @@ fn decode_request_body(headers: &HeaderMap, body: Bytes) -> Option<Vec<u8>> {
     (decoded.len() <= MAX_DECOMPRESSED_SIZE).then_some(decoded)
 }
 
-async fn handle_traces(
-    State(state): State<Arc<ProxyState>>,
-    headers: HeaderMap,
-    body: Bytes,
-) -> StatusCode {
-    if body.len() > MAX_REQUEST_SIZE {
-        return StatusCode::PAYLOAD_TOO_LARGE;
-    }
+/// A request the service-name policy refused before any span was forwarded.
+/// Carried back to the transport handlers so each maps it to its own status:
+/// HTTP returns 403, gRPC returns `permission_denied`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum TraceRequestRejection {
+    ServiceNamePolicy(ServiceNamePolicyRejection),
+}
 
-    // OTLP clients gzip the body by default; decompress before decoding protobuf.
-    let Some(body) = decode_request_body(&headers, body) else {
-        return StatusCode::BAD_REQUEST;
-    };
-
-    let mut request = match ExportTraceServiceRequest::decode(body.as_slice()) {
-        Ok(request) => request,
-        Err(_) => return StatusCode::BAD_REQUEST,
-    };
-
+/// Apply the service-name policy to every resource span, then encode, forward,
+/// and (on a retryable failure) buffer each resource's batch.
+///
+/// This is the transport-agnostic core shared by the HTTP (`/v1/traces`) and
+/// gRPC (`:4317`) receivers — the policy gate, the wire encoding, the buffer
+/// retry decision, and the upload-token auth all live here once. Transports own
+/// only their own framing: HTTP the size guard, gzip, and protobuf decode; gRPC
+/// the transport-level decode-size limit. A policy rejection short-circuits
+/// before any partial payload is forwarded.
+async fn process_trace_request(
+    state: &ProxyState,
+    mut request: ExportTraceServiceRequest,
+) -> Result<(), TraceRequestRejection> {
     for resource_span in &mut request.resource_spans {
         match apply_service_name_policy(
             resource_span,
@@ -463,14 +474,18 @@ async fn handle_traces(
             Ok(false) => {}
             Err(ServiceNamePolicyRejection::Missing) => {
                 warn!("trace resource span rejected: service.name is required");
-                return StatusCode::FORBIDDEN;
+                return Err(TraceRequestRejection::ServiceNamePolicy(
+                    ServiceNamePolicyRejection::Missing,
+                ));
             }
             Err(ServiceNamePolicyRejection::NotAllowed(service_name)) => {
                 warn!(
                     service_name = %service_name,
                     "trace resource span rejected: service.name is not in the configured allow-list"
                 );
-                return StatusCode::FORBIDDEN;
+                return Err(TraceRequestRejection::ServiceNamePolicy(
+                    ServiceNamePolicyRejection::NotAllowed(service_name),
+                ));
             }
         }
     }
@@ -490,19 +505,72 @@ async fn handle_traces(
             }
         };
 
-        let outcome = forward_payload(state.as_ref(), &payload).await;
+        let outcome = forward_payload(state, &payload).await;
         if matches!(outcome, ForwardOutcome::Retryable) {
-            buffer_for_retry(state.as_ref(), &payload).await;
+            buffer_for_retry(state, &payload).await;
         }
     }
 
-    StatusCode::OK
+    Ok(())
+}
+
+async fn handle_traces(
+    State(state): State<Arc<ProxyState>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> StatusCode {
+    if body.len() > MAX_REQUEST_SIZE {
+        return StatusCode::PAYLOAD_TOO_LARGE;
+    }
+
+    // OTLP clients gzip the body by default; decompress before decoding protobuf.
+    let Some(body) = decode_request_body(&headers, body) else {
+        return StatusCode::BAD_REQUEST;
+    };
+
+    let request = match ExportTraceServiceRequest::decode(body.as_slice()) {
+        Ok(request) => request,
+        Err(_) => return StatusCode::BAD_REQUEST,
+    };
+
+    match process_trace_request(state.as_ref(), request).await {
+        Ok(()) => StatusCode::OK,
+        Err(TraceRequestRejection::ServiceNamePolicy(_)) => StatusCode::FORBIDDEN,
+    }
+}
+
+/// OTLP/gRPC receiver — the `:4317` sibling of the `/v1/traces` HTTP listener.
+///
+/// tonic owns the transport framing (HTTP/2, length-prefixing, the protobuf
+/// codec); this handler decodes nothing itself. It forwards the request into
+/// the shared [`process_trace_request`] so buffering, retry, auth, and the
+/// service-name policy match the HTTP path exactly, and maps a policy rejection
+/// to `permission_denied` (the gRPC peer of HTTP 403).
+struct TraceGrpcService {
+    state: Arc<ProxyState>,
+}
+
+#[tonic::async_trait]
+impl TraceService for TraceGrpcService {
+    async fn export(
+        &self,
+        request: tonic::Request<ExportTraceServiceRequest>,
+    ) -> Result<tonic::Response<ExportTraceServiceResponse>, tonic::Status> {
+        match process_trace_request(self.state.as_ref(), request.into_inner()).await {
+            // An unset partial_success means full success per the OTLP spec.
+            Ok(()) => Ok(tonic::Response::new(ExportTraceServiceResponse::default())),
+            Err(TraceRequestRejection::ServiceNamePolicy(_)) => Err(
+                tonic::Status::permission_denied("service.name rejected by trace acceptance policy"),
+            ),
+        }
+    }
 }
 
 pub struct TraceProxy {
     config: TraceProxyConfig,
     shutdown_tx: Option<watch::Sender<bool>>,
     server_handle: Option<JoinHandle<()>>,
+    grpc_handle: Option<JoinHandle<()>>,
     drain_handle: Option<JoinHandle<()>>,
 }
 
@@ -512,6 +580,7 @@ impl TraceProxy {
             config,
             shutdown_tx: None,
             server_handle: None,
+            grpc_handle: None,
             drain_handle: None,
         }
     }
@@ -557,6 +626,30 @@ impl TraceProxy {
                 .ok();
         }));
 
+        // Optional OTLP/gRPC listener — a sibling of the HTTP server sharing the
+        // same forward path and the same shutdown signal. Off unless the control
+        // plane set a gRPC address.
+        if let Some(grpc_address) = self.config.grpc_listen_address {
+            let grpc_service = TraceServiceServer::new(TraceGrpcService {
+                state: state.clone(),
+            })
+            // Parity with the HTTP listener's MAX_REQUEST_SIZE cap (tonic
+            // defaults to 4 MB).
+            .max_decoding_message_size(MAX_REQUEST_SIZE);
+
+            let mut grpc_shutdown_rx = shutdown_rx.clone();
+            info!(address = %grpc_address, "trace proxy gRPC listening");
+            self.grpc_handle = Some(tokio::spawn(async move {
+                tonic::transport::Server::builder()
+                    .add_service(grpc_service)
+                    .serve_with_shutdown(grpc_address, async move {
+                        let _ = grpc_shutdown_rx.changed().await;
+                    })
+                    .await
+                    .ok();
+            }));
+        }
+
         self.drain_handle = Some(tokio::spawn(drain_loop(state, shutdown_rx)));
 
         Ok(())
@@ -576,6 +669,14 @@ impl TraceProxy {
                 Ok(Ok(())) => {}
                 Ok(Err(e)) => error!(error = %e, "trace proxy server task panicked"),
                 Err(_) => warn!("trace proxy server stop timed out"),
+            }
+        }
+
+        if let Some(handle) = self.grpc_handle.take() {
+            match tokio::time::timeout(timeout, handle).await {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => error!(error = %e, "trace proxy gRPC task panicked"),
+                Err(_) => warn!("trace proxy gRPC stop timed out"),
             }
         }
 
@@ -654,6 +755,7 @@ mod tests {
     fn test_config(endpoint: String, buffer_path: &Path) -> TraceProxyConfig {
         TraceProxyConfig {
             listen_address: "127.0.0.1:0".parse().unwrap(),
+            grpc_listen_address: None,
             subbox_endpoint: endpoint,
             archive_id: "arc_test".into(),
             repo_id: "repo_test".into(),
@@ -927,6 +1029,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let config = TraceProxyConfig {
             listen_address: "127.0.0.1:0".parse().unwrap(),
+            grpc_listen_address: None,
             subbox_endpoint: "http://localhost:9999/v1/logpacer-wire".into(),
             archive_id: "arc_test".into(),
             repo_id: "repo_test".into(),
@@ -1446,6 +1549,157 @@ mod tests {
         );
         let buffer = state.buffer.lock().await;
         assert_eq!(buffer.count().unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn grpc_export_forwards_span_through_shared_path() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path(WIRE_PATH))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_raw(wire_response(1, 0, ""), "application/x-protobuf"),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let dir = tempfile::tempdir().unwrap();
+        let state = test_state(
+            format!("{}{WIRE_PATH}", server.uri()),
+            &dir.path().join("trace-buffer.sqlite"),
+        )
+        .await;
+        let service = TraceGrpcService {
+            state: state.clone(),
+        };
+
+        let request = ExportTraceServiceRequest {
+            resource_spans: vec![resource_span_with_service(Some("checkout"))],
+        };
+        let response = service
+            .export(tonic::Request::new(request))
+            .await
+            .expect("gRPC export should succeed");
+        // An empty response (partial_success unset) signals full acceptance.
+        assert_eq!(response.into_inner(), ExportTraceServiceResponse::default());
+
+        // The span must reach the wire through the same forward path as HTTP.
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 1, "exactly one payload should be forwarded");
+        let forwarded =
+            WireRequest::decode(&requests[0].body[..]).expect("forwarded body decodes as wire");
+        let Some(routed_batch::Payload::Traces(traces)) = &forwarded.batches[0].payload else {
+            panic!("expected routed traces payload");
+        };
+        assert_eq!(traces.entries_json.len(), 1);
+        let span: serde_json::Value = serde_json::from_slice(&traces.entries_json[0]).unwrap();
+        assert_eq!(span["service_name"], serde_json::json!("checkout"));
+    }
+
+    #[tokio::test]
+    async fn grpc_export_maps_policy_rejection_to_permission_denied() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path(WIRE_PATH))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_raw(wire_response(1, 0, ""), "application/x-protobuf"),
+            )
+            .mount(&server)
+            .await;
+
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config_with_policy(
+            format!("{}{WIRE_PATH}", server.uri()),
+            &dir.path().join("trace-buffer.sqlite"),
+            true,
+            BTreeSet::new(),
+        );
+        let state = test_state_from_config(config).await;
+        let service = TraceGrpcService {
+            state: state.clone(),
+        };
+
+        let request = ExportTraceServiceRequest {
+            resource_spans: vec![resource_span_with_service(None)],
+        };
+        let status = service
+            .export(tonic::Request::new(request))
+            .await
+            .expect_err("required service.name must reject");
+
+        assert_eq!(status.code(), tonic::Code::PermissionDenied);
+        assert!(
+            server.received_requests().await.unwrap().is_empty(),
+            "a policy rejection must not forward a partial payload"
+        );
+        let buffer = state.buffer.lock().await;
+        assert_eq!(buffer.count().unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn proxy_serves_grpc_when_address_configured() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path(WIRE_PATH))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_raw(wire_response(1, 0, ""), "application/x-protobuf"),
+            )
+            .mount(&server)
+            .await;
+
+        let grpc_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let grpc_address = grpc_listener.local_addr().unwrap();
+        drop(grpc_listener);
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = test_config(
+            format!("{}{WIRE_PATH}", server.uri()),
+            &dir.path().join("trace-buffer.sqlite"),
+        );
+        config.grpc_listen_address = Some(grpc_address);
+
+        let mut proxy = TraceProxy::new(config);
+        proxy.start().await.expect("proxy should start");
+
+        // Drive the live gRPC listener with a real OTLP export client.
+        use opentelemetry_proto::tonic::collector::trace::v1::trace_service_client::TraceServiceClient;
+        let request = ExportTraceServiceRequest {
+            resource_spans: vec![resource_span_with_service(Some("checkout"))],
+        };
+        let response = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                match TraceServiceClient::connect(format!("http://{grpc_address}")).await {
+                    Ok(mut client) => break client.export(request.clone()).await,
+                    Err(_) => tokio::time::sleep(std::time::Duration::from_millis(50)).await,
+                }
+            }
+        })
+        .await
+        .expect("gRPC listener should accept the export before timeout")
+        .expect("export RPC should succeed");
+        assert_eq!(
+            response.into_inner(),
+            ExportTraceServiceResponse::default()
+        );
+
+        let requests = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let requests = server.received_requests().await.unwrap();
+                if !requests.is_empty() {
+                    break requests;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("wire relay should receive the forwarded trace before timeout");
+
+        proxy.stop().await;
+
+        assert_eq!(requests.len(), 1, "exactly one payload should be forwarded");
     }
 
     #[tokio::test]
