@@ -25,6 +25,12 @@ reqwest = { version = "0.12", features = ["json", "rustls-tls-native-roots", "st
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
+# XML reader for Windows Event Log records. wevtutil emits the well-defined
+# Windows Event schema as XML; we map it to structured JSON on the wire. Pulled
+# in unconditionally (the parse is pure and unit-tested on every platform); the
+# live wevtutil query stays Windows-only.
+quick-xml = "0.40"
+
 # Shared #[repr(C)] BPF event layout (LogChunk / ConnectEvent / CHUNK_LEN) — one
 # source of truth shared with the kernel BPF crate (bpf/). Pulled only by `ebpf`.
 edgepacer-ebpf-common = { path = "bpf-common", version = "0.1.0", optional = true }

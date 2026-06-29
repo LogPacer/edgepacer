@@ -5,6 +5,11 @@
 
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use quick_xml::XmlVersion;
+use quick_xml::escape::resolve_predefined_entity;
+use quick_xml::events::Event as XmlEvent;
+use quick_xml::reader::Reader;
+use serde_json::{Map, Value, json};
 use tokio::process::Command;
 use tokio::sync::watch;
 use tracing::{debug, info, warn};
@@ -19,7 +24,7 @@ const CHECKPOINT_INTERVAL: u64 = 100;
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct EventLogRecord {
     record_id: u64,
-    xml: String,
+    json: Vec<u8>,
 }
 
 /// Stream Windows Event Log records into the streaming pipeline actor.
@@ -93,7 +98,7 @@ pub async fn stream_event_log(
                         .unwrap_or_default()
                         .as_nanos() as i64;
 
-                    if !handle.enqueue(record.xml.into_bytes(), now_ns).await {
+                    if !handle.enqueue(record.json, now_ns).await {
                         warn!(channel, "streaming pipeline actor gone, stopping Windows Event Log stream");
                         handle
                             .set_final_checkpoint(StreamingCheckpoint::windows_event_log(
@@ -209,11 +214,8 @@ fn parse_event_xml_batch(xml: &str) -> Vec<EventLogRecord> {
             break;
         };
         let event_xml = &rest[..end + "</Event>".len()];
-        if let Some(record_id) = extract_record_id(event_xml) {
-            records.push(EventLogRecord {
-                record_id,
-                xml: event_xml.to_string(),
-            });
+        if let Some(record) = event_to_record(event_xml) {
+            records.push(record);
         }
         rest = &rest[end + "</Event>".len()..];
     }
@@ -221,15 +223,194 @@ fn parse_event_xml_batch(xml: &str) -> Vec<EventLogRecord> {
     records
 }
 
-fn extract_record_id(xml: &str) -> Option<u64> {
-    let start = xml.find("<EventRecordID>")? + "<EventRecordID>".len();
-    let end = xml[start..].find("</EventRecordID>")? + start;
-    xml[start..end].trim().parse().ok()
+/// Parse one `<Event>…</Event>` blob into a structured JSON object.
+///
+/// Returns `None` when the event carries no EventRecordID — the field is the
+/// resume anchor for the wevtutil checkpoint, so an event we cannot resume past
+/// is dropped rather than enqueued.
+///
+/// `wevtutil /f:xml` emits the raw event schema only; the rendered, localized
+/// Message is not present (it needs EvtFormatMessage against a provider DLL) and
+/// is deliberately out of scope here.
+fn event_to_record(event_xml: &str) -> Option<EventLogRecord> {
+    let parsed = parse_event(event_xml)?;
+    let record_id = parsed
+        .get("EventRecordID")
+        .and_then(Value::as_str)
+        .and_then(|value| value.trim().parse().ok())?;
+    let json = serde_json::to_vec(&parsed).ok()?;
+    Some(EventLogRecord { record_id, json })
+}
+
+/// Map the Windows Event XML schema to a flat JSON object.
+///
+/// `<System>` carries the well-known envelope fields (most as element text, but
+/// `Provider`/`TimeCreated` hold their value in an attribute). `<EventData>`
+/// contributes a `EventData` object of `Name`-keyed `<Data>` values plus an
+/// `EventDataUnnamed` array for positional `<Data>` entries.
+fn parse_event(event_xml: &str) -> Option<Value> {
+    // No `trim_text`: we only buffer character content inside leaf elements
+    // (System fields, <Data>), which have no child elements and thus no
+    // inter-element indentation to strip — and trimming would corrupt EventData
+    // values that carry meaningful surrounding whitespace. Whitespace between
+    // elements arrives while no field is active and is ignored.
+    let mut reader = Reader::from_str(event_xml);
+
+    let mut object = Map::new();
+    let mut event_data = Map::new();
+    let mut event_data_unnamed: Vec<Value> = Vec::new();
+    let mut in_event_data = false;
+
+    // The element whose character content we are accumulating, and the buffer it
+    // collects into. quick-xml emits an element's content as several events — one
+    // `Text` per literal run plus a `GeneralRef` per entity (`&amp;` etc.) — so we
+    // gather them all and commit the joined value on the matching `End`.
+    let mut field: Option<Field> = None;
+    let mut buffer = String::new();
+
+    loop {
+        match reader.read_event() {
+            Ok(XmlEvent::Start(element)) => {
+                let name = local_name(element.name().as_ref());
+                match name.as_str() {
+                    // Provider/TimeCreated carry their value in an attribute, not
+                    // in text. They usually arrive self-closing (Empty), but a
+                    // non-self-closing form is handled the same way here.
+                    "Provider" | "TimeCreated" => {
+                        capture_attribute(&mut object, &reader, &element, &name)
+                    }
+                    "EventID" | "Level" | "Computer" | "Channel" | "EventRecordID" => {
+                        field = Some(Field::System(name));
+                        buffer.clear();
+                    }
+                    "EventData" => in_event_data = true,
+                    "Data" if in_event_data => {
+                        field = Some(Field::Data(attribute(&reader, &element, b"Name")));
+                        buffer.clear();
+                    }
+                    _ => {}
+                }
+            }
+            // Self-closing Provider/TimeCreated arrive as Empty; their values live
+            // in attributes (Provider Name=…, TimeCreated SystemTime=…).
+            Ok(XmlEvent::Empty(element)) => {
+                let name = local_name(element.name().as_ref());
+                if matches!(name.as_str(), "Provider" | "TimeCreated") {
+                    capture_attribute(&mut object, &reader, &element, &name);
+                }
+            }
+            Ok(XmlEvent::Text(text)) if field.is_some() => {
+                buffer.push_str(&decode_text(&text));
+            }
+            // An entity reference inside content (e.g. &amp;, &lt;, &#65;) is its
+            // own event in quick-xml; resolve it back into the value buffer.
+            Ok(XmlEvent::GeneralRef(reference)) => {
+                if field.is_some()
+                    && let Ok(name) = reference.decode()
+                {
+                    if let Some(resolved) = resolve_predefined_entity(&name) {
+                        buffer.push_str(resolved);
+                    } else if let Ok(Some(ch)) = reference.resolve_char_ref() {
+                        buffer.push(ch);
+                    }
+                }
+            }
+            Ok(XmlEvent::End(element)) => {
+                let name = local_name(element.name().as_ref());
+                if name == "EventData" {
+                    in_event_data = false;
+                } else if let Some(field) = field.take() {
+                    let value = Value::String(std::mem::take(&mut buffer));
+                    match field {
+                        Field::System(key) => {
+                            object.insert(key, value);
+                        }
+                        Field::Data(Some(key)) => {
+                            event_data.insert(key, value);
+                        }
+                        Field::Data(None) => event_data_unnamed.push(value),
+                    }
+                }
+            }
+            Ok(XmlEvent::Eof) => break,
+            Err(_) => return None,
+            _ => {}
+        }
+    }
+
+    if !event_data.is_empty() {
+        object.insert("EventData".to_string(), Value::Object(event_data));
+    }
+    if !event_data_unnamed.is_empty() {
+        object.insert("EventDataUnnamed".to_string(), json!(event_data_unnamed));
+    }
+
+    Some(Value::Object(object))
+}
+
+/// The destination for the character content currently being accumulated.
+enum Field {
+    /// A `<System>` envelope field, keyed by element name (e.g. "EventID").
+    System(String),
+    /// An `<EventData>` `<Data>` entry: `Some(name)` keyed, `None` positional.
+    Data(Option<String>),
+}
+
+/// Insert the value-bearing attribute of an attribute-only `<System>` element
+/// (`Provider Name=…`, `TimeCreated SystemTime=…`) into the JSON object under the
+/// element's own name.
+fn capture_attribute(
+    object: &mut Map<String, Value>,
+    reader: &Reader<&[u8]>,
+    element: &quick_xml::events::BytesStart<'_>,
+    name: &str,
+) {
+    let key = match name {
+        "Provider" => b"Name".as_slice(),
+        "TimeCreated" => b"SystemTime".as_slice(),
+        _ => return,
+    };
+    if let Some(value) = attribute(reader, element, key) {
+        object.insert(name.to_string(), Value::String(value));
+    }
+}
+
+/// Strip any XML namespace prefix, returning the local element name.
+fn local_name(raw: &[u8]) -> String {
+    let name = raw.rsplit(|byte| *byte == b':').next().unwrap_or(raw);
+    String::from_utf8_lossy(name).into_owned()
+}
+
+/// Decode a literal text run: bytes -> str with XML 1.0 EOL normalization. Entity
+/// references are delivered separately as `GeneralRef` events, so a `Text` run
+/// never carries an unresolved entity of its own.
+fn decode_text(text: &quick_xml::events::BytesText<'_>) -> String {
+    text.xml10_content().unwrap_or_default().into_owned()
+}
+
+fn attribute(
+    reader: &Reader<&[u8]>,
+    element: &quick_xml::events::BytesStart<'_>,
+    key: &[u8],
+) -> Option<String> {
+    element.attributes().flatten().find_map(|attr| {
+        (attr.key.as_ref() == key)
+            .then(|| {
+                attr.decoded_and_normalized_value(XmlVersion::Implicit1_0, reader.decoder())
+                    .ok()
+            })
+            .flatten()
+            .map(|value| value.into_owned())
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn parsed_json(record: &EventLogRecord) -> Value {
+        serde_json::from_slice(&record.json).expect("record JSON is valid")
+    }
 
     #[test]
     fn parses_concatenated_wevtutil_xml_events() {
@@ -240,10 +421,17 @@ mod tests {
         let records = parse_event_xml_batch(xml);
 
         assert_eq!(records.len(), 2);
+
+        let first = parsed_json(&records[0]);
         assert_eq!(records[0].record_id, 41);
-        assert!(records[0].xml.contains("<Data>one</Data>"));
+        assert_eq!(first["EventID"], "1");
+        assert_eq!(first["Channel"], "Application");
+        assert_eq!(first["EventDataUnnamed"], json!(["one"]));
+
+        let second = parsed_json(&records[1]);
         assert_eq!(records[1].record_id, 42);
-        assert!(records[1].xml.contains("<Data>two</Data>"));
+        assert_eq!(second["EventID"], "2");
+        assert_eq!(second["EventDataUnnamed"], json!(["two"]));
     }
 
     #[test]
@@ -256,6 +444,59 @@ mod tests {
 
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].record_id, 9);
+    }
+
+    #[test]
+    fn maps_system_envelope_and_named_event_data() {
+        let xml = "\
+<Event xmlns='http://schemas.microsoft.com/win/2004/08/events/event'>\
+<System>\
+<Provider Name='Microsoft-Windows-Security-Auditing' Guid='{54849625-5478-4994-a5ba-3e3b0328c30d}'/>\
+<EventID>4624</EventID>\
+<Level>0</Level>\
+<TimeCreated SystemTime='2026-06-29T10:00:00.000000000Z'/>\
+<EventRecordID>9876</EventRecordID>\
+<Channel>Security</Channel>\
+<Computer>DESKTOP-ABC</Computer>\
+</System>\
+<EventData>\
+<Data Name='SubjectUserName'>SYSTEM</Data>\
+<Data Name='TargetUserName'>alice</Data>\
+<Data>positional</Data>\
+</EventData>\
+</Event>";
+
+        let records = parse_event_xml_batch(xml);
+
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].record_id, 9876);
+
+        let event = parsed_json(&records[0]);
+        assert_eq!(event["Provider"], "Microsoft-Windows-Security-Auditing");
+        assert_eq!(event["EventID"], "4624");
+        assert_eq!(event["Level"], "0");
+        assert_eq!(event["TimeCreated"], "2026-06-29T10:00:00.000000000Z");
+        assert_eq!(event["EventRecordID"], "9876");
+        assert_eq!(event["Channel"], "Security");
+        assert_eq!(event["Computer"], "DESKTOP-ABC");
+        assert_eq!(event["EventData"]["SubjectUserName"], "SYSTEM");
+        assert_eq!(event["EventData"]["TargetUserName"], "alice");
+        assert_eq!(event["EventDataUnnamed"], json!(["positional"]));
+    }
+
+    #[test]
+    fn escapes_special_characters_in_event_data() {
+        let xml = "\
+<Event xmlns='http://schemas.microsoft.com/win/2004/08/events/event'>\
+<System><EventRecordID>5</EventRecordID></System>\
+<EventData><Data Name='Path'>C:\\Temp &amp; &lt;logs&gt;</Data></EventData>\
+</Event>";
+
+        let records = parse_event_xml_batch(xml);
+
+        assert_eq!(records.len(), 1);
+        let event = parsed_json(&records[0]);
+        assert_eq!(event["EventData"]["Path"], "C:\\Temp & <logs>");
     }
 
     #[cfg(windows)]
