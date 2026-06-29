@@ -28,7 +28,7 @@ use axum::{
     http::{HeaderMap, StatusCode},
     routing::post,
 };
-use prost14::Message as OtelMessage;
+use prost::Message as OtelMessage;
 use tokio::sync::{Mutex, watch};
 use tokio::task::JoinHandle;
 use tracing::{debug, error, info, warn};
