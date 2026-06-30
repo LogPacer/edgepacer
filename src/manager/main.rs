@@ -37,7 +37,7 @@ struct Cli {
 #[derive(Args, Debug)]
 struct RunArgs {
     /// Path to the edgepacer binary
-    #[arg(long, default_value = "./edgepacer", env = "EDGEPACER_PATH")]
+    #[arg(long, default_value = "edgepacer", env = "EDGEPACER_PATH")]
     edgepacer: PathBuf,
 
     /// Rails control-plane URL
@@ -140,10 +140,30 @@ fn go_platform_name(os: &str, arch: &str) -> String {
     format!("{os}-{arch}")
 }
 
+/// Resolve the agent binary path. A relative path (the `edgepacer` default) is
+/// anchored to the manager executable's own directory, so the agent always lands
+/// in a writable location next to the manager regardless of the process CWD.
+fn resolve_edgepacer_path(path: PathBuf) -> PathBuf {
+    if path.is_absolute() {
+        return path;
+    }
+    match std::env::current_exe() {
+        Ok(exe) => match exe.parent() {
+            Some(dir) => dir.join(&path),
+            None => path,
+        },
+        Err(_) => path,
+    }
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
-    let run = cli.run;
+    let mut run = cli.run;
+    // Anchor a relative agent path to the manager's own directory rather than the
+    // process CWD. Services and `iex`-piped installs run with CWD=system32, where
+    // writing the agent at "./edgepacer" fails with "Access is denied".
+    run.edgepacer = resolve_edgepacer_path(run.edgepacer);
 
     // Initialize logging
     let filter = EnvFilter::try_new("info").unwrap();
