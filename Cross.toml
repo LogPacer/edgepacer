@@ -1,5 +1,8 @@
 [build.env]
-passthrough = ["RUSTC_WORKSPACE_WRAPPER"]
+# EDGEPACER_RELEASE_VERSION must reach build.rs *inside* the container, or every
+# cross build stamps `<version>-dev+unknown` — a prerelease that sorts below the
+# release tag, so the manager's update loop perpetually "updates" the agent.
+passthrough = ["RUSTC_WORKSPACE_WRAPPER", "EDGEPACER_RELEASE_VERSION"]
 
 [target.x86_64-unknown-linux-musl]
 image = "ghcr.io/cross-rs/x86_64-unknown-linux-musl:0.2.5"

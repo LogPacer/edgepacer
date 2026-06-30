@@ -210,10 +210,50 @@ impl Updater {
         Ok(backup_path)
     }
 
-    /// Install new binary (atomic rename).
+    /// Install the new binary, replacing the current one.
+    ///
+    /// Unix: a single atomic rename — the running image keeps its open inode.
+    /// Windows: the running (or just-killed) exe holds an image lock, so an
+    /// in-place overwrite fails with "Access is denied (os error 5)". Windows
+    /// *does* permit renaming a locked exe out of the way, so move the current
+    /// binary aside (`target` → `.old`), move the new one into place, then
+    /// best-effort delete `.old`. The move-aside is retried briefly because the
+    /// child's file handle can lag its exit.
     pub fn install_new(new_path: &Path, target_path: &Path) -> anyhow::Result<()> {
+        #[cfg(windows)]
+        Self::install_new_windows(new_path, target_path)?;
+        #[cfg(not(windows))]
         std::fs::rename(new_path, target_path)?;
         info!(target = %target_path.display(), "[manager] installed new binary");
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    fn install_new_windows(new_path: &Path, target_path: &Path) -> anyhow::Result<()> {
+        use std::time::{Duration, Instant};
+
+        // First install (no current binary): nothing to move aside.
+        if !target_path.exists() {
+            return std::fs::rename(new_path, target_path).map_err(Into::into);
+        }
+
+        let old_path = target_path.with_extension("old");
+        let _ = std::fs::remove_file(&old_path); // clear a leftover .old from a prior update
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            match std::fs::rename(target_path, &old_path) {
+                Ok(()) => break,
+                Err(_) if Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(200));
+                }
+                Err(e) => return Err(anyhow::anyhow!("failed to move current binary aside: {e}")),
+            }
+        }
+
+        std::fs::rename(new_path, target_path)
+            .map_err(|e| anyhow::anyhow!("failed to move new binary into place: {e}"))?;
+        let _ = std::fs::remove_file(&old_path); // best-effort; harmless if it lingers
         Ok(())
     }
 

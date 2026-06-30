@@ -125,6 +125,7 @@ fn discover_ports_native() -> Result<Vec<ListeningPort>, String> {
 }
 
 /// Shell-out fallback: parse `lsof -i -P -n` output.
+#[cfg(not(target_os = "windows"))]
 fn discover_ports_shellout() -> Result<Vec<ListeningPort>, String> {
     let output = std::process::Command::new("lsof")
         .args(["-i", "-P", "-n"])
@@ -147,6 +148,7 @@ fn discover_ports_shellout() -> Result<Vec<ListeningPort>, String> {
 /// postgres   1234   morten  5u  IPv6 0x67890      0t0  TCP [::1]:5432 (LISTEN)
 /// dnsmasq     567   nobody  4u  IPv4 0xabcde      0t0  UDP *:53
 /// ```
+#[cfg(any(not(target_os = "windows"), test))]
 fn parse_lsof_output(output: &str) -> Vec<ListeningPort> {
     let mut ports = Vec::new();
 
@@ -171,6 +173,7 @@ fn parse_lsof_output(output: &str) -> Vec<ListeningPort> {
     ports
 }
 
+#[cfg(any(not(target_os = "windows"), test))]
 fn parse_lsof_line(line: &str) -> Option<ListeningPort> {
     let parts: Vec<&str> = line.split_whitespace().collect();
     if parts.len() < 9 {
@@ -208,7 +211,93 @@ fn discover_ports_sync() -> Result<Vec<ListeningPort>, String> {
     })
 }
 
-#[cfg(not(target_os = "linux"))]
+/// Windows: `netstat -ano` for listening sockets + owner PID, names from `sysinfo`.
+/// (`netstat` is the sanctioned Windows shell-out — already used for TCP stats in
+/// `host_metrics_windows.rs`. `lsof` does not exist on Windows.)
+#[cfg(target_os = "windows")]
+fn discover_ports_sync() -> Result<Vec<ListeningPort>, String> {
+    use sysinfo::{Pid, ProcessesToUpdate, System};
+
+    let output = std::process::Command::new("netstat")
+        .args(["-ano"])
+        .output()
+        .map_err(|e| format!("failed to run netstat: {e}"))?;
+
+    if !output.status.success() {
+        return Err(format!(
+            "netstat failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
+
+    let mut ports = parse_netstat_ano(&String::from_utf8_lossy(&output.stdout));
+
+    // netstat -ano gives the PID but not the process name — resolve it via sysinfo.
+    let mut system = System::new();
+    system.refresh_processes(ProcessesToUpdate::All, true);
+    for port in &mut ports {
+        if let Some(proc) = system.process(Pid::from_u32(port.pid)) {
+            port.process = proc.name().to_string_lossy().into_owned();
+        }
+    }
+
+    debug!(
+        count = ports.len(),
+        "discovered listening ports via netstat"
+    );
+    Ok(ports)
+}
+
+/// Parse `netstat -ano` output. Columns: `Proto  Local  Foreign  [State]  PID`
+/// — TCP has a State column, UDP does not. Keep listening TCP and all bound UDP,
+/// mirroring the lsof path's `(LISTEN)`/all-UDP filter.
+#[cfg(any(target_os = "windows", test))]
+fn parse_netstat_ano(output: &str) -> Vec<ListeningPort> {
+    let mut ports = Vec::new();
+
+    for line in output.lines() {
+        let parts: Vec<&str> = line.split_whitespace().collect();
+        if parts.len() < 4 {
+            continue;
+        }
+
+        let (protocol, local_addr, pid_str) = match parts[0].to_lowercase().as_str() {
+            "tcp" if parts.len() >= 5 => {
+                if parts[3] != "LISTENING" {
+                    continue;
+                }
+                ("tcp", parts[1], parts[4])
+            }
+            "udp" => ("udp", parts[1], parts[3]),
+            _ => continue,
+        };
+
+        let Ok(pid) = pid_str.parse::<u32>() else {
+            continue;
+        };
+        // Local address: "0.0.0.0:135", "[::]:445", "127.0.0.1:8080" — port is after the last ':'.
+        let Some(port) = local_addr
+            .rsplit(':')
+            .next()
+            .and_then(|p| p.parse::<u16>().ok())
+        else {
+            continue;
+        };
+
+        ports.push(ListeningPort {
+            port,
+            protocol: protocol.to_string(),
+            process: String::new(),
+            pid,
+        });
+    }
+
+    ports.sort_by_key(|p| (p.port, p.protocol.clone()));
+    ports.dedup_by_key(|p| (p.port, p.protocol.clone()));
+    ports
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "windows")))]
 fn discover_ports_sync() -> Result<Vec<ListeningPort>, String> {
     discover_ports_shellout()
 }
@@ -268,6 +357,40 @@ chrome     9999   morten  42u IPv4 0xdeadb      0t0  TCP 192.168.1.5:54321->93.1
         let port = parse_lsof_line(line).unwrap();
         assert_eq!(port.port, 5432);
         assert_eq!(port.protocol, "tcp");
+    }
+
+    #[test]
+    fn parse_netstat_ano_listen_and_udp() {
+        let output = "\
+Active Connections
+
+  Proto  Local Address          Foreign Address        State           PID
+  TCP    0.0.0.0:135            0.0.0.0:0              LISTENING       1234
+  TCP    [::]:445               [::]:0                 LISTENING       4
+  TCP    127.0.0.1:51000        127.0.0.1:443          ESTABLISHED     5000
+  UDP    0.0.0.0:5353           *:*                                    777
+";
+        let ports = parse_netstat_ano(output);
+
+        // Listening TCP kept (incl. IPv6 [::] form), with owner PID.
+        assert!(
+            ports
+                .iter()
+                .any(|p| p.port == 135 && p.protocol == "tcp" && p.pid == 1234)
+        );
+        assert!(
+            ports
+                .iter()
+                .any(|p| p.port == 445 && p.protocol == "tcp" && p.pid == 4)
+        );
+        // Bound UDP kept (no state column).
+        assert!(
+            ports
+                .iter()
+                .any(|p| p.port == 5353 && p.protocol == "udp" && p.pid == 777)
+        );
+        // Non-listening (ESTABLISHED) TCP excluded.
+        assert!(!ports.iter().any(|p| p.port == 51000));
     }
 
     #[tokio::test]
