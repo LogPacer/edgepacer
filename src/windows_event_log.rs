@@ -155,12 +155,13 @@ pub async fn stream_event_log(
     );
 }
 
-/// Sample up to `max_lines` rendered (`/f:text`) event lines from a channel for
-/// Rails discovery analysis and the review queue, newest-first.
+/// Sample up to `max_lines` events from a channel for Rails discovery + the
+/// review queue, newest-first, as JSON.
 ///
-/// This is the discovery-time sampling path, deliberately distinct from the
-/// JSON streaming collection above: a sample is human-readable rendered text —
-/// what the screener shows the operator and what schema analysis runs against.
+/// Event Logs are structured records, never free text, so a sample is the same
+/// flat-JSON shape the streaming collection ships (`query_records` below) — the
+/// screener previews exactly what will be collected. Whether a JSON source needs
+/// schema analysis at all is a control-plane decision, not the agent's.
 pub async fn sample_channel_lines(channel: &str, max_lines: usize) -> Result<Vec<String>, String> {
     // wevtutil is a heavy per-call spawn; cap how many run at once.
     let _permit = WEVTUTIL_SAMPLE_SEM
@@ -168,30 +169,13 @@ pub async fn sample_channel_lines(channel: &str, max_lines: usize) -> Result<Vec
         .await
         .map_err(|_| "wevtutil sample semaphore closed".to_string())?;
 
-    let events = max_lines.clamp(1, QUERY_LIMIT);
-    let count = format!("/c:{events}");
-    let output = Command::new("wevtutil")
-        .args(["qe", channel, count.as_str(), "/rd:true", "/f:text"])
-        .output()
-        .await
-        .map_err(|error| format!("wevtutil spawn failed for {channel}: {error}"))?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        return Err(format!(
-            "wevtutil exit {} for {channel}: {stderr}",
-            output.status
-        ));
-    }
-
-    let rendered = String::from_utf8_lossy(&output.stdout);
-    let mut lines: Vec<String> = rendered
-        .lines()
-        .map(str::trim_end)
-        .filter(|line| !line.trim().is_empty())
-        .map(str::to_string)
+    let limit = max_lines.clamp(1, QUERY_LIMIT);
+    let records = query_records(channel, None, limit, true).await?;
+    let lines: Vec<String> = records
+        .iter()
+        .take(max_lines)
+        .map(|record| String::from_utf8_lossy(&record.json).into_owned())
         .collect();
-    lines.truncate(max_lines);
     Ok(lines)
 }
 
