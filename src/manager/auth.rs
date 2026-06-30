@@ -103,7 +103,7 @@ impl ManagerAuth {
             .connect_timeout(Duration::from_secs(10))
             .user_agent(format!(
                 "edgepacer-manager/{} ({}/{})",
-                env!("CARGO_PKG_VERSION"),
+                crate::common::VERSION,
                 std::env::consts::OS,
                 std::env::consts::ARCH,
             ))

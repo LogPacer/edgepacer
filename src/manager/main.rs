@@ -184,7 +184,7 @@ async fn main() -> anyhow::Result<()> {
     )?;
 
     info!(
-        version = env!("CARGO_PKG_VERSION"),
+        version = edgepacer::common::VERSION,
         platform = %run.platform,
         edgepacer_path = %run.edgepacer.display(),
         "[manager] edgepacer-manager starting"
