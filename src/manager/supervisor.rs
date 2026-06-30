@@ -318,12 +318,26 @@ async fn install_scheduled_task(cfg: &InstallConfig) -> Result<String> {
 
 #[cfg(target_os = "windows")]
 async fn uninstall_scheduled_task() -> Result<String> {
+    // Stop a running instance first, then remove the task definition.
     let ps = format!(
-        "Unregister-ScheduledTask -TaskName '{name}' -Confirm:$false -ErrorAction SilentlyContinue",
+        "Stop-ScheduledTask -TaskName '{name}' -ErrorAction SilentlyContinue; \
+         Unregister-ScheduledTask -TaskName '{name}' -Confirm:$false -ErrorAction SilentlyContinue",
         name = SERVICE_NAME,
     );
     let _ = run("powershell", &["-NoProfile", "-Command", &ps]).await;
-    Ok(format!("removed Scheduled Task '{SERVICE_NAME}'"))
+
+    // Remove the config we wrote next to the manager binary: the env file holds
+    // the bootstrap token (must not linger after uninstall), and the wrapper +
+    // log are install artifacts. The running .exe can't delete itself, so the
+    // binary is left for the caller to remove.
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            let _ = std::fs::remove_file(dir.join("edgepacer.env"));
+            let _ = std::fs::remove_file(dir.join("edgepacer-service.cmd"));
+            let _ = std::fs::remove_file(dir.join("edgepacer.log"));
+        }
+    }
+    Ok(format!("removed Scheduled Task '{SERVICE_NAME}' + config"))
 }
 
 // ── shared ──────────────────────────────────────────────────────────────────
