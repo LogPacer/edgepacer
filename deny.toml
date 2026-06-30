@@ -22,6 +22,9 @@ allow = [
   "Apache-2.0 WITH LLVM-exception",
   "BSD-2-Clause",
   "BSD-3-Clause",
+  # Community Data License Agreement — Permissive. The license on webpki-roots'
+  # bundled Mozilla CA certificate data (the data, not code). Permissive.
+  "CDLA-Permissive-2.0",
   "ISC",
   "MIT",
   "Unicode-3.0",
