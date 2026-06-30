@@ -126,7 +126,7 @@ encoding_rs = "0.8"
 sysinfo = "0.33"
 
 # Docker discovery + streaming
-bollard = "0.18"
+bollard = "0.21"
 futures-util = "0.3"
 
 # Kubernetes discovery (optional — only used when running in-cluster)
