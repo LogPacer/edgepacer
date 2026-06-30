@@ -71,17 +71,13 @@ struct RunArgs {
     /// Always download latest on startup (development mode)
     #[arg(long)]
     force_update: bool,
-
-    /// Keep the manager binary itself up to date. Only safe under a supervisor
-    /// that restarts the process on exit (systemd/launchd/Windows service): the
-    /// manager swaps its own binary and exits for the supervisor to relaunch the
-    /// new version.
-    #[arg(long, env = "EDGEPACER_SELF_UPDATE")]
-    self_update: bool,
 }
 
 #[derive(Subcommand, Debug)]
 enum ManagerCommand {
+    /// Update the manager binary itself (manual; resolved against the manager
+    /// channel, decoupled from the agent). The agent auto-updates separately.
+    Update,
     /// Install, remove, and control the Windows Service wrapper
     Service(ServiceArgs),
 }
@@ -298,39 +294,11 @@ async fn main() -> anyhow::Result<()> {
             }
         }
 
-        // Manager self-update: keep our own binary current when supervised.
-        // Check our version against the manager channel; on a newer release, swap
-        // our binary and break so the post-loop shutdown stops the agent and the
-        // supervisor relaunches the new manager. Gated behind --self-update
-        // because exiting only self-heals under a restarting supervisor
-        // (systemd/launchd today; Windows once the service supervisor lands).
-        if run.self_update {
-            match updater
-                .check_for_self_update(edgepacer::common::VERSION)
-                .await
-            {
-                Ok(Some(update)) => {
-                    info!(
-                        from = edgepacer::common::VERSION,
-                        to = %update.version,
-                        "[manager] manager self-update available; installing"
-                    );
-                    match perform_self_update(&updater, &update).await {
-                        Ok(()) => {
-                            info!(
-                                "[manager] self-update installed; exiting for supervisor restart"
-                            );
-                            break;
-                        }
-                        Err(e) => error!(error = %e, "[manager] self-update failed"),
-                    }
-                }
-                Ok(None) => {}
-                Err(e) => warn!(error = %e, "[manager] self-update check failed"),
-            }
-        }
+        // The manager updates ITSELF only via the manual `edgepacer-manager
+        // update` subcommand (manager channel) -- never in this loop -- so
+        // frequent agent releases never churn or restart the manager.
 
-        // Check for updates
+        // Check for the agent's latest version
         let current_version = match process.get_version().await {
             Ok(v) => v,
             Err(e) => {
@@ -386,8 +354,55 @@ fn required_arg<'a>(value: Option<&'a str>, name: &str) -> anyhow::Result<&'a st
 
 async fn handle_manager_command(command: ManagerCommand, run: &RunArgs) -> anyhow::Result<()> {
     match command {
+        ManagerCommand::Update => handle_update(run).await,
         ManagerCommand::Service(args) => handle_service_command(args.command, run).await,
     }
+}
+
+/// Manual manager self-update: check the manager channel and, if a newer manager
+/// exists, download + verify + swap our own binary. The running supervised
+/// manager keeps the old image until the supervisor restarts it.
+async fn handle_update(run: &RunArgs) -> anyhow::Result<()> {
+    let rails = required_arg(run.rails.as_deref(), "--rails / EDGEPACER_RAILS_URL")?;
+    let account_token = required_arg(
+        run.account_token.as_deref(),
+        "--account-token / EDGEPACER_ACCOUNT_TOKEN",
+    )?;
+    edgepacer::common::validate_control_plane_url(rails)?;
+
+    let mut auth = ManagerAuth::new(rails, account_token);
+    auth.ensure_bootstrap_token().await?;
+    let installation_id = token_store::load_or_create_installation_id().unwrap_or_default();
+    let updater = Updater::new(
+        rails,
+        auth.token(),
+        &run.platform,
+        &installation_id,
+        run.update_public_key.as_deref(),
+    )?;
+
+    match updater
+        .check_for_self_update(edgepacer::common::VERSION)
+        .await?
+    {
+        Some(update) => {
+            info!(
+                from = edgepacer::common::VERSION,
+                to = %update.version,
+                "[manager] manager update available; installing"
+            );
+            perform_self_update(&updater, &update).await?;
+            info!(
+                version = %update.version,
+                "[manager] manager binary updated; restart the manager service to run it"
+            );
+        }
+        None => info!(
+            version = edgepacer::common::VERSION,
+            "[manager] manager is already up to date"
+        ),
+    }
+    Ok(())
 }
 
 async fn handle_service_command(command: ServiceCommand, run: &RunArgs) -> anyhow::Result<()> {
@@ -566,11 +581,9 @@ mod tests {
     use clap::{CommandFactory, Parser};
 
     #[test]
-    fn self_update_flag_defaults_off_and_parses() {
-        let off = Cli::parse_from(["edgepacer-manager"]);
-        assert!(!off.run.self_update);
-        let on = Cli::parse_from(["edgepacer-manager", "--self-update"]);
-        assert!(on.run.self_update);
+    fn cli_parses_update_subcommand() {
+        let cli = Cli::try_parse_from(["edgepacer-manager", "update"]).unwrap();
+        assert!(matches!(cli.command, Some(super::ManagerCommand::Update)));
     }
 
     #[test]
@@ -635,7 +648,6 @@ mod tests {
             update_public_key: None,
             debug: false,
             force_update: false,
-            self_update: false,
         };
         let args = super::ServiceInstallArgs {
             name: "EdgePacerTest".into(),
