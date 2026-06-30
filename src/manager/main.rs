@@ -71,6 +71,13 @@ struct RunArgs {
     /// Always download latest on startup (development mode)
     #[arg(long)]
     force_update: bool,
+
+    /// Keep the manager binary itself up to date. Only safe under a supervisor
+    /// that restarts the process on exit (systemd/launchd/Windows service): the
+    /// manager swaps its own binary and exits for the supervisor to relaunch the
+    /// new version.
+    #[arg(long, env = "EDGEPACER_SELF_UPDATE")]
+    self_update: bool,
 }
 
 #[derive(Subcommand, Debug)]
@@ -291,6 +298,38 @@ async fn main() -> anyhow::Result<()> {
             }
         }
 
+        // Manager self-update: keep our own binary current when supervised.
+        // Check our version against the manager channel; on a newer release, swap
+        // our binary and break so the post-loop shutdown stops the agent and the
+        // supervisor relaunches the new manager. Gated behind --self-update
+        // because exiting only self-heals under a restarting supervisor
+        // (systemd/launchd today; Windows once the service supervisor lands).
+        if run.self_update {
+            match updater
+                .check_for_self_update(edgepacer::common::VERSION)
+                .await
+            {
+                Ok(Some(update)) => {
+                    info!(
+                        from = edgepacer::common::VERSION,
+                        to = %update.version,
+                        "[manager] manager self-update available; installing"
+                    );
+                    match perform_self_update(&updater, &update).await {
+                        Ok(()) => {
+                            info!(
+                                "[manager] self-update installed; exiting for supervisor restart"
+                            );
+                            break;
+                        }
+                        Err(e) => error!(error = %e, "[manager] self-update failed"),
+                    }
+                }
+                Ok(None) => {}
+                Err(e) => warn!(error = %e, "[manager] self-update check failed"),
+            }
+        }
+
         // Check for updates
         let current_version = match process.get_version().await {
             Ok(v) => v,
@@ -493,6 +532,25 @@ async fn perform_update(
     Ok(())
 }
 
+/// Download, verify, and swap the manager's own binary, with rollback on
+/// failure. The caller exits afterward so the supervisor relaunches the new
+/// binary; the running image keeps executing until then.
+async fn perform_self_update(
+    updater: &Updater,
+    update: &edgepacer::manager::updater::UpdateInfo,
+) -> anyhow::Result<()> {
+    let manager_exe = std::env::current_exe()
+        .map_err(|e| anyhow::anyhow!("resolve manager executable path: {e}"))?;
+    let new_path = updater.download_and_verify(update, &manager_exe).await?;
+    let backup = Updater::backup_current(&manager_exe)?;
+    if let Err(e) = Updater::install_new(&new_path, &manager_exe) {
+        Updater::restore_backup(&backup, &manager_exe)?;
+        anyhow::bail!("self-update install failed: {e}");
+    }
+    Updater::cleanup_backup(&backup);
+    Ok(())
+}
+
 /// Get the version of a binary by running it with --version.
 async fn get_binary_version(path: &PathBuf) -> anyhow::Result<String> {
     let output = tokio::process::Command::new(path)
@@ -506,6 +564,14 @@ async fn get_binary_version(path: &PathBuf) -> anyhow::Result<String> {
 mod tests {
     use super::{Cli, ServiceCommand, detect_platform, go_platform_name, service_install_config};
     use clap::{CommandFactory, Parser};
+
+    #[test]
+    fn self_update_flag_defaults_off_and_parses() {
+        let off = Cli::parse_from(["edgepacer-manager"]);
+        assert!(!off.run.self_update);
+        let on = Cli::parse_from(["edgepacer-manager", "--self-update"]);
+        assert!(on.run.self_update);
+    }
 
     #[test]
     fn detect_platform_uses_go_style_names_on_current_host() {
@@ -569,6 +635,7 @@ mod tests {
             update_public_key: None,
             debug: false,
             force_update: false,
+            self_update: false,
         };
         let args = super::ServiceInstallArgs {
             name: "EdgePacerTest".into(),

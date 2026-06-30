@@ -99,15 +99,29 @@ impl Updater {
         self.token = token.to_string();
     }
 
-    /// Check if a newer version is available.
+    /// Check if a newer agent version is available.
     /// GET /api/v1/managers/latest?platform=X&current_version=Y
     pub async fn check_for_update(
         &self,
         current_version: &str,
     ) -> anyhow::Result<Option<UpdateInfo>> {
+        self.check("/api/v1/managers/latest", current_version).await
+    }
+
+    /// Check if a newer *manager* version is available (self-update).
+    /// GET /api/v1/managers/self/latest?platform=X&current_version=Y
+    pub async fn check_for_self_update(
+        &self,
+        current_version: &str,
+    ) -> anyhow::Result<Option<UpdateInfo>> {
+        self.check("/api/v1/managers/self/latest", current_version)
+            .await
+    }
+
+    async fn check(&self, path: &str, current_version: &str) -> anyhow::Result<Option<UpdateInfo>> {
         let url = format!(
-            "{}/api/v1/managers/latest?platform={}&current_version={}",
-            self.rails_url, self.platform, current_version
+            "{}{}?platform={}&current_version={}",
+            self.rails_url, path, self.platform, current_version
         );
 
         let resp = self
