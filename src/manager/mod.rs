@@ -5,5 +5,6 @@
 
 pub mod auth;
 pub mod process;
+pub mod supervisor;
 pub mod updater;
 pub mod windows_service;
