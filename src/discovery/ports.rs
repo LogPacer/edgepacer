@@ -241,7 +241,10 @@ fn discover_ports_sync() -> Result<Vec<ListeningPort>, String> {
         }
     }
 
-    debug!(count = ports.len(), "discovered listening ports via netstat");
+    debug!(
+        count = ports.len(),
+        "discovered listening ports via netstat"
+    );
     Ok(ports)
 }
 
@@ -370,10 +373,22 @@ Active Connections
         let ports = parse_netstat_ano(output);
 
         // Listening TCP kept (incl. IPv6 [::] form), with owner PID.
-        assert!(ports.iter().any(|p| p.port == 135 && p.protocol == "tcp" && p.pid == 1234));
-        assert!(ports.iter().any(|p| p.port == 445 && p.protocol == "tcp" && p.pid == 4));
+        assert!(
+            ports
+                .iter()
+                .any(|p| p.port == 135 && p.protocol == "tcp" && p.pid == 1234)
+        );
+        assert!(
+            ports
+                .iter()
+                .any(|p| p.port == 445 && p.protocol == "tcp" && p.pid == 4)
+        );
         // Bound UDP kept (no state column).
-        assert!(ports.iter().any(|p| p.port == 5353 && p.protocol == "udp" && p.pid == 777));
+        assert!(
+            ports
+                .iter()
+                .any(|p| p.port == 5353 && p.protocol == "udp" && p.pid == 777)
+        );
         // Non-listening (ESTABLISHED) TCP excluded.
         assert!(!ports.iter().any(|p| p.port == 51000));
     }
