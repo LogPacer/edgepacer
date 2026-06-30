@@ -269,6 +269,28 @@ async fn main() -> anyhow::Result<()> {
             }
         }
 
+        // Self-heal: if the Server was deleted in Rails the persisted bootstrap
+        // token now fails auth. Re-validate it; a definitive rejection re-onboards
+        // (recreating the Server by installation_id) and rotates the token. Only
+        // restart the agent when the token actually changed — a 200 or a transient
+        // ping error leaves the running agent untouched.
+        match auth.revalidate_bootstrap_token().await {
+            Ok(true) => {
+                info!(
+                    "[manager] bootstrap token rotated after re-onboarding, restarting edgepacer"
+                );
+                process.start(auth.token()).await?;
+                if let Err(e) = process.wait_healthy(health_timeout).await {
+                    error!(error = %e, "[manager] re-onboarded edgepacer failed health check");
+                    continue;
+                }
+            }
+            Ok(false) => {}
+            Err(e) => {
+                warn!(error = %e, "[manager] bootstrap token re-validation failed");
+            }
+        }
+
         // Check for updates
         let current_version = match process.get_version().await {
             Ok(v) => v,
