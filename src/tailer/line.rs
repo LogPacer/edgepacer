@@ -33,7 +33,7 @@ impl LineEncoding {
     /// this sequence on code-unit-aligned boundaries.
     fn newline_terminator(self) -> &'static [u8] {
         match self {
-            LineEncoding::Utf8 | LineEncoding::Utf8Bom => &[b'\n'],
+            LineEncoding::Utf8 | LineEncoding::Utf8Bom => b"\n",
             LineEncoding::Utf16Le => &[0x0A, 0x00],
             LineEncoding::Utf16Be => &[0x00, 0x0A],
         }

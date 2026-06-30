@@ -168,7 +168,7 @@ pub async fn sample_channel_lines(channel: &str, max_lines: usize) -> Result<Vec
         .await
         .map_err(|_| "wevtutil sample semaphore closed".to_string())?;
 
-    let events = max_lines.min(QUERY_LIMIT).max(1);
+    let events = max_lines.clamp(1, QUERY_LIMIT);
     let count = format!("/c:{events}");
     let output = Command::new("wevtutil")
         .args(["qe", channel, count.as_str(), "/rd:true", "/f:text"])
