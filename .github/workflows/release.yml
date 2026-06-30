@@ -4,11 +4,19 @@ on:
   push:
     tags:
       - "v*"
+      - "manager-v*"
   workflow_dispatch:
     inputs:
       version:
         description: Release version without the leading v
         required: true
+      component:
+        description: Release stream (agent or manager)
+        type: choice
+        options:
+          - agent
+          - manager
+        default: agent
 
 concurrency:
   group: release-${{ github.ref }}
@@ -29,14 +37,33 @@ jobs:
     outputs:
       version: ${{ steps.version.outputs.version }}
       tag: ${{ steps.version.outputs.tag }}
+      component: ${{ steps.version.outputs.component }}
     steps:
-      - name: Resolve version
+      - name: Resolve version + stream
         id: version
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+          INPUT_COMPONENT: ${{ inputs.component }}
+          REF_NAME: ${{ github.ref_name }}
         run: |
-          if [ -n "${{ inputs.version }}" ]; then
-            version="${{ inputs.version }}"
+          if [ -n "${INPUT_VERSION}" ]; then
+            version="${INPUT_VERSION}"
+            component="${INPUT_COMPONENT:-agent}"
           else
-            version="${GITHUB_REF_NAME#v}"
+            case "${REF_NAME}" in
+              manager-v*)
+                component="manager"
+                version="${REF_NAME#manager-v}"
+                ;;
+              v*)
+                component="agent"
+                version="${REF_NAME#v}"
+                ;;
+              *)
+                echo "unrecognized release ref: ${REF_NAME}" >&2
+                exit 1
+                ;;
+            esac
           fi
           case "${version}" in
             *-dev*)
@@ -44,8 +71,16 @@ jobs:
               exit 1
               ;;
           esac
-          echo "version=${version}" >> "$GITHUB_OUTPUT"
-          echo "tag=v${version}" >> "$GITHUB_OUTPUT"
+          if [ "${component}" = "manager" ]; then
+            tag="manager-v${version}"
+          else
+            tag="v${version}"
+          fi
+          {
+            echo "version=${version}"
+            echo "tag=${tag}"
+            echo "component=${component}"
+          } >> "$GITHUB_OUTPUT"
 
   build-binaries:
     name: Build ${{ matrix.name }} Binary
@@ -147,10 +182,11 @@ jobs:
           if-no-files-found: error
 
   publish:
-    name: Publish Release
+    name: Publish Agent Release
     needs:
       - resolve
       - build-binaries
+    if: ${{ needs.resolve.outputs.component == 'agent' }}
     runs-on: ubuntu-24.04
     permissions:
       attestations: write
@@ -313,5 +349,99 @@ jobs:
             gh release create "${tag}" "${release_assets[@]}" \
               --target "${GITHUB_SHA}" \
               --title "EdgePacer ${tag}" \
+              --notes-file "${notes_file}"
+          fi
+
+  publish-manager:
+    name: Publish Manager Release
+    needs:
+      - resolve
+      - build-binaries
+    if: ${{ needs.resolve.outputs.component == 'manager' }}
+    runs-on: ubuntu-24.04
+    permissions:
+      attestations: write
+      artifact-metadata: write
+      contents: write
+      id-token: write
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v3
+        with:
+          cosign-release: "v2.5.3"
+
+      - name: Download release binaries
+        uses: actions/download-artifact@v8
+        with:
+          pattern: release-*
+          path: dist
+          merge-multiple: true
+
+      - name: Download release manifest tool
+        uses: actions/download-artifact@v8
+        with:
+          name: manifest-tool
+          path: dist/tools
+
+      - name: Resolve release manifest tool
+        id: manifest_tool
+        run: |
+          manifest_tool="$(find dist/tools -type f -name release-manifest -print -quit)"
+          if [ -z "${manifest_tool}" ]; then
+            echo "failed to find downloaded release-manifest tool" >&2
+            find dist/tools -maxdepth 3 -type f -print >&2
+            exit 1
+          fi
+          chmod 0555 "${manifest_tool}"
+          echo "path=${manifest_tool}" >> "$GITHUB_OUTPUT"
+
+      - name: Scope dist to the manager binaries
+        run: |
+          # The build job produces both agent + manager binaries; the manager
+          # release ships only the edgepacer-manager-* binaries, so drop the agent
+          # ones before the manifest + release steps glob dist.
+          find dist -maxdepth 1 -name 'edgepacer-*' ! -name 'edgepacer-manager-*' -delete
+
+      - name: Generate signed update manifest
+        env:
+          EDGEPACER_UPDATE_SIGNING_KEY: ${{ secrets.EDGEPACER_UPDATE_SIGNING_KEY }}
+        run: |
+          scripts/release-package.sh \
+            --skip-build \
+            --version "${{ needs.resolve.outputs.version }}" \
+            --tag "${{ needs.resolve.outputs.tag }}" \
+            --repository "${{ github.repository }}" \
+            --dist-dir dist \
+            --manifest-tool "${{ steps.manifest_tool.outputs.path }}" \
+            --sign-blobs
+
+      - name: Attest release artifact provenance
+        if: ${{ github.event.repository.private == false }}
+        uses: actions/attest@v4
+        with:
+          subject-path: |
+            dist/edgepacer-manager-*
+            dist/checksums.txt
+            dist/LICENSE-3rdparty.csv
+            dist/update-manifest.json
+
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          tag="${{ needs.resolve.outputs.tag }}"
+          notes_file="$(mktemp)"
+          printf 'EdgePacer Manager %s\n\nManager binaries are signed with Sigstore bundles and listed in update-manifest.json. Third-party dependency attribution is included in LICENSE-3rdparty.csv.\n' "${tag}" > "${notes_file}"
+          mapfile -d '' release_assets < <(find dist -maxdepth 1 -type f -print0)
+
+          if gh release view "${tag}" >/dev/null 2>&1; then
+            gh release upload "${tag}" "${release_assets[@]}" --clobber
+          else
+            gh release create "${tag}" "${release_assets[@]}" \
+              --target "${GITHUB_SHA}" \
+              --title "EdgePacer Manager ${tag}" \
               --notes-file "${notes_file}"
           fi
