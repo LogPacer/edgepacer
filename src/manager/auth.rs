@@ -360,14 +360,14 @@ impl ManagerAuth {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
+    use tokio::sync::Mutex;
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     // `EDGEPACER_STATE_DIR` is process-global, and the integration tests below
     // bootstrap into a private temp dir. Serialize them so concurrent tests in
     // this binary never observe each other's state dir.
-    static STATE_DIR_GUARD: Mutex<()> = Mutex::new(());
+    static STATE_DIR_GUARD: Mutex<()> = Mutex::const_new(());
 
     #[test]
     fn classify_ping_treats_2xx_as_valid() {
@@ -418,7 +418,7 @@ mod tests {
 
     #[tokio::test]
     async fn revalidate_is_noop_when_ping_returns_200() {
-        let _guard = STATE_DIR_GUARD.lock().unwrap();
+        let _guard = STATE_DIR_GUARD.lock().await;
         let state_dir = tempfile::tempdir().unwrap();
         unsafe { std::env::set_var("EDGEPACER_STATE_DIR", state_dir.path()) };
 
@@ -442,7 +442,7 @@ mod tests {
 
     #[tokio::test]
     async fn revalidate_rebootstraps_and_signals_restart_on_401() {
-        let _guard = STATE_DIR_GUARD.lock().unwrap();
+        let _guard = STATE_DIR_GUARD.lock().await;
         let state_dir = tempfile::tempdir().unwrap();
         unsafe { std::env::set_var("EDGEPACER_STATE_DIR", state_dir.path()) };
 
@@ -476,7 +476,7 @@ mod tests {
 
     #[tokio::test]
     async fn revalidate_keeps_token_on_5xx_ping_error() {
-        let _guard = STATE_DIR_GUARD.lock().unwrap();
+        let _guard = STATE_DIR_GUARD.lock().await;
         let state_dir = tempfile::tempdir().unwrap();
         unsafe { std::env::set_var("EDGEPACER_STATE_DIR", state_dir.path()) };
 
