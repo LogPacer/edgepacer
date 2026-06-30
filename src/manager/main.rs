@@ -78,6 +78,10 @@ enum ManagerCommand {
     /// Update the manager binary itself (manual; resolved against the manager
     /// channel, decoupled from the agent). The agent auto-updates separately.
     Update,
+    /// Install the OS supervisor (systemd / launchd / Scheduled Task) + start the manager.
+    Install,
+    /// Stop + remove the supervisor and local state (reports the uninstall first).
+    Uninstall,
     /// Install, remove, and control the Windows Service wrapper
     Service(ServiceArgs),
 }
@@ -355,8 +359,38 @@ fn required_arg<'a>(value: Option<&'a str>, name: &str) -> anyhow::Result<&'a st
 async fn handle_manager_command(command: ManagerCommand, run: &RunArgs) -> anyhow::Result<()> {
     match command {
         ManagerCommand::Update => handle_update(run).await,
+        ManagerCommand::Install => handle_install(run).await,
+        ManagerCommand::Uninstall => handle_uninstall(run).await,
         ManagerCommand::Service(args) => handle_service_command(args.command, run).await,
     }
+}
+
+/// Set up the OS supervisor for this manager binary and start it.
+async fn handle_install(run: &RunArgs) -> anyhow::Result<()> {
+    let rails = required_arg(run.rails.as_deref(), "--rails / EDGEPACER_RAILS_URL")?;
+    let account_token = required_arg(
+        run.account_token.as_deref(),
+        "--account-token / EDGEPACER_ACCOUNT_TOKEN",
+    )?;
+    let manager_path = std::env::current_exe()
+        .map_err(|e| anyhow::anyhow!("resolve manager executable path: {e}"))?;
+    let cfg = edgepacer::manager::supervisor::InstallConfig {
+        manager_path,
+        rails_url: rails.to_string(),
+        account_token: account_token.to_string(),
+        update_public_key: run.update_public_key.clone(),
+    };
+    let msg = edgepacer::manager::supervisor::install(&cfg).await?;
+    info!("[manager] {msg}");
+    Ok(())
+}
+
+/// Report the uninstall to the control plane, then remove the supervisor + state.
+async fn handle_uninstall(run: &RunArgs) -> anyhow::Result<()> {
+    let rails = run.rails.as_deref().unwrap_or_default();
+    let msg = edgepacer::manager::supervisor::uninstall(rails).await?;
+    info!("[manager] {msg}");
+    Ok(())
 }
 
 /// Manual manager self-update: check the manager channel and, if a newer manager
