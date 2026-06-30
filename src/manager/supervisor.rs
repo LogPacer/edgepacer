@@ -10,7 +10,9 @@
 //! that it compiles per-target; behaviour must be validated on each host.
 
 use anyhow::{Context, Result};
-use std::path::{Path, PathBuf};
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+use std::path::Path;
+use std::path::PathBuf;
 use tracing::{info, warn};
 
 /// OS service / task name (and launchd label suffix).
@@ -130,7 +132,7 @@ async fn report_uninstall(rails_url: &str) {
 
 #[cfg(target_os = "linux")]
 const SYSTEMD_UNIT_PATH: &str = "/etc/systemd/system/edgepacer.service";
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(target_os = "linux")]
 const UNIX_CONFIG_DIR: &str = "/etc/edgepacer";
 
 #[cfg(target_os = "linux")]
@@ -231,7 +233,7 @@ async fn uninstall_launchd() -> Result<String> {
     Ok("removed launchd daemon".to_string())
 }
 
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(target_os = "linux")]
 fn write_unix_env_file(cfg: &InstallConfig) -> Result<()> {
     std::fs::create_dir_all(UNIX_CONFIG_DIR)?;
     let path = Path::new(UNIX_CONFIG_DIR).join("edgepacer.env");
