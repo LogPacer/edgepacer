@@ -115,6 +115,13 @@ flate2 = "1"
 # Regex (multiline entry assembler, per-source start patterns)
 regex = "1"
 
+# Text decoding for file tailing. .NET / Windows apps commonly write log `.txt`
+# files in UTF-16 (LE/BE, BOM-prefixed); we decode per line to valid UTF-8 so
+# Danish text (æøå) ships as RawText, not byte-level mojibake. Byte handling
+# only — no log-content parsing. Already in the tree transitively; declared
+# directly here as the tailer is now a first-class consumer.
+encoding_rs = "0.8"
+
 # System metrics (CPU, memory, disk, network, processes)
 sysinfo = "0.33"
 

@@ -770,6 +770,7 @@ dependencies = [
  "dirs",
  "ed25519-dalek",
  "edgepacer-ebpf-common",
+ "encoding_rs",
  "flate2",
  "futures-util",
  "gethostname",

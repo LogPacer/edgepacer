@@ -313,6 +313,12 @@ fn push_resolved_source(
                 unit: access_locator,
             },
         )),
+        AccessMethod::WindowsEventLog => resolved.streaming_sources.push(streaming_source(
+            stream,
+            StreamAccessMethod::WindowsEventLog {
+                channel: access_locator,
+            },
+        )),
     }
 
     resolved.diagnostics.push(matched(stream, matched_via));

@@ -12,17 +12,43 @@ const FORMAT_PLAIN_TEXT: &str = "plain_text";
 const FORMAT_SAMPLE_MAX_LINES: usize = 20;
 const FORMAT_SAMPLE_MAX_BYTES: u64 = 64 * 1024;
 
-/// Discover log files in the given scan paths.
-pub async fn discover_log_files(scan_paths: &[&str]) -> anyhow::Result<Vec<LogFile>> {
+/// Default file extension allowlist — bare `.log` only. `.txt` is opt-in per
+/// host via the `discovery.log_extensions` config key.
+pub const DEFAULT_LOG_EXTENSIONS: &[&str] = &["log"];
+
+/// OS-aware default scan paths, used when no config scan_paths are set.
+/// Windows has no `/var/log`, so fall back to the common server log roots.
+pub fn default_scan_paths() -> &'static [&'static str] {
+    if cfg!(windows) {
+        &[
+            r"C:\inetpub\logs\LogFiles",
+            r"C:\Windows\Logs",
+            r"C:\ProgramData",
+        ]
+    } else {
+        &["/var/log"]
+    }
+}
+
+/// Discover log files in the given scan paths, keeping files whose extension is
+/// in `allowed_extensions` (e.g. `["log"]`, or `["log", "txt"]` to opt in `.txt`).
+pub async fn discover_log_files(
+    scan_paths: &[&str],
+    allowed_extensions: &[&str],
+) -> anyhow::Result<Vec<LogFile>> {
     let paths: Vec<String> = scan_paths.iter().map(|s| s.to_string()).collect();
+    let allowed: Vec<String> = allowed_extensions.iter().map(|s| s.to_string()).collect();
 
     // Run blocking I/O on a thread pool
-    tokio::task::spawn_blocking(move || discover_log_files_sync(&paths))
+    tokio::task::spawn_blocking(move || discover_log_files_sync(&paths, &allowed))
         .await
         .map_err(|e| anyhow::anyhow!("file discovery task failed: {e}"))?
 }
 
-fn discover_log_files_sync(scan_paths: &[String]) -> anyhow::Result<Vec<LogFile>> {
+fn discover_log_files_sync(
+    scan_paths: &[String],
+    allowed_extensions: &[String],
+) -> anyhow::Result<Vec<LogFile>> {
     let mut files = Vec::new();
 
     for base_path in scan_paths {
@@ -32,13 +58,17 @@ fn discover_log_files_sync(scan_paths: &[String]) -> anyhow::Result<Vec<LogFile>
             continue;
         }
 
-        walk_directory(base, &mut files)?;
+        walk_directory(base, &mut files, allowed_extensions)?;
     }
 
     Ok(files)
 }
 
-fn walk_directory(dir: &std::path::Path, files: &mut Vec<LogFile>) -> anyhow::Result<()> {
+fn walk_directory(
+    dir: &std::path::Path,
+    files: &mut Vec<LogFile>,
+    allowed_extensions: &[String],
+) -> anyhow::Result<()> {
     let entries = match std::fs::read_dir(dir) {
         Ok(entries) => entries,
         Err(e) => {
@@ -61,8 +91,8 @@ fn walk_directory(dir: &std::path::Path, files: &mut Vec<LogFile>) -> anyhow::Re
 
         if metadata.is_dir() {
             // Recurse but limit depth to avoid traversing huge trees
-            walk_directory(&path, files)?;
-        } else if metadata.is_file() && is_log_file(&path) {
+            walk_directory(&path, files, allowed_extensions)?;
+        } else if metadata.is_file() && is_log_file(&path, allowed_extensions) {
             let readable = is_readable(&path);
             let modified = metadata
                 .modified()
@@ -95,19 +125,37 @@ fn walk_directory(dir: &std::path::Path, files: &mut Vec<LogFile>) -> anyhow::Re
     Ok(())
 }
 
-/// Check if a file looks like a log file.
-fn is_log_file(path: &std::path::Path) -> bool {
+/// Check if a file looks like a log file, given the allowed extension set
+/// (e.g. `["log"]`). Matches a bare allowed extension, and rotated logs
+/// (`app.log.gz`, `app.log.1`) whose inner stem extension is itself allowed.
+fn is_log_file(path: &std::path::Path, allowed: &[String]) -> bool {
+    let ext_allowed = |ext: &str| allowed.iter().any(|a| a == ext);
+
     match path.extension().and_then(|e| e.to_str()) {
-        Some("log") => true,
-        Some("gz" | "xz" | "zst" | "bz2") => {
-            // Compressed log files: check if the stem also ends in .log
-            path.file_stem()
-                .and_then(|s| s.to_str())
-                .map(|s| s.ends_with(".log"))
-                .unwrap_or(false)
-        }
+        Some(ext) if ext_allowed(ext) => true,
+        // Rotated logs: the outer suffix is a compression marker (`app.log.gz`)
+        // or a numeric rotation index (`app.log.1`), so the inner stem extension
+        // is what must be allowed.
+        Some(ext) if is_rotation_suffix(ext) => path
+            .file_stem()
+            .and_then(|s| std::path::Path::new(s).extension())
+            .and_then(|e| e.to_str())
+            .map(ext_allowed)
+            .unwrap_or(false),
         _ => false,
     }
+}
+
+/// A rotation/compression suffix that wraps an inner log file: a known
+/// compression extension (`app.log.gz`) or a numeric index (`app.log.1`).
+fn is_rotation_suffix(ext: &str) -> bool {
+    matches!(ext, "gz" | "xz" | "zst" | "bz2") || is_numeric(ext)
+}
+
+/// Non-empty and all ASCII digits — a logrotate-style numeric rotation suffix
+/// (`app.log.1`, `app.log.42`).
+fn is_numeric(s: &str) -> bool {
+    !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit())
 }
 
 #[cfg(unix)]
@@ -198,12 +246,91 @@ mod tests {
     use super::*;
     use std::io::Write;
 
+    fn ext(list: &[&str]) -> Vec<String> {
+        list.iter().map(|s| s.to_string()).collect()
+    }
+
     #[test]
     fn detects_log_files() {
-        assert!(is_log_file(std::path::Path::new("/var/log/syslog.log")));
-        assert!(is_log_file(std::path::Path::new("/var/log/app.log.gz")));
-        assert!(!is_log_file(std::path::Path::new("/var/log/syslog")));
-        assert!(!is_log_file(std::path::Path::new("/var/log/data.csv")));
+        let allowed = ext(DEFAULT_LOG_EXTENSIONS);
+        assert!(is_log_file(
+            std::path::Path::new("/var/log/syslog.log"),
+            &allowed
+        ));
+        assert!(is_log_file(
+            std::path::Path::new("/var/log/app.log.gz"),
+            &allowed
+        ));
+        assert!(!is_log_file(
+            std::path::Path::new("/var/log/syslog"),
+            &allowed
+        ));
+        assert!(!is_log_file(
+            std::path::Path::new("/var/log/data.csv"),
+            &allowed
+        ));
+    }
+
+    #[test]
+    fn default_allowlist_matches_log_only() {
+        let allowed = ext(DEFAULT_LOG_EXTENSIONS);
+        assert!(is_log_file(
+            std::path::Path::new("/var/log/app.log"),
+            &allowed
+        ));
+        // .txt is opt-in — rejected under the default allowlist.
+        assert!(!is_log_file(
+            std::path::Path::new("/var/log/app.txt"),
+            &allowed
+        ));
+    }
+
+    #[test]
+    fn txt_matches_when_opted_in() {
+        let allowed = ext(&["log", "txt"]);
+        assert!(is_log_file(
+            std::path::Path::new("/var/log/app.txt"),
+            &allowed
+        ));
+        assert!(is_log_file(
+            std::path::Path::new("/var/log/app.log"),
+            &allowed
+        ));
+    }
+
+    #[test]
+    fn rotated_logs_match_under_default_allowlist() {
+        let allowed = ext(DEFAULT_LOG_EXTENSIONS);
+        assert!(is_log_file(
+            std::path::Path::new("/var/log/app.log.gz"),
+            &allowed
+        ));
+        assert!(is_log_file(
+            std::path::Path::new("/var/log/app.log.1"),
+            &allowed
+        ));
+        // A rotated non-log extension stays out under the default allowlist.
+        assert!(!is_log_file(
+            std::path::Path::new("/var/log/app.csv.1"),
+            &allowed
+        ));
+    }
+
+    #[test]
+    fn default_scan_paths_are_os_aware() {
+        let paths = default_scan_paths();
+        if cfg!(windows) {
+            assert_eq!(
+                paths,
+                &[
+                    r"C:\inetpub\logs\LogFiles",
+                    r"C:\Windows\Logs",
+                    r"C:\ProgramData",
+                ]
+            );
+        } else {
+            assert_eq!(paths, &["/var/log"]);
+        }
     }
 
     #[tokio::test]
@@ -218,7 +345,9 @@ mod tests {
         std::fs::write(sub.join("nested.log"), "nested\n").unwrap();
 
         let path_str = dir.path().to_str().unwrap();
-        let files = discover_log_files(&[path_str]).await.unwrap();
+        let files = discover_log_files(&[path_str], DEFAULT_LOG_EXTENSIONS)
+            .await
+            .unwrap();
         assert_eq!(files.len(), 2);
 
         let paths: Vec<&str> = files.iter().map(|f| f.path.as_str()).collect();
@@ -239,7 +368,9 @@ mod tests {
         std::fs::write(&plain_log, "2026-04-05 INFO hello\n").unwrap();
 
         let path_str = dir.path().to_str().unwrap();
-        let files = discover_log_files(&[path_str]).await.unwrap();
+        let files = discover_log_files(&[path_str], DEFAULT_LOG_EXTENSIONS)
+            .await
+            .unwrap();
         assert_eq!(files.len(), 2);
 
         let json_file = files.iter().find(|f| f.path.ends_with("json.log")).unwrap();
@@ -258,7 +389,7 @@ mod tests {
         let path = dir.path().join("bracey.log");
         std::fs::write(&path, "{not json}\n").unwrap();
 
-        let files = discover_log_files(&[dir.path().to_str().unwrap()])
+        let files = discover_log_files(&[dir.path().to_str().unwrap()], DEFAULT_LOG_EXTENSIONS)
             .await
             .unwrap();
         let file = files
@@ -275,7 +406,7 @@ mod tests {
         let path = dir.path().join("mixed.log");
         std::fs::write(&path, "{\"level\":\"info\"}\nnot json\n").unwrap();
 
-        let files = discover_log_files(&[dir.path().to_str().unwrap()])
+        let files = discover_log_files(&[dir.path().to_str().unwrap()], DEFAULT_LOG_EXTENSIONS)
             .await
             .unwrap();
         let file = files
@@ -292,7 +423,7 @@ mod tests {
         let path = dir.path().join("array.log");
         std::fs::write(&path, "[{\"level\":\"info\"}]\n").unwrap();
 
-        let files = discover_log_files(&[dir.path().to_str().unwrap()])
+        let files = discover_log_files(&[dir.path().to_str().unwrap()], DEFAULT_LOG_EXTENSIONS)
             .await
             .unwrap();
         let file = files
@@ -309,7 +440,7 @@ mod tests {
         let path = dir.path().join("binary.log");
         std::fs::write(&path, [0xff, 0xfe, b'{', b'}']).unwrap();
 
-        let files = discover_log_files(&[dir.path().to_str().unwrap()])
+        let files = discover_log_files(&[dir.path().to_str().unwrap()], DEFAULT_LOG_EXTENSIONS)
             .await
             .unwrap();
         let file = files
