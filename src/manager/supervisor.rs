@@ -28,6 +28,15 @@ pub struct InstallConfig {
 
 /// Set up the OS supervisor for the manager and start it.
 pub async fn install(cfg: &InstallConfig) -> Result<String> {
+    // These values are written into line-oriented env files and the launchd
+    // plist, so a control character in (e.g.) the token could inject extra env
+    // lines or plist content. Reject them before writing anything.
+    ensure_single_line("account token", &cfg.account_token)?;
+    ensure_single_line("rails URL", &cfg.rails_url)?;
+    if let Some(key) = &cfg.update_public_key {
+        ensure_single_line("update public key", key)?;
+    }
+
     #[cfg(target_os = "linux")]
     {
         install_systemd(cfg).await
@@ -42,9 +51,20 @@ pub async fn install(cfg: &InstallConfig) -> Result<String> {
     }
     #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
     {
-        let _ = cfg;
         anyhow::bail!("`install` is not supported on this platform")
     }
+}
+
+/// Reject control characters (newline / CR / NUL) in operator-supplied values
+/// that get written into env files or the launchd plist — defends against
+/// injecting extra env lines or plist content via a malformed token.
+fn ensure_single_line(label: &str, value: &str) -> Result<()> {
+    if value.contains(['\n', '\r', '\0']) {
+        anyhow::bail!(
+            "{label} contains a control character; refusing to write it to a config file"
+        );
+    }
+    Ok(())
 }
 
 /// Report the uninstall to the control plane (best-effort), then stop + remove
@@ -160,8 +180,21 @@ async fn uninstall_systemd() -> Result<String> {
 const LAUNCHD_PLIST_PATH: &str = "/Library/LaunchDaemons/com.logpacer.edgepacer.plist";
 
 #[cfg(target_os = "macos")]
+fn xml_escape(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+}
+
+#[cfg(target_os = "macos")]
 async fn install_launchd(cfg: &InstallConfig) -> Result<String> {
-    let key = cfg.update_public_key.clone().unwrap_or_default();
+    // XML-escape every interpolated value so a token containing `<` / `&` / `"`
+    // can't break out of its <string> and inject plist content.
+    let manager = xml_escape(&cfg.manager_path.display().to_string());
+    let token = xml_escape(&cfg.account_token);
+    let rails = xml_escape(&cfg.rails_url);
+    let key = xml_escape(&cfg.update_public_key.clone().unwrap_or_default());
     let plist = format!(
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
          <!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n\
@@ -178,12 +211,12 @@ async fn install_launchd(cfg: &InstallConfig) -> Result<String> {
          <key>StandardOutPath</key><string>/var/log/edgepacer.log</string>\n\
          <key>StandardErrorPath</key><string>/var/log/edgepacer.err.log</string>\n\
          </dict></plist>\n",
-        manager = cfg.manager_path.display(),
-        token = cfg.account_token,
-        rails = cfg.rails_url,
     );
     std::fs::write(LAUNCHD_PLIST_PATH, plist)
         .with_context(|| format!("write {LAUNCHD_PLIST_PATH}"))?;
+    // The plist embeds the bootstrap token (EnvironmentVariables) -> root-only.
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(LAUNCHD_PLIST_PATH, std::fs::Permissions::from_mode(0o600))?;
     run("launchctl", &["load", LAUNCHD_PLIST_PATH]).await?;
     run("launchctl", &["start", "com.logpacer.edgepacer"]).await?;
     Ok(format!(
@@ -231,6 +264,20 @@ async fn install_scheduled_task(cfg: &InstallConfig) -> Result<String> {
         cfg.update_public_key.clone().unwrap_or_default(),
     );
     std::fs::write(&env_path, body).with_context(|| format!("write {}", env_path.display()))?;
+    // The env file holds the bootstrap token -> restrict to SYSTEM + Administrators
+    // (remove inherited ACEs so non-admins on the box can't read it).
+    let env_str = env_path.display().to_string();
+    run(
+        "icacls",
+        &[
+            env_str.as_str(),
+            "/inheritance:r",
+            "/grant:r",
+            "SYSTEM:F",
+            "Administrators:F",
+        ],
+    )
+    .await?;
 
     // Loop wrapper: load env, run the manager, relaunch on any exit (5s backoff).
     let wrapper_path = dir.join("edgepacer-service.cmd");
