@@ -250,6 +250,9 @@ async fn read_sample_lines_for_identifier(
         Some((AccessMethod::DockerApi, container_id)) => {
             read_docker_lines(&container_id, max_lines).await
         }
+        Some((AccessMethod::WindowsEventLog, channel)) => {
+            crate::windows_event_log::sample_channel_lines(&channel, max_lines).await
+        }
         None => read_sample_lines(identifier, max_lines),
     }
 }
@@ -287,6 +290,12 @@ fn sample_error_reason(error: &str) -> &'static str {
         "docker_logs_failed"
     } else if normalized.starts_with("failed to open ") {
         "file_open_failed"
+    } else if normalized.contains("access is denied") || normalized.contains("error 5") {
+        // wevtutil rejects a channel the agent's account can't read (e.g.
+        // Security under a restricted service account).
+        "access_denied"
+    } else if normalized.contains("wevtutil") {
+        "wevtutil_failed"
     } else {
         "other"
     }
@@ -408,6 +417,14 @@ mod tests {
         assert_eq!(
             sample_error_reason("docker connect failed: bad socket"),
             "docker_connect_failed"
+        );
+        assert_eq!(
+            sample_error_reason("wevtutil exit 1 for Security: Access is denied."),
+            "access_denied"
+        );
+        assert_eq!(
+            sample_error_reason("wevtutil spawn failed for Application: not found"),
+            "wevtutil_failed"
         );
     }
 

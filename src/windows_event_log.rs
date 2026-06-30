@@ -11,7 +11,7 @@ use quick_xml::events::Event as XmlEvent;
 use quick_xml::reader::Reader;
 use serde_json::{Map, Value, json};
 use tokio::process::Command;
-use tokio::sync::watch;
+use tokio::sync::{Semaphore, watch};
 use tracing::{debug, info, warn};
 
 use crate::streaming_actor::StreamHandle;
@@ -20,6 +20,11 @@ use crate::streaming_checkpoint::StreamingCheckpoint;
 const POLL_INTERVAL: Duration = Duration::from_secs(1);
 const QUERY_LIMIT: usize = 100;
 const CHECKPOINT_INTERVAL: u64 = 100;
+
+/// Bounds concurrent `wevtutil` sample spawns. Each call is a process spawn plus
+/// a render — the discovery cost center — so sampling many channels never
+/// fans out into an unbounded pile of `wevtutil` processes.
+static WEVTUTIL_SAMPLE_SEM: Semaphore = Semaphore::const_new(4);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct EventLogRecord {
@@ -148,6 +153,46 @@ pub async fn stream_event_log(
         total_entries = entries_processed,
         "Windows Event Log streaming stopped"
     );
+}
+
+/// Sample up to `max_lines` rendered (`/f:text`) event lines from a channel for
+/// Rails discovery analysis and the review queue, newest-first.
+///
+/// This is the discovery-time sampling path, deliberately distinct from the
+/// JSON streaming collection above: a sample is human-readable rendered text —
+/// what the screener shows the operator and what schema analysis runs against.
+pub async fn sample_channel_lines(channel: &str, max_lines: usize) -> Result<Vec<String>, String> {
+    // wevtutil is a heavy per-call spawn; cap how many run at once.
+    let _permit = WEVTUTIL_SAMPLE_SEM
+        .acquire()
+        .await
+        .map_err(|_| "wevtutil sample semaphore closed".to_string())?;
+
+    let events = max_lines.clamp(1, QUERY_LIMIT);
+    let count = format!("/c:{events}");
+    let output = Command::new("wevtutil")
+        .args(["qe", channel, count.as_str(), "/rd:true", "/f:text"])
+        .output()
+        .await
+        .map_err(|error| format!("wevtutil spawn failed for {channel}: {error}"))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        return Err(format!(
+            "wevtutil exit {} for {channel}: {stderr}",
+            output.status
+        ));
+    }
+
+    let rendered = String::from_utf8_lossy(&output.stdout);
+    let mut lines: Vec<String> = rendered
+        .lines()
+        .map(str::trim_end)
+        .filter(|line| !line.trim().is_empty())
+        .map(str::to_string)
+        .collect();
+    lines.truncate(max_lines);
+    Ok(lines)
 }
 
 async fn latest_record_id(channel: &str) -> Result<u64, String> {

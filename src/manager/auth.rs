@@ -9,6 +9,7 @@ use sha2::{Digest, Sha256};
 use std::time::Duration;
 use tracing::{info, warn};
 
+use crate::delivery::ErrorClass;
 use crate::token_store;
 
 const SERVER_TOKEN_FILE: &str = "server_bootstrap_token";
@@ -44,6 +45,42 @@ pub struct ManagerAuthResponse {
     pub access_token: Option<String>,
     pub refresh_token: Option<String>,
     pub expires_in: Option<i64>,
+}
+
+/// Outcome of re-validating the persisted server token from the run loop.
+///
+/// Mirrors the `Auth` vs `Retryable` split used by
+/// `auth_session::refresh_decision`: only a definitive auth rejection re-onboards;
+/// a transient blip keeps the current token so a flaky network never churns it.
+#[derive(Debug, PartialEq, Eq)]
+enum PingOutcome {
+    /// 2xx/3xx — the server still accepts the token. No-op.
+    Valid,
+    /// 401/403 (`ErrorClass::Auth`) — the Server was deleted/the token revoked;
+    /// re-bootstrap against the account token to recreate it.
+    AuthRejected,
+    /// 5xx / network / timeout (`ErrorClass::Retryable`) — keep the current
+    /// token and try again next interval.
+    Retryable,
+}
+
+/// Classify a `managers/ping` HTTP status for the run-loop re-validate path.
+///
+/// Reuses the shared `classify_http_status` policy and its `ErrorClass::Auth`
+/// vs `ErrorClass::Retryable` distinction (the same split `refresh_decision`
+/// uses) so only a definitive auth rejection re-onboards: a 5xx (and, defensively,
+/// any other non-auth status such as a transient 404) is retryable and leaves the
+/// token alone. Pure, so it is unit-testable without a live control plane.
+/// Transport failures never reach here — they are mapped to a no-op at the call
+/// site, since a dropped connection is not an auth verdict.
+fn classify_ping(status: reqwest::StatusCode) -> PingOutcome {
+    if status.is_success() || status.is_redirection() {
+        return PingOutcome::Valid;
+    }
+    match crate::delivery::classify_http_status(status.as_u16()) {
+        ErrorClass::Auth => PingOutcome::AuthRejected,
+        ErrorClass::Retryable | ErrorClass::NonRetryable => PingOutcome::Retryable,
+    }
 }
 
 /// Manager authentication client.
@@ -132,6 +169,52 @@ impl ManagerAuth {
 
         info!("[manager] authenticating with Rails (first-time bootstrap)");
         self.bootstrap(&fingerprint).await
+    }
+
+    /// Re-validate the current server bootstrap token while running, and
+    /// re-onboard if the Server was deleted in Rails. Called once per check
+    /// interval from the run loop.
+    ///
+    /// Only a definitive auth rejection (401/403 → `ErrorClass::Auth`) triggers
+    /// a re-bootstrap, which re-resolves/recreates the Server by
+    /// `installation_id` via the account token and rotates `self.token` to the
+    /// fresh server bootstrap token. A 200 is a no-op; any transient failure
+    /// (5xx, network, timeout) keeps the current token so a blip never churns
+    /// it. The persisted token file is only overwritten by a successful
+    /// re-bootstrap — never deleted on a transient failure.
+    ///
+    /// Returns `Ok(true)` only when the token actually changed (re-onboarded),
+    /// so the caller restarts the supervised agent with the new token.
+    pub async fn revalidate_bootstrap_token(&mut self) -> anyhow::Result<bool> {
+        // A non-HTTP failure (bad header, transport error) is never an auth
+        // rejection — keep the current token and try again next interval.
+        let status = match self.ping(&self.token).await {
+            Ok(resp) => resp.status(),
+            Err(e) => {
+                warn!(error = %e, "[manager] bootstrap token re-validation ping failed transiently, keeping current token");
+                return Ok(false);
+            }
+        };
+
+        match classify_ping(status) {
+            PingOutcome::Valid => Ok(false),
+            PingOutcome::Retryable => {
+                warn!(
+                    "[manager] server error during bootstrap token re-validation, keeping current token"
+                );
+                Ok(false)
+            }
+            PingOutcome::AuthRejected => {
+                info!("[manager] server bootstrap token rejected (Server deleted?), re-onboarding");
+                let fingerprint = account_token_fingerprint(&self.account_token);
+                let previous = self.token.clone();
+                self.bootstrap(&fingerprint).await?;
+                // Signal a restart only when the re-bootstrap actually rotated
+                // the token; a recreated Server with an identical token needs no
+                // agent restart.
+                Ok(self.token != previous)
+            }
+        }
     }
 
     /// Validate and adopt the persisted server token. Returns false if it is
@@ -227,15 +310,7 @@ impl ManagerAuth {
 
     /// GET /api/v1/managers/ping — validate a token is still accepted.
     async fn validate_token(&self, token: &str) -> anyhow::Result<()> {
-        let url = format!("{}/api/v1/managers/ping", self.rails_url);
-
-        let mut headers = HeaderMap::new();
-        headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
-        let auth = crate::common::bearer_header(token)
-            .ok_or_else(|| anyhow::anyhow!("token is not a valid HTTP header value"))?;
-        headers.insert(AUTHORIZATION, auth);
-
-        let resp = self.http.get(&url).headers(headers).send().await?;
+        let resp = self.ping(token).await?;
 
         let status = resp.status();
         if status == reqwest::StatusCode::UNAUTHORIZED
@@ -255,6 +330,21 @@ impl ManagerAuth {
         Ok(())
     }
 
+    /// Send a single GET /api/v1/managers/ping with the given bearer token.
+    /// Shared by the startup `validate_token` path and the run-loop
+    /// `revalidate_bootstrap_token` path.
+    async fn ping(&self, token: &str) -> anyhow::Result<reqwest::Response> {
+        let url = format!("{}/api/v1/managers/ping", self.rails_url);
+
+        let mut headers = HeaderMap::new();
+        headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+        let auth = crate::common::bearer_header(token)
+            .ok_or_else(|| anyhow::anyhow!("token is not a valid HTTP header value"))?;
+        headers.insert(AUTHORIZATION, auth);
+
+        Ok(self.http.get(&url).headers(headers).send().await?)
+    }
+
     /// Headers for /managers/auth — always the account token, regardless of
     /// what `self.token` currently holds.
     fn bearer_headers(&self) -> HeaderMap {
@@ -264,5 +354,147 @@ impl ManagerAuth {
             headers.insert(AUTHORIZATION, auth);
         }
         headers
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::sync::Mutex;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    // `EDGEPACER_STATE_DIR` is process-global, and the integration tests below
+    // bootstrap into a private temp dir. Serialize them so concurrent tests in
+    // this binary never observe each other's state dir.
+    static STATE_DIR_GUARD: Mutex<()> = Mutex::const_new(());
+
+    #[test]
+    fn classify_ping_treats_2xx_as_valid() {
+        assert_eq!(classify_ping(reqwest::StatusCode::OK), PingOutcome::Valid);
+        assert_eq!(
+            classify_ping(reqwest::StatusCode::NO_CONTENT),
+            PingOutcome::Valid
+        );
+    }
+
+    #[test]
+    fn classify_ping_treats_401_403_as_auth_rejected() {
+        assert_eq!(
+            classify_ping(reqwest::StatusCode::UNAUTHORIZED),
+            PingOutcome::AuthRejected
+        );
+        assert_eq!(
+            classify_ping(reqwest::StatusCode::FORBIDDEN),
+            PingOutcome::AuthRejected
+        );
+    }
+
+    #[test]
+    fn classify_ping_treats_5xx_and_other_non_auth_as_retryable() {
+        assert_eq!(
+            classify_ping(reqwest::StatusCode::INTERNAL_SERVER_ERROR),
+            PingOutcome::Retryable
+        );
+        assert_eq!(
+            classify_ping(reqwest::StatusCode::SERVICE_UNAVAILABLE),
+            PingOutcome::Retryable
+        );
+        // A transient 404 must not be read as a deleted Server — only 401/403 is
+        // a definitive auth verdict for the loop path.
+        assert_eq!(
+            classify_ping(reqwest::StatusCode::NOT_FOUND),
+            PingOutcome::Retryable
+        );
+    }
+
+    /// Build a `ManagerAuth` already holding a server bootstrap token, as if the
+    /// startup `ensure_bootstrap_token` had adopted one.
+    fn running_auth(rails_url: &str) -> ManagerAuth {
+        let mut auth = ManagerAuth::new(rails_url, "account-token");
+        auth.token = "old-server-token".to_string();
+        auth
+    }
+
+    #[tokio::test]
+    async fn revalidate_is_noop_when_ping_returns_200() {
+        let _guard = STATE_DIR_GUARD.lock().await;
+        let state_dir = tempfile::tempdir().unwrap();
+        unsafe { std::env::set_var("EDGEPACER_STATE_DIR", state_dir.path()) };
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/managers/ping"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
+        // No /managers/auth mount: if revalidate wrongly re-bootstrapped, that
+        // POST would 404 and surface as an Err here instead of Ok(false).
+
+        let mut auth = running_auth(&server.uri());
+        let changed = auth.revalidate_bootstrap_token().await.unwrap();
+
+        assert!(!changed, "200 ping must not signal a restart");
+        assert_eq!(auth.token(), "old-server-token");
+
+        unsafe { std::env::remove_var("EDGEPACER_STATE_DIR") };
+    }
+
+    #[tokio::test]
+    async fn revalidate_rebootstraps_and_signals_restart_on_401() {
+        let _guard = STATE_DIR_GUARD.lock().await;
+        let state_dir = tempfile::tempdir().unwrap();
+        unsafe { std::env::set_var("EDGEPACER_STATE_DIR", state_dir.path()) };
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/managers/ping"))
+            .respond_with(ResponseTemplate::new(401).set_body_string("server deleted"))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/v1/managers/auth"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "server_bootstrap_token": "fresh-server-token",
+            })))
+            .mount(&server)
+            .await;
+
+        let mut auth = running_auth(&server.uri());
+        let changed = auth.revalidate_bootstrap_token().await.unwrap();
+
+        assert!(changed, "401 ping must re-onboard and signal a restart");
+        assert_eq!(auth.token(), "fresh-server-token");
+        // The rotated token is persisted so a manager restart resumes on it.
+        assert_eq!(
+            token_store::load_token(SERVER_TOKEN_FILE).as_deref(),
+            Some("fresh-server-token")
+        );
+
+        unsafe { std::env::remove_var("EDGEPACER_STATE_DIR") };
+    }
+
+    #[tokio::test]
+    async fn revalidate_keeps_token_on_5xx_ping_error() {
+        let _guard = STATE_DIR_GUARD.lock().await;
+        let state_dir = tempfile::tempdir().unwrap();
+        unsafe { std::env::set_var("EDGEPACER_STATE_DIR", state_dir.path()) };
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/managers/ping"))
+            .respond_with(ResponseTemplate::new(503).set_body_string("unavailable"))
+            .mount(&server)
+            .await;
+        // No /managers/auth mount: a transient blip must not re-bootstrap; if it
+        // did, the POST would 404 and this would be an Err instead of Ok(false).
+
+        let mut auth = running_auth(&server.uri());
+        let changed = auth.revalidate_bootstrap_token().await.unwrap();
+
+        assert!(!changed, "5xx ping must not re-bootstrap");
+        assert_eq!(auth.token(), "old-server-token");
+
+        unsafe { std::env::remove_var("EDGEPACER_STATE_DIR") };
     }
 }

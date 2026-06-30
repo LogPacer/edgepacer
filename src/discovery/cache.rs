@@ -5,7 +5,7 @@
 
 use std::collections::HashMap;
 
-use super::{Census, Container, LogFile, SystemdService};
+use super::{Census, Container, EventLogChannel, LogFile, SystemdService};
 
 /// Resolved access method for a log source.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -14,6 +14,7 @@ pub enum AccessMethod {
     DockerApi,
     Journald,
     Kubernetes,
+    WindowsEventLog,
 }
 
 /// Confidence that the matched key is a *durable* source identity rather than
@@ -160,6 +161,7 @@ pub struct DiscoveryCache {
     containers: HashMap<String, Container>,
     files: HashMap<String, LogFile>,
     systemd_services: HashMap<String, SystemdService>,
+    event_log_channels: HashMap<String, EventLogChannel>,
 }
 
 impl DiscoveryCache {
@@ -172,6 +174,7 @@ impl DiscoveryCache {
         self.update_containers(&census.containers);
         self.update_files(&census.log_files);
         self.update_systemd_services(&census.systemd_services);
+        self.update_event_log_channels(&census.event_log_channels);
     }
 
     fn update_containers(&mut self, containers: &[Container]) {
@@ -249,6 +252,14 @@ impl DiscoveryCache {
         }
     }
 
+    fn update_event_log_channels(&mut self, channels: &[EventLogChannel]) {
+        self.event_log_channels.clear();
+        for channel in channels {
+            self.event_log_channels
+                .insert(channel.channel.clone(), channel.clone());
+        }
+    }
+
     /// Resolve a collect directive (identifier + type hint) to a concrete
     /// reader, reporting how the match was made and how durable it is.
     pub fn resolve(&self, identifier: &str, loggable_type: &str) -> CollectMatch {
@@ -256,6 +267,7 @@ impl DiscoveryCache {
             "container" => self.resolve_container(identifier),
             "file" => self.resolve_file(identifier),
             "systemd_service" | "journald" => self.resolve_systemd(identifier),
+            "windows_event_log" => self.resolve_windows_event_log(identifier),
             _ => {
                 // Unknown hint: try each lane in priority order. A container
                 // result (including an Ambiguous refusal) wins over file/systemd.
@@ -267,7 +279,15 @@ impl DiscoveryCache {
                 if !matches!(file, CollectMatch::NotFound) {
                     return file;
                 }
-                self.resolve_systemd(identifier)
+                let systemd = self.resolve_systemd(identifier);
+                if !matches!(systemd, CollectMatch::NotFound) {
+                    return systemd;
+                }
+                // Windows Event Log sample requests carry no type hint (the wire
+                // is just an identifier), so the empty-hint path lands here.
+                // Gated on the discovered channel set, so this never
+                // over-matches a stray file path or unit name.
+                self.resolve_windows_event_log(identifier)
             }
         }
     }
@@ -342,6 +362,21 @@ impl DiscoveryCache {
         }
     }
 
+    /// Resolve a Windows Event Log channel by name. Gated on the discovered
+    /// channel set — a channel EdgePacer has not enumerated does not resolve,
+    /// so the empty-hint sampler fallback can't mistake a file/unit for one.
+    fn resolve_windows_event_log(&self, identifier: &str) -> CollectMatch {
+        match self.event_log_channels.get(identifier) {
+            Some(channel) => CollectMatch::Matched(ResolvedAccess {
+                access_method: AccessMethod::WindowsEventLog,
+                matched_via: MatchVia::WindowsEventLog,
+                stable_identity: channel.channel.clone(),
+                access_locator: channel.channel.clone(),
+            }),
+            None => CollectMatch::NotFound,
+        }
+    }
+
     pub fn stats(&self) -> DiscoveryCacheStats {
         let mut seen = std::collections::HashSet::new();
         for c in self.containers.values() {
@@ -351,6 +386,7 @@ impl DiscoveryCache {
             containers: seen.len(),
             files: self.files.len(),
             systemd_services: self.systemd_services.len(),
+            event_log_channels: self.event_log_channels.len(),
         }
     }
 }
@@ -360,11 +396,12 @@ pub struct DiscoveryCacheStats {
     pub containers: usize,
     pub files: usize,
     pub systemd_services: usize,
+    pub event_log_channels: usize,
 }
 
 impl DiscoveryCacheStats {
     pub fn total(&self) -> usize {
-        self.containers + self.files + self.systemd_services
+        self.containers + self.files + self.systemd_services + self.event_log_channels
     }
 }
 
@@ -375,6 +412,7 @@ pub fn infer_loggable_type(matching_strategy: &str) -> &'static str {
         | "log_path" | "image" => "container",
         "systemd_unit" => "systemd_service",
         "file_path" => "file",
+        "windows_event_log" => "windows_event_log",
         _ => "",
     }
 }
@@ -691,6 +729,37 @@ mod tests {
             cache.resolve("EventLog", "systemd_service"),
             CollectMatch::NotFound
         );
+    }
+
+    #[test]
+    fn resolves_discovered_event_log_channel_by_name() {
+        let mut census = Census::default();
+        census.event_log_channels.push(EventLogChannel {
+            channel: "Application".into(),
+            record_count: 1234,
+        });
+        let mut cache = DiscoveryCache::new();
+        cache.update_all(&census);
+
+        // Explicit type hint resolves to the wevtutil access method.
+        let access = matched(cache.resolve("Application", "windows_event_log"));
+        assert_eq!(access.access_method, AccessMethod::WindowsEventLog);
+        assert_eq!(access.matched_via, MatchVia::WindowsEventLog);
+        assert_eq!(access.confidence(), Confidence::Strong);
+        assert_eq!(access.access_locator, "Application");
+
+        // The empty-hint sampler path also resolves a *discovered* channel.
+        let (method, loc) = cache.resolve_access_method("Application", "").unwrap();
+        assert_eq!(method, AccessMethod::WindowsEventLog);
+        assert_eq!(loc, "Application");
+
+        // An undiscovered channel name does not resolve (no over-matching).
+        assert_eq!(
+            cache.resolve("Microsoft-Windows-Nope/Operational", "windows_event_log"),
+            CollectMatch::NotFound
+        );
+        assert!(cache.resolve_access_method("Nope", "").is_none());
+        assert_eq!(cache.stats().event_log_channels, 1);
     }
 
     #[test]

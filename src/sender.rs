@@ -460,6 +460,16 @@ impl Client {
         self.post_census("/api/v1/census/journald", payload).await
     }
 
+    /// Report Windows Event Log channel inventory to Rails.
+    /// POST /census/windows_event_logs
+    pub async fn report_event_log_inventory(
+        &self,
+        payload: &serde_json::Value,
+    ) -> Result<InventoryResponse, EdgepacerError> {
+        self.post_census("/api/v1/census/windows_event_logs", payload)
+            .await
+    }
+
     /// Generic census POST helper.
     async fn post_census(
         &self,

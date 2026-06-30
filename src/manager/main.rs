@@ -37,7 +37,7 @@ struct Cli {
 #[derive(Args, Debug)]
 struct RunArgs {
     /// Path to the edgepacer binary
-    #[arg(long, default_value = "./edgepacer", env = "EDGEPACER_PATH")]
+    #[arg(long, default_value = "edgepacer", env = "EDGEPACER_PATH")]
     edgepacer: PathBuf,
 
     /// Rails control-plane URL
@@ -140,10 +140,30 @@ fn go_platform_name(os: &str, arch: &str) -> String {
     format!("{os}-{arch}")
 }
 
+/// Resolve the agent binary path. A relative path (the `edgepacer` default) is
+/// anchored to the manager executable's own directory, so the agent always lands
+/// in a writable location next to the manager regardless of the process CWD.
+fn resolve_edgepacer_path(path: PathBuf) -> PathBuf {
+    if path.is_absolute() {
+        return path;
+    }
+    match std::env::current_exe() {
+        Ok(exe) => match exe.parent() {
+            Some(dir) => dir.join(&path),
+            None => path,
+        },
+        Err(_) => path,
+    }
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
-    let run = cli.run;
+    let mut run = cli.run;
+    // Anchor a relative agent path to the manager's own directory rather than the
+    // process CWD. Services and `iex`-piped installs run with CWD=system32, where
+    // writing the agent at "./edgepacer" fails with "Access is denied".
+    run.edgepacer = resolve_edgepacer_path(run.edgepacer);
 
     // Initialize logging
     let filter = EnvFilter::try_new("info").unwrap();
@@ -246,6 +266,28 @@ async fn main() -> anyhow::Result<()> {
             if let Err(e) = process.wait_healthy(health_timeout).await {
                 error!(error = %e, "[manager] restarted edgepacer failed health check");
                 continue;
+            }
+        }
+
+        // Self-heal: if the Server was deleted in Rails the persisted bootstrap
+        // token now fails auth. Re-validate it; a definitive rejection re-onboards
+        // (recreating the Server by installation_id) and rotates the token. Only
+        // restart the agent when the token actually changed — a 200 or a transient
+        // ping error leaves the running agent untouched.
+        match auth.revalidate_bootstrap_token().await {
+            Ok(true) => {
+                info!(
+                    "[manager] bootstrap token rotated after re-onboarding, restarting edgepacer"
+                );
+                process.start(auth.token()).await?;
+                if let Err(e) = process.wait_healthy(health_timeout).await {
+                    error!(error = %e, "[manager] re-onboarded edgepacer failed health check");
+                    continue;
+                }
+            }
+            Ok(false) => {}
+            Err(e) => {
+                warn!(error = %e, "[manager] bootstrap token re-validation failed");
             }
         }
 

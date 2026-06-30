@@ -6,7 +6,7 @@ use tracing::{debug, info, warn};
 
 use crate::checkpoint::Checkpoint;
 
-use super::line::{read_one_line, trim_line_ending};
+use super::line::{LineEncoding, decode_line, detect_encoding, read_one_line, trim_line_ending};
 
 #[derive(Debug, Clone, Copy)]
 struct ObservedFileState {
@@ -65,6 +65,11 @@ pub(super) struct TailerState {
     /// remaining bytes can be drained to EOF before the new file is read.
     draining: Option<BufReader<std::fs::File>>,
     pending_open: Option<PendingOpen>,
+    /// Source-byte encoding, sniffed from a leading BOM at open. Drives line
+    /// splitting (terminator width) and per-line decode to UTF-8. The BOM bytes
+    /// stay part of the source stream and count toward `offset`, so a checkpoint
+    /// offset remains a valid source position across restarts.
+    encoding: LineEncoding,
 }
 
 impl TailerState {
@@ -77,6 +82,7 @@ impl TailerState {
             size: 0,
             draining: None,
             pending_open: Some(mode),
+            encoding: LineEncoding::default(),
         }
     }
 
@@ -100,6 +106,13 @@ impl TailerState {
         let inode = observed.inode;
         let modtime = observed.modtime;
         let current_size = observed.size;
+
+        // Sniff a leading BOM for the line encoding. Read up to the first 3
+        // bytes, then rewind to byte 0 -- the seek branches below all use
+        // absolute seeks, so the BOM bytes stay part of the source stream and
+        // keep counting toward `offset`.
+        let mut file = file;
+        let encoding = sniff_encoding(&mut file)?;
 
         let mut reader = BufReader::new(file);
         let (offset, size, description) = match mode {
@@ -137,6 +150,7 @@ impl TailerState {
         self.inode = inode;
         self.modtime = modtime;
         self.size = size;
+        self.encoding = encoding;
         self.pending_open = None;
         Ok(())
     }
@@ -156,7 +170,7 @@ impl TailerState {
                 break;
             };
             line_buf.clear();
-            let outcome = read_one_line(drain, &mut line_buf, max_line_bytes)?;
+            let outcome = read_one_line(drain, &mut line_buf, max_line_bytes, self.encoding)?;
             if outcome.consumed == 0 {
                 info!(path = %path_display, "finished draining rotated file");
                 self.draining = None;
@@ -170,6 +184,9 @@ impl TailerState {
                     "oversize line truncated during drain"
                 );
             }
+            // Draining resumes the tail of an already-partially-read rotated
+            // file, so these are never the first (BOM-bearing) line.
+            decode_line(&mut line_buf, self.encoding, false);
             trim_line_ending(&mut line_buf);
             lines.push(std::mem::take(&mut line_buf));
         }
@@ -177,7 +194,12 @@ impl TailerState {
         if let Some(reader) = self.reader.as_mut() {
             while lines.len() < max_lines {
                 line_buf.clear();
-                let outcome = read_one_line(reader, &mut line_buf, max_line_bytes)?;
+                // The first line of the file is the only one carrying a BOM.
+                // It is read exactly when we start at source offset 0 -- a
+                // checkpoint resume from offset > 0 already consumed the BOM in
+                // a prior run, so the flag is naturally false there.
+                let is_first_line = self.offset == 0;
+                let outcome = read_one_line(reader, &mut line_buf, max_line_bytes, self.encoding)?;
                 if outcome.consumed == 0 {
                     break;
                 }
@@ -190,6 +212,7 @@ impl TailerState {
                         "oversize line truncated"
                     );
                 }
+                decode_line(&mut line_buf, self.encoding, is_first_line);
                 trim_line_ending(&mut line_buf);
                 lines.push(std::mem::take(&mut line_buf));
             }
@@ -309,6 +332,18 @@ impl TailerState {
     }
 }
 
+/// Read up to the first 3 bytes of `file` to detect a leading BOM, then rewind
+/// to byte 0. The caller's subsequent absolute seek (TailFromEnd / FromStart /
+/// Checkpoint) sets the real read position; the BOM bytes remain part of the
+/// source stream so offsets stay source-relative.
+fn sniff_encoding(file: &mut std::fs::File) -> io::Result<LineEncoding> {
+    use std::io::Read;
+    let mut head = [0u8; 3];
+    let n = file.read(&mut head)?;
+    file.seek(SeekFrom::Start(0))?;
+    Ok(detect_encoding(&head[..n]))
+}
+
 fn is_retryable_io_error(e: &io::Error) -> bool {
     matches!(
         e.kind(),
@@ -402,4 +437,130 @@ unsafe extern "system" {
         file: *mut std::ffi::c_void,
         file_information: *mut ByHandleFileInformation,
     ) -> i32;
+}
+
+#[cfg(test)]
+mod encoding_tests {
+    use super::*;
+
+    fn utf16le_bytes(s: &str) -> Vec<u8> {
+        let mut v = Vec::new();
+        for u in s.encode_utf16() {
+            v.extend_from_slice(&u.to_le_bytes());
+        }
+        v
+    }
+
+    fn utf16be_bytes(s: &str) -> Vec<u8> {
+        let mut v = Vec::new();
+        for u in s.encode_utf16() {
+            v.extend_from_slice(&u.to_be_bytes());
+        }
+        v
+    }
+
+    /// Write `bytes` to a temp file, open it from start, and read all lines.
+    /// Returns the lines and the tailer's final source-byte offset. All reads
+    /// complete here, so the temp dir can drop on return.
+    fn read_from_start(bytes: &[u8]) -> (Vec<Vec<u8>>, u64) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("encoded.txt");
+        std::fs::write(&path, bytes).unwrap();
+
+        let mut state = TailerState::pending(PendingOpen::FromStart);
+        state.try_upgrade_pending(&path).unwrap();
+        let lines = state.read_lines(&path, 1024, 1 << 20).unwrap();
+        (lines, state.offset())
+    }
+
+    #[test]
+    fn utf16le_bom_ships_clean_utf8() {
+        let mut bytes = vec![0xFF, 0xFE];
+        bytes.extend_from_slice(&utf16le_bytes("æøå\nsecond\n"));
+        let (lines, offset) = read_from_start(&bytes);
+
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0], "æøå".as_bytes());
+        assert_eq!(lines[1], b"second");
+        assert!(!lines[0].contains(&0), "no interleaved NUL byte");
+        assert!(
+            std::str::from_utf8(&lines[0]).is_ok(),
+            "valid UTF-8 -> RawText"
+        );
+        // (f) offset stays in SOURCE bytes -- the resume guarantee.
+        assert_eq!(offset, bytes.len() as u64);
+    }
+
+    #[test]
+    fn utf16be_bom_ships_clean_utf8() {
+        let mut bytes = vec![0xFE, 0xFF];
+        bytes.extend_from_slice(&utf16be_bytes("æøå\nsecond\n"));
+        let (lines, offset) = read_from_start(&bytes);
+
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0], "æøå".as_bytes());
+        assert_eq!(lines[1], b"second");
+        assert!(!lines[0].contains(&0), "no interleaved NUL byte");
+        assert_eq!(offset, bytes.len() as u64);
+    }
+
+    #[test]
+    fn plain_utf8_is_byte_identical_passthrough() {
+        let bytes = b"hello\nverden\n".to_vec();
+        let (lines, offset) = read_from_start(&bytes);
+
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0], b"hello");
+        assert_eq!(lines[1], b"verden");
+        assert_eq!(offset, bytes.len() as u64);
+    }
+
+    #[test]
+    fn utf8_bom_stripped_from_first_line_only() {
+        let mut bytes = vec![0xEF, 0xBB, 0xBF];
+        bytes.extend_from_slice(b"first\nsecond\n");
+        let (lines, offset) = read_from_start(&bytes);
+
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0], b"first", "BOM stripped from line 1");
+        assert_eq!(lines[1], b"second", "line 2 untouched");
+        // Offset still counts the 3 BOM bytes as source bytes.
+        assert_eq!(offset, bytes.len() as u64);
+    }
+
+    #[test]
+    fn utf16le_crlf_leaves_no_stray_cr() {
+        // BOM required: detection is BOM-based, so a BOM-less UTF-16 stream is
+        // (by design) read as UTF-8. Prepend FF FE like the other UTF-16 tests.
+        let mut bytes = vec![0xFF, 0xFE];
+        bytes.extend_from_slice(&utf16le_bytes("line\r\nnext\r\n"));
+        let (lines, offset) = read_from_start(&bytes);
+
+        assert_eq!(lines.len(), 2);
+        assert_eq!(
+            lines[0], b"line",
+            "decoded \\r\\n then trimmed -> no stray CR"
+        );
+        assert_eq!(lines[1], b"next");
+        assert_eq!(offset, bytes.len() as u64);
+    }
+
+    #[test]
+    fn utf16le_offset_equals_full_source_length() {
+        // Two-line UTF-16LE file (with BOM so the encoding is detected). The
+        // resume guarantee: after a full read the offset is the SOURCE byte
+        // length, not the shorter decoded length -- so a checkpoint offset
+        // remains a valid byte position to seek back to.
+        let mut bytes = vec![0xFF, 0xFE];
+        bytes.extend_from_slice(&utf16le_bytes("one\ntwo\n"));
+        let (lines, offset) = read_from_start(&bytes);
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0], b"one");
+        assert_eq!(lines[1], b"two");
+        assert_eq!(offset, bytes.len() as u64);
+        // Decoded total is far shorter than source -- proves offset is NOT in
+        // decoded bytes (a whole-reader transcoder would have broken this).
+        let decoded_total: usize = lines.iter().map(|l| l.len()).sum();
+        assert!(offset as usize > decoded_total);
+    }
 }

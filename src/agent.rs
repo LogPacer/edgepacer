@@ -34,16 +34,15 @@ pub async fn run(
 
     // Initial discovery immediately, then poll
     loop {
-        // Read scan_paths from config (dynamic — changes on hot-reload).
+        // Read scan_paths and the extension allowlist from config (dynamic —
+        // changes on hot-reload). Both fall back to OS-aware defaults when unset.
         let scan_paths = extract_scan_paths(&shared_config).await;
         let scan_refs: Vec<&str> = scan_paths.iter().map(|s| s.as_str()).collect();
+        let log_extensions = extract_log_extensions(&shared_config).await;
+        let ext_refs: Vec<&str> = log_extensions.iter().map(|s| s.as_str()).collect();
 
-        let census = if scan_refs.is_empty() {
-            discovery::discover().await
-        } else {
-            debug!(paths = ?scan_refs, "using config-driven scan paths");
-            discovery::discover_with_paths(&scan_refs).await
-        };
+        debug!(paths = ?scan_refs, extensions = ?ext_refs, "using scan paths");
+        let census = discovery::discover_with_paths(&scan_refs, &ext_refs).await;
         let report = tracker.update_from_scan(&census);
         let package_report = if census.errors.contains_key("packages") {
             None
@@ -62,6 +61,7 @@ pub async fn run(
                     containers = stats.containers,
                     files = stats.files,
                     systemd = stats.systemd_services,
+                    event_log = stats.event_log_channels,
                     "discovery cache updated"
                 );
             }
@@ -305,6 +305,32 @@ async fn report_snapshot_data(client: &Client, census: &discovery::Census) {
             }
         }
     }
+
+    // Windows Event Log channels — re-asserted each scan (Rails upserts
+    // idempotently). Snapshot, not delta: channels rarely churn, and re-posting
+    // keeps last_seen_at fresh so reviewable channels don't age into "quiet"
+    // and drop out of the screener.
+    if !census.event_log_channels.is_empty() {
+        let payload = json!({
+            "channels": census.event_log_channels.iter().map(|c| json!({
+                "identifier": c.channel,
+                "channel": c.channel,
+                "record_count": c.record_count,
+            })).collect::<Vec<_>>(),
+        });
+        match client.report_event_log_inventory(&payload).await {
+            Ok(resp) => {
+                debug!(
+                    count = census.event_log_channels.len(),
+                    status = ?resp.status,
+                    "reported windows event log inventory"
+                );
+            }
+            Err(e) => {
+                warn!(error = %e, "failed to report windows event log inventory");
+            }
+        }
+    }
 }
 
 async fn report_package_lane(
@@ -345,14 +371,23 @@ async fn report_package_lane(
     }
 }
 
-/// Extract scan_paths from the unified config's discovery section.
+/// OS-aware default scan paths, used when config sets none.
+fn default_scan_paths() -> Vec<String> {
+    discovery::files::default_scan_paths()
+        .iter()
+        .map(|s| s.to_string())
+        .collect()
+}
+
+/// Extract scan_paths from the unified config's discovery section, falling back
+/// to OS-aware defaults when unset.
 async fn extract_scan_paths(shared_config: &SharedConfig) -> Vec<String> {
     let cfg = shared_config.read().await;
     let Some(unified) = cfg.as_ref() else {
-        return Vec::new();
+        return default_scan_paths();
     };
 
-    unified
+    let configured: Vec<String> = unified
         .raw
         .get("discovery")
         .and_then(|d| d.get("scan_paths"))
@@ -362,7 +397,47 @@ async fn extract_scan_paths(shared_config: &SharedConfig) -> Vec<String> {
                 .filter_map(|v| v.as_str().map(|s| s.to_string()))
                 .collect()
         })
-        .unwrap_or_default()
+        .unwrap_or_default();
+
+    if configured.is_empty() {
+        default_scan_paths()
+    } else {
+        configured
+    }
+}
+
+/// Extract the file-extension allowlist from the unified config's discovery
+/// section, falling back to the default `.log`-only allowlist when unset.
+async fn extract_log_extensions(shared_config: &SharedConfig) -> Vec<String> {
+    let default = || -> Vec<String> {
+        discovery::files::DEFAULT_LOG_EXTENSIONS
+            .iter()
+            .map(|s| s.to_string())
+            .collect()
+    };
+
+    let cfg = shared_config.read().await;
+    let Some(unified) = cfg.as_ref() else {
+        return default();
+    };
+
+    let configured: Vec<String> = unified
+        .raw
+        .get("discovery")
+        .and_then(|d| d.get("log_extensions"))
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    if configured.is_empty() {
+        default()
+    } else {
+        configured
+    }
 }
 
 #[cfg(test)]

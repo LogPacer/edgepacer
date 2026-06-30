@@ -9,12 +9,16 @@ use tokio::sync::RwLock;
 pub mod cache;
 pub mod cri;
 pub mod docker;
+pub mod event_log;
 pub mod files;
 pub mod kubernetes;
 pub mod packages;
 pub mod ports;
 pub mod processes;
 pub mod systemd;
+// Retained for a future service→Event-Log-provider mapping; no longer feeds the
+// discovery census (Windows services are not log sources — Event Log channels are).
+#[allow(dead_code)]
 pub mod windows_services;
 
 use serde::Serialize;
@@ -39,6 +43,8 @@ pub struct Census {
     pub containers: Vec<Container>,
     pub log_files: Vec<LogFile>,
     pub systemd_services: Vec<SystemdService>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub event_log_channels: Vec<EventLogChannel>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub processes: Vec<processes::Process>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -251,6 +257,10 @@ impl Container {
                 }
             }
             cache::AccessMethod::Journald => String::new(),
+            // A container never resolves to the Windows Event Log access method
+            // (determine_access_method only yields File/DockerApi/Journald/
+            // Kubernetes); this arm just keeps the match exhaustive.
+            cache::AccessMethod::WindowsEventLog => String::new(),
         }
     }
 }
@@ -325,6 +335,23 @@ impl SystemdService {
     }
 }
 
+/// A discovered Windows Event Log channel (Windows only). Curated to the
+/// records-bearing set so the review queue is not flooded with the ~1000
+/// mostly-empty channels `wevtutil el` lists.
+#[derive(Debug, Clone, Serialize)]
+pub struct EventLogChannel {
+    pub channel: String,
+    /// Records observed at discovery — drives the records-bearing curation and
+    /// is surfaced to Rails for the review queue.
+    pub record_count: u64,
+}
+
+impl EventLogChannel {
+    pub fn identifier(&self) -> &str {
+        &self.channel
+    }
+}
+
 /// Run a full discovery scan. Backends run in parallel; failures are best-effort.
 pub async fn discover() -> Census {
     let mut census = Census {
@@ -333,6 +360,10 @@ pub async fn discover() -> Census {
         collected_at: chrono::Utc::now().to_rfc3339(),
         ..Default::default()
     };
+
+    // No config scan paths: fall back to OS-aware defaults and the default
+    // `.log`-only extension allowlist.
+    let scan_paths = files::default_scan_paths();
 
     // Run discovery backends in parallel
     let (
@@ -344,17 +375,17 @@ pub async fn discover() -> Census {
         processes_result,
         ports_result,
         packages_result,
-        windows_services_result,
+        event_log_result,
     ) = tokio::join!(
         docker::discover_containers(),
-        files::discover_log_files(&["/var/log"]),
+        files::discover_log_files(scan_paths, files::DEFAULT_LOG_EXTENSIONS),
         systemd::discover_services(),
         kubernetes::discover_kubernetes_pods(),
         cri::discover_cri_containers(),
         processes::discover_processes(),
         ports::discover_ports(),
         packages::discover_packages(),
-        windows_services::discover_services(),
+        event_log::discover_channels(),
     );
 
     match docker_result {
@@ -412,16 +443,19 @@ pub async fn discover() -> Census {
         }
     }
 
-    match windows_services_result {
-        Ok(services) => {
-            debug!(count = services.len(), "discovered windows services");
-            census.systemd_services.extend(services);
+    match event_log_result {
+        Ok(channels) => {
+            debug!(
+                count = channels.len(),
+                "discovered windows event log channels"
+            );
+            census.event_log_channels = channels;
         }
         Err(e) => {
-            warn!(error = %e, "windows service discovery failed");
+            warn!(error = %e, "windows event log discovery failed");
             census
                 .errors
-                .insert("windows_services".into(), e.to_string());
+                .insert("event_log_channels".into(), e.to_string());
         }
     }
 
@@ -461,8 +495,8 @@ pub async fn discover() -> Census {
     census
 }
 
-/// Run discovery with custom scan paths for log files.
-pub async fn discover_with_paths(scan_paths: &[&str]) -> Census {
+/// Run discovery with custom scan paths and extension allowlist for log files.
+pub async fn discover_with_paths(scan_paths: &[&str], log_extensions: &[&str]) -> Census {
     let mut census = Census {
         os: std::env::consts::OS.to_string(),
         architecture: std::env::consts::ARCH.to_string(),
@@ -479,17 +513,17 @@ pub async fn discover_with_paths(scan_paths: &[&str]) -> Census {
         processes_result,
         ports_result,
         packages_result,
-        windows_services_result,
+        event_log_result,
     ) = tokio::join!(
         docker::discover_containers(),
-        files::discover_log_files(scan_paths),
+        files::discover_log_files(scan_paths, log_extensions),
         systemd::discover_services(),
         kubernetes::discover_kubernetes_pods(),
         cri::discover_cri_containers(),
         processes::discover_processes(),
         ports::discover_ports(),
         packages::discover_packages(),
-        windows_services::discover_services(),
+        event_log::discover_channels(),
     );
 
     match docker_result {
@@ -547,16 +581,19 @@ pub async fn discover_with_paths(scan_paths: &[&str]) -> Census {
         }
     }
 
-    match windows_services_result {
-        Ok(services) => {
-            debug!(count = services.len(), "discovered windows services");
-            census.systemd_services.extend(services);
+    match event_log_result {
+        Ok(channels) => {
+            debug!(
+                count = channels.len(),
+                "discovered windows event log channels"
+            );
+            census.event_log_channels = channels;
         }
         Err(e) => {
-            warn!(error = %e, "windows service discovery failed");
+            warn!(error = %e, "windows event log discovery failed");
             census
                 .errors
-                .insert("windows_services".into(), e.to_string());
+                .insert("event_log_channels".into(), e.to_string());
         }
     }
 
