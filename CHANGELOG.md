@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- Honor the control plane's `full_resync_required` census response on every
+  inventory lane (containers, services, files, journald, processes, ports,
+  Windows event logs, packages), not just packages. The flag now clears the
+  committed container/file/service maps so the next scan re-reports the full
+  inventory, healing orphaned control-plane rows without an agent restart. Any
+  lane's response carrying the one-shot flag resets all lanes.
+
 ## 0.1.10 - 2026-06-29
 
 - Accept OTLP trace ingestion over gRPC on a sibling `:4317` listener, alongside

@@ -68,7 +68,7 @@ pub async fn run(
         }
 
         if !report.is_empty() {
-            match report_inventory(client, &report).await {
+            match report_inventory(client, &mut tracker, &report).await {
                 Ok(()) => tracker.commit_scan(),
                 Err(e) => {
                     error!(error = %e, "failed to report inventory");
@@ -80,7 +80,7 @@ pub async fn run(
         }
 
         // Report volatile snapshot data separately from compacted inventory lanes.
-        report_snapshot_data(client, &census).await;
+        report_snapshot_data(client, &mut tracker, &census).await;
         if let Some(package_report) = package_report {
             report_package_lane(client, &mut tracker, &package_report).await;
         }
@@ -133,6 +133,7 @@ fn container_census_entry(c: &Container) -> serde_json::Value {
 /// Report inventory changes to Rails via type-specific endpoints.
 async fn report_inventory(
     client: &Client,
+    tracker: &mut ChangeTracker,
     report: &InventoryReport,
 ) -> Result<(), crate::common::EdgepacerError> {
     // Server identity comes from the access token, not the request body.
@@ -178,6 +179,9 @@ async fn report_inventory(
                     status = ?resp.status,
                     "reported service inventory"
                 );
+                if resp.full_resync_required.unwrap_or(false) {
+                    tracker.require_full_resync();
+                }
             }
             Err(e) => {
                 warn!(error = %e, "failed to report service inventory");
@@ -202,6 +206,9 @@ async fn report_inventory(
                     status = ?resp.status,
                     "reported container inventory"
                 );
+                if resp.full_resync_required.unwrap_or(false) {
+                    tracker.require_full_resync();
+                }
             }
             Err(e) => {
                 warn!(error = %e, "failed to report container inventory");
@@ -233,6 +240,9 @@ async fn report_inventory(
                     status = ?resp.status,
                     "reported file inventory"
                 );
+                if resp.full_resync_required.unwrap_or(false) {
+                    tracker.require_full_resync();
+                }
             }
             Err(e) => {
                 warn!(error = %e, "failed to report file inventory");
@@ -263,6 +273,9 @@ async fn report_inventory(
                     status = ?resp.status,
                     "reported journald inventory"
                 );
+                if resp.full_resync_required.unwrap_or(false) {
+                    tracker.require_full_resync();
+                }
             }
             Err(e) => {
                 warn!(error = %e, "failed to report journald inventory");
@@ -275,7 +288,17 @@ async fn report_inventory(
 }
 
 /// Report volatile snapshot inventory (processes, ports) — full replacement, no delta tracking.
-async fn report_snapshot_data(client: &Client, census: &discovery::Census) {
+///
+/// These lanes POST every cycle regardless of whether the delta lanes changed,
+/// so they are the reliable channel for the control plane to hand a quiet agent
+/// its one-shot `full_resync_required` — the delta lanes in `report_inventory`
+/// are skipped entirely when nothing changed, which is exactly when orphaned
+/// rows persist. Honoring the flag here resets every delta lane.
+async fn report_snapshot_data(
+    client: &Client,
+    tracker: &mut ChangeTracker,
+    census: &discovery::Census,
+) {
     // Processes
     if !census.processes.is_empty() {
         let payload = json!({
@@ -284,6 +307,9 @@ async fn report_snapshot_data(client: &Client, census: &discovery::Census) {
         match client.report_process_inventory(&payload).await {
             Ok(resp) => {
                 debug!(count = census.processes.len(), status = ?resp.status, "reported process inventory");
+                if resp.full_resync_required.unwrap_or(false) {
+                    tracker.require_full_resync();
+                }
             }
             Err(e) => {
                 warn!(error = %e, "failed to report process inventory");
@@ -299,6 +325,9 @@ async fn report_snapshot_data(client: &Client, census: &discovery::Census) {
         match client.report_port_inventory(&payload).await {
             Ok(resp) => {
                 debug!(count = census.listening_ports.len(), status = ?resp.status, "reported port inventory");
+                if resp.full_resync_required.unwrap_or(false) {
+                    tracker.require_full_resync();
+                }
             }
             Err(e) => {
                 warn!(error = %e, "failed to report port inventory");
@@ -325,6 +354,9 @@ async fn report_snapshot_data(client: &Client, census: &discovery::Census) {
                     status = ?resp.status,
                     "reported windows event log inventory"
                 );
+                if resp.full_resync_required.unwrap_or(false) {
+                    tracker.require_full_resync();
+                }
             }
             Err(e) => {
                 warn!(error = %e, "failed to report windows event log inventory");
@@ -359,7 +391,10 @@ async fn report_package_lane(
             );
 
             if resp.full_resync_required.unwrap_or(false) {
-                tracker.require_package_full_resync();
+                // Any lane's flag clears every lane, not just packages — the
+                // control plane sets one one-shot and can stamp it on whichever
+                // census response reaches the agent first.
+                tracker.require_full_resync();
             } else {
                 tracker.commit_package_scan();
             }
@@ -574,5 +609,109 @@ mod tests {
                 "pod_name must never be reported"
             );
         }
+    }
+
+    fn plain_container(id: &str) -> Container {
+        Container {
+            id: id.into(),
+            name: id.into(),
+            service_name: String::new(),
+            service_name_explicit: false,
+            image: "nginx:latest".into(),
+            state: "running".into(),
+            labels: Default::default(),
+            env: vec![],
+            runtime: "docker".into(),
+            log_path: String::new(),
+            pod_uid: String::new(),
+            pod_name: String::new(),
+            namespace: String::new(),
+            node_name: String::new(),
+            deployment: String::new(),
+            workload_kind: String::new(),
+            container_id: id.into(),
+            container_name: String::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn container_census_full_resync_response_forces_re_report() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/v1/census/containers"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "status": "accepted",
+                "full_resync_required": true
+            })))
+            .mount(&server)
+            .await;
+
+        let config = test_app_config(server.uri());
+        let client = Client::new_for_test(&config, "installation-1").unwrap();
+        client.set_bearer_token("access-1");
+        let mut tracker = ChangeTracker::new();
+
+        let census = discovery::Census {
+            containers: vec![plain_container("abc123")],
+            ..Default::default()
+        };
+
+        // First cycle: report the new container; the server demands a resync.
+        let report = tracker.update_from_scan(&census);
+        assert!(!report.is_empty());
+        report_inventory(&client, &mut tracker, &report)
+            .await
+            .unwrap();
+        // The caller commits on success — the resync must survive it.
+        tracker.commit_scan();
+
+        // The unchanged next scan re-emits the container as new.
+        let next = tracker.update_from_scan(&census);
+        assert_eq!(next.new_containers.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn process_snapshot_full_resync_response_resets_delta_lanes() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/v1/census/processes"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "status": "accepted",
+                "full_resync_required": true
+            })))
+            .mount(&server)
+            .await;
+
+        let config = test_app_config(server.uri());
+        let client = Client::new_for_test(&config, "installation-1").unwrap();
+        client.set_bearer_token("access-1");
+        let mut tracker = ChangeTracker::new();
+
+        // Commit a container baseline, then confirm the lane is quiet.
+        let census = discovery::Census {
+            containers: vec![plain_container("abc123")],
+            ..Default::default()
+        };
+        let _ = tracker.update_from_scan(&census);
+        tracker.commit_scan();
+        assert!(tracker.update_from_scan(&census).is_empty());
+        tracker.commit_scan();
+
+        // A quiet agent skips the delta lanes but still POSTs processes every
+        // cycle — the flag rides that response and must reset the delta lanes.
+        let snapshot = discovery::Census {
+            processes: vec![crate::discovery::processes::Process {
+                pid: 1,
+                user: "root".into(),
+                cpu: "0.0".into(),
+                mem: "0.0".into(),
+                command: "init".into(),
+            }],
+            ..Default::default()
+        };
+        report_snapshot_data(&client, &mut tracker, &snapshot).await;
+
+        let next = tracker.update_from_scan(&census);
+        assert_eq!(next.new_containers.len(), 1);
     }
 }
