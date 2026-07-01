@@ -95,6 +95,7 @@ impl Container {
     /// - K8s: namespace/deployment/container_name (survives pod restarts)
     /// - Compose: project/service
     /// - Swarm: stack/service
+    /// - Kamal: service-destination (role-agnostic; web + rpc share one workload)
     /// - Standalone Docker: container name
     pub fn stable_id(&self) -> String {
         // Kubernetes: namespace/deployment/container_name (spec name, not pod-prefixed)
@@ -129,6 +130,15 @@ impl Container {
             return service.clone();
         }
 
+        // Kamal: service-destination. Kamal always sets `service` + `destination`,
+        // and the identity is role-agnostic so web + rpc collapse to one workload.
+        // The container name embeds the deploy git SHA, so it can't be the id.
+        if let (Some(service), Some(destination)) =
+            (self.labels.get("service"), self.labels.get("destination"))
+        {
+            return format!("{}-{}", service, destination);
+        }
+
         // Standalone Docker / other: container name
         self.name.clone()
     }
@@ -151,6 +161,8 @@ impl Container {
     ///   else parsed from the container name `project-service-N`)
     /// - Docker Swarm: `stack/service/<slot>` (slot from the swarm task name
     ///   `service.slot.taskid`)
+    /// - Kamal: `service-role-destination` — stable across deploys (the container
+    ///   name embeds the git SHA); falls back to `service-destination` without a role
     /// - Standalone Docker / other: the container name (a single instance)
     pub fn stable_instance_id(&self) -> String {
         // Kubernetes. The per-instance id extends stable_id (namespace/workload/
@@ -204,6 +216,19 @@ impl Container {
             return match stack {
                 Some(stack) => format!("{}/{}", stack, service),
                 None => service.clone(),
+            };
+        }
+
+        // Kamal: service-role-destination — a per-role instance that survives a
+        // redeploy, since the container name embeds the deploy git SHA. `service`
+        // + `destination` are always set; `role` separates web from rpc, and when
+        // it's absent the instance collapses to the `service-destination` workload.
+        if let (Some(service), Some(destination)) =
+            (self.labels.get("service"), self.labels.get("destination"))
+        {
+            return match self.labels.get("role") {
+                Some(role) => format!("{}-{}-{}", service, role, destination),
+                None => format!("{}-{}", service, destination),
             };
         }
 
@@ -823,6 +848,59 @@ mod tests {
         c.container_name = "api".into();
         c.pod_name = "api-7b4f9c8d5-xyz".into();
         assert_eq!(c.stable_instance_id(), "prod/api/api");
+        assert_eq!(c.stable_instance_id(), c.stable_id());
+    }
+
+    fn make_kamal_container(role: &str, name: &str) -> Container {
+        let mut c = make_container(name);
+        c.labels.insert("service".into(), "logpacer".into());
+        c.labels.insert("role".into(), role.into());
+        c.labels.insert("destination".into(), "prod".into());
+        c
+    }
+
+    #[test]
+    fn stable_id_kamal_is_service_destination() {
+        let c = make_kamal_container("web", "logpacer-web-prod-1a2b3c4");
+        assert_eq!(c.stable_id(), "logpacer-prod");
+    }
+
+    #[test]
+    fn stable_instance_id_kamal_is_service_role_destination() {
+        let c = make_kamal_container("web", "logpacer-web-prod-1a2b3c4");
+        assert_eq!(c.stable_instance_id(), "logpacer-web-prod");
+    }
+
+    #[test]
+    fn stable_kamal_ids_survive_a_redeploy_to_a_new_sha() {
+        // Same labels, new container name (the git SHA moved) — ids must not move.
+        let before = make_kamal_container("web", "logpacer-web-prod-1a2b3c4");
+        let after = make_kamal_container("web", "logpacer-web-prod-9f8e7d6");
+        assert_eq!(before.stable_id(), after.stable_id());
+        assert_eq!(before.stable_instance_id(), after.stable_instance_id());
+    }
+
+    #[test]
+    fn stable_instance_id_kamal_rpc_role() {
+        let c = make_kamal_container("rpc", "logpacer-rpc-prod-1a2b3c4");
+        assert_eq!(c.stable_instance_id(), "logpacer-rpc-prod");
+    }
+
+    #[test]
+    fn kamal_web_and_rpc_share_workload_but_differ_per_role() {
+        let web = make_kamal_container("web", "logpacer-web-prod-1a2b3c4");
+        let rpc = make_kamal_container("rpc", "logpacer-rpc-prod-1a2b3c4");
+        // Same workload — web + rpc collapse to one stable_id.
+        assert_eq!(web.stable_id(), rpc.stable_id());
+        // Distinct per-role instances.
+        assert_ne!(web.stable_instance_id(), rpc.stable_instance_id());
+    }
+
+    #[test]
+    fn stable_instance_id_kamal_without_role_falls_back_to_workload() {
+        let mut c = make_kamal_container("web", "logpacer-prod-1a2b3c4");
+        c.labels.remove("role");
+        assert_eq!(c.stable_instance_id(), "logpacer-prod");
         assert_eq!(c.stable_instance_id(), c.stable_id());
     }
 }
