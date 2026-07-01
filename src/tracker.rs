@@ -362,6 +362,29 @@ impl ChangeTracker {
         self.force_package_full_snapshot = true;
         debug!("package lane full resync requested");
     }
+
+    /// Force a full re-report of every inventory lane on the next cycle.
+    ///
+    /// The control plane sets this one-shot when a lane's rows have drifted from
+    /// the agent's committed view — an orphaned row that delta census never
+    /// re-mentions and so only heals on agent restart. Clearing the committed
+    /// container/file/service maps makes the next `update_from_scan` re-emit
+    /// every entry as `new_*`; `require_package_full_resync` forces the next
+    /// package report to a full snapshot.
+    ///
+    /// Pending state is dropped so a `commit_scan` later in the same cycle can't
+    /// silently repopulate the maps we just cleared. Idempotent: safe to call
+    /// for every lane response that carries the flag within one cycle.
+    pub fn require_full_resync(&mut self) {
+        self.committed_containers.clear();
+        self.committed_files.clear();
+        self.committed_services.clear();
+        self.pending_containers = None;
+        self.pending_files = None;
+        self.pending_services = None;
+        self.require_package_full_resync();
+        debug!("full inventory resync requested");
+    }
 }
 
 fn package_events(
@@ -542,6 +565,18 @@ mod tests {
             permissions: "644".into(),
             format: "plain_text".into(),
             line_count: 100,
+        }
+    }
+
+    fn make_service(name: &str) -> SystemdService {
+        SystemdService {
+            name: name.into(),
+            load_state: "loaded".into(),
+            active_state: "active".into(),
+            sub_state: "running".into(),
+            description: String::new(),
+            service_name: String::new(),
+            main_pid: 0,
         }
     }
 
@@ -906,5 +941,65 @@ mod tests {
         });
 
         assert!(report.stopped_containers.is_empty());
+    }
+
+    #[test]
+    fn require_full_resync_re_emits_every_lane_as_new() {
+        let mut tracker = ChangeTracker::new();
+        let census = Census {
+            containers: vec![make_container("abc123", "running")],
+            log_files: vec![make_log_file("/var/log/app.log")],
+            systemd_services: vec![make_service("nginx.service")],
+            installed_packages: vec![make_package("apt", "nginx", "1.18.0")],
+            ..Default::default()
+        };
+
+        // Establish a committed baseline for every lane.
+        let _ = tracker.update_from_scan(&census);
+        tracker.commit_scan();
+        let _ = tracker.update_packages_from_scan("agent-1", &census.installed_packages);
+        tracker.commit_package_scan();
+
+        // Steady state: an unchanged scan reports nothing new.
+        assert!(tracker.update_from_scan(&census).is_empty());
+        tracker.commit_scan();
+
+        tracker.require_full_resync();
+
+        // A commit that lands after the resync must not repopulate the cleared
+        // maps — the next unchanged scan re-emits every entry as new.
+        let report = tracker.update_from_scan(&census);
+        assert_eq!(report.new_containers.len(), 1);
+        assert_eq!(report.new_files.len(), 1);
+        assert_eq!(report.new_services.len(), 1);
+        assert!(report.stopped_containers.is_empty());
+        assert!(report.stopped_files.is_empty());
+        assert!(report.stopped_services.is_empty());
+
+        let package_report =
+            tracker.update_packages_from_scan("agent-1", &census.installed_packages);
+        assert!(package_report.full_snapshot);
+        assert_eq!(package_report.upsert_count, 1);
+    }
+
+    #[test]
+    fn require_full_resync_is_idempotent_within_a_cycle() {
+        let mut tracker = ChangeTracker::new();
+        let census = Census {
+            containers: vec![make_container("abc123", "running")],
+            ..Default::default()
+        };
+        let _ = tracker.update_from_scan(&census);
+        tracker.commit_scan();
+
+        // Multiple lane responses can carry the flag in one cycle; repeating the
+        // call must stay harmless.
+        tracker.require_full_resync();
+        tracker.require_full_resync();
+        // A late commit is a no-op because pending was dropped.
+        tracker.commit_scan();
+
+        let report = tracker.update_from_scan(&census);
+        assert_eq!(report.new_containers.len(), 1);
     }
 }
