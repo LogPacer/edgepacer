@@ -44,7 +44,7 @@ serde_json = "1"
 # Windows Event schema as XML; we map it to structured JSON on the wire. Pulled
 # in unconditionally (the parse is pure and unit-tested on every platform); the
 # live wevtutil query stays Windows-only.
-quick-xml = "0.40"
+quick-xml = "0.41"
 
 # Shared #[repr(C)] BPF event layout (LogChunk / ConnectEvent / CHUNK_LEN) — one
 # source of truth shared with the kernel BPF crate (bpf/). Pulled only by `ebpf`.
