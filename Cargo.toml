@@ -21,12 +21,18 @@ tokio = { version = "1", features = ["full"] }
 # HTTP client
 reqwest = { version = "0.12", features = [
     "json",
-    # Bundled Mozilla roots, not the OS store: Windows fetches root CAs on demand
-    # (schannel), so rustls-native-roots intermittently fails the first GitHub
-    # release download with UnknownIssuer until the store is warmed. webpki-roots
-    # ships the roots in the binary — GitHub, Let's Encrypt, and our infra all
-    # chain to public CAs in Mozilla's set.
+    # BOTH root sets — they merge into one trust store:
+    # - webpki-roots ships Mozilla's roots in the binary, so the first GitHub
+    #   release download verifies even when Windows' on-demand cert store
+    #   (schannel) is cold (it intermittently failed UnknownIssuer with
+    #   native roots alone until the store was warmed).
+    # - native-roots adds the OS trust store on top, so endpoints signed by a
+    #   private CA (enterprise TLS-intercepting proxies, dev-machine CAs)
+    #   verify too. webpki alone made every private-CA endpoint UnknownIssuer.
+    # A cold/failed native load degrades gracefully: the bundled webpki roots
+    # are already in the store, so public-CA endpoints keep working.
     "rustls-tls-webpki-roots",
+    "rustls-tls-native-roots",
     "stream",
 ], default-features = false }
 
