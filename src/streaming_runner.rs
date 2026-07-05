@@ -50,6 +50,7 @@ pub async fn run_streaming_reader(
                     container_id,
                     &config.log_source_id,
                     since,
+                    config.multiline.as_ref(),
                     &mut shutdown,
                 )
                 .await;
@@ -61,6 +62,7 @@ pub async fn run_streaming_reader(
                     unit,
                     &config.log_source_id,
                     cursor,
+                    config.multiline.as_ref(),
                     &mut shutdown,
                 )
                 .await;
@@ -74,6 +76,7 @@ pub async fn run_streaming_reader(
                     channel,
                     &config.log_source_id,
                     record_id,
+                    config.multiline.as_ref(),
                     &mut shutdown,
                 )
                 .await;

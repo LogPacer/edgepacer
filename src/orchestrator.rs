@@ -387,6 +387,7 @@ impl Orchestrator {
                 &source_dir,
                 shipper,
                 self.pipeline_config(),
+                stream.multiline.as_ref(),
                 &stream.log_source_id,
                 self.overflow.clone(),
             )?

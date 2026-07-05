@@ -48,6 +48,7 @@ pub(crate) mod sqlite_sequence_buffer;
 pub mod stats;
 pub mod streaming_actor;
 pub mod streaming_checkpoint;
+mod streaming_multiline;
 pub mod streaming_pipeline;
 mod streaming_runner;
 pub mod tailer;

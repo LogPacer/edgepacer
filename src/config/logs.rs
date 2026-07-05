@@ -335,6 +335,7 @@ fn streaming_source(
         archive_id: stream.archive_id.clone(),
         repo_id: stream.repo_id.clone(),
         stamp_resource_identifier: stream.stamp_resource_identifier,
+        multiline: stream.multiline.clone(),
         config_hash: stream.config_hash.clone(),
     }
 }
@@ -546,7 +547,12 @@ mod tests {
                     "matching_strategy": "container_name",
                     "subbox_endpoint": "https://collect.example.com/wire",
                     "archive_id": "arc_stream",
-                    "repo_id": "repo_stream"
+                    "repo_id": "repo_stream",
+                    "multiline": {
+                        "start_pattern": "^\\d{4}-\\d{2}-\\d{2}",
+                        "max_lines": 500,
+                        "timeout_seconds": 5
+                    }
                 }
             }
         }));
@@ -588,6 +594,16 @@ mod tests {
         assert_eq!(stream.endpoint, "https://collect.example.com/wire");
         assert_eq!(stream.archive_id, "arc_stream");
         assert_eq!(stream.repo_id, "repo_stream");
+        assert_eq!(
+            stream.multiline.as_ref().map(|config| {
+                (
+                    config.start_pattern.as_str(),
+                    config.max_lines,
+                    config.timeout_secs,
+                )
+            }),
+            Some((r"^\d{4}-\d{2}-\d{2}", 500, 5))
+        );
     }
 
     #[test]

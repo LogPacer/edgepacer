@@ -189,6 +189,7 @@ impl DeliveryPipeline {
         data_dir: &Path,
         shipper: Shipper,
         config: PipelineConfig,
+        multiline: Option<&MultilineConfig>,
         source_id: &str,
         overflow: Option<Arc<SharedOverflow>>,
     ) -> Result<Self, PipelineError> {
@@ -197,7 +198,7 @@ impl DeliveryPipeline {
             data_dir,
             shipper,
             config,
-            multiline: None,
+            multiline,
             source_id,
             overflow,
             kubernetes: true,

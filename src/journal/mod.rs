@@ -12,7 +12,15 @@ mod native;
 
 use tokio::sync::watch;
 
+use crate::config::MultilineConfig;
 use crate::streaming_actor::StreamHandle;
+
+#[cfg(target_os = "linux")]
+use crate::streaming_multiline::StreamingEntryAssembler;
+#[cfg(target_os = "linux")]
+use std::time::Duration;
+#[cfg(target_os = "linux")]
+use tokio::time::MissedTickBehavior;
 
 pub use unit::is_systemd_unit;
 
@@ -47,15 +55,16 @@ pub async fn stream_unit_logs(
     unit: &str,
     source_id: &str,
     resume_cursor: Option<&str>,
+    multiline: Option<&MultilineConfig>,
     shutdown: &mut watch::Receiver<bool>,
 ) {
     #[cfg(target_os = "linux")]
     {
-        stream_unit_logs_native(handle, unit, source_id, resume_cursor, shutdown).await;
+        stream_unit_logs_native(handle, unit, source_id, resume_cursor, multiline, shutdown).await;
     }
 
     #[cfg(not(target_os = "linux"))]
-    fallback::stream_unit_logs(handle, unit, source_id, resume_cursor, shutdown).await;
+    fallback::stream_unit_logs(handle, unit, source_id, resume_cursor, multiline, shutdown).await;
 }
 
 #[cfg(target_os = "linux")]
@@ -64,6 +73,7 @@ async fn stream_unit_logs_native(
     unit: &str,
     source_id: &str,
     resume_cursor: Option<&str>,
+    multiline: Option<&MultilineConfig>,
     shutdown: &mut watch::Receiver<bool>,
 ) {
     let (tx, mut rx) = tokio::sync::mpsc::channel::<Result<StreamEntry, String>>(256);
@@ -71,6 +81,17 @@ async fn stream_unit_logs_native(
     let source_id_owned = source_id.to_string();
     let resume_owned = resume_cursor.map(|s| s.to_string());
     let shutdown_thread = shutdown.clone();
+
+    let mut assembler = match StreamingEntryAssembler::new(multiline) {
+        Ok(assembler) => assembler,
+        Err(error) => {
+            tracing::error!(unit, source_id, error = %error, "invalid journald multiline pattern");
+            return;
+        }
+    };
+    let mut assembler_tick = tokio::time::interval(Duration::from_secs(1));
+    assembler_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    assembler_tick.tick().await;
 
     let reader = std::thread::spawn(move || {
         native::stream_unit_blocking(&unit_owned, resume_owned.as_deref(), tx, shutdown_thread);
@@ -86,6 +107,29 @@ async fn stream_unit_logs_native(
             _ = shutdown.changed() => {
                 break;
             }
+            _ = assembler_tick.tick() => {
+                match assembler.check_timeout(handle).await {
+                    Ok(emit) => {
+                        if !native::record_emit(
+                            handle,
+                            source_id,
+                            &mut entries_processed,
+                            &mut last_cursor,
+                            checkpoint_interval,
+                            emit,
+                        )
+                        .await
+                        {
+                            tracing::warn!(unit, "streaming pipeline actor gone, stopping journald stream");
+                            break;
+                        }
+                    }
+                    Err(_) => {
+                        tracing::warn!(unit, "streaming pipeline actor gone, stopping journald stream");
+                        break;
+                    }
+                }
+            }
             entry = rx.recv() => {
                 match entry {
                     Some(Ok(entry)) => {
@@ -95,6 +139,7 @@ async fn stream_unit_logs_native(
                             &mut entries_processed,
                             &mut last_cursor,
                             checkpoint_interval,
+                            &mut assembler,
                             entry,
                         )
                         .await
@@ -117,8 +162,44 @@ async fn stream_unit_logs_native(
     let _ = reader.join();
 
     if use_fallback {
-        fallback::stream_unit_logs(handle, unit, &source_id_owned, resume_cursor, shutdown).await;
+        fallback::stream_unit_logs(
+            handle,
+            unit,
+            &source_id_owned,
+            resume_cursor,
+            multiline,
+            shutdown,
+        )
+        .await;
         return;
+    }
+
+    match assembler.flush(handle).await {
+        Ok(emit) => {
+            if !native::record_emit(
+                handle,
+                source_id,
+                &mut entries_processed,
+                &mut last_cursor,
+                checkpoint_interval,
+                emit,
+            )
+            .await
+            {
+                tracing::warn!(
+                    unit,
+                    "streaming pipeline actor gone, stopping journald stream"
+                );
+                return;
+            }
+        }
+        Err(_) => {
+            tracing::warn!(
+                unit,
+                "streaming pipeline actor gone, stopping journald stream"
+            );
+            return;
+        }
     }
 
     native::finalize_stream(

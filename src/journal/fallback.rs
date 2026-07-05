@@ -6,10 +6,16 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
 use tokio::sync::watch;
+use tokio::time::MissedTickBehavior;
 use tracing::{debug, error, info, warn};
 
+use crate::config::MultilineConfig;
 use crate::streaming_actor::StreamHandle;
 use crate::streaming_checkpoint::StreamingCheckpoint;
+use crate::streaming_multiline::{StreamingEmit, StreamingEntryAssembler};
+
+const CHECKPOINT_INTERVAL: u64 = 100;
+const ASSEMBLER_CHECK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// Pull the most recent `max_lines` from journald for a systemd unit via journalctl.
 pub fn sample_unit_lines(unit: &str, max_lines: usize) -> Result<Vec<String>, String> {
@@ -48,6 +54,7 @@ pub async fn stream_unit_logs(
     unit: &str,
     source_id: &str,
     resume_cursor: Option<&str>,
+    multiline: Option<&MultilineConfig>,
     shutdown: &mut watch::Receiver<bool>,
 ) {
     let mut args = vec![
@@ -96,9 +103,19 @@ pub async fn stream_unit_logs(
     };
 
     let mut reader = BufReader::new(stdout).lines();
+    let mut assembler = match StreamingEntryAssembler::new(multiline) {
+        Ok(assembler) => assembler,
+        Err(error) => {
+            error!(unit, source_id, error = %error, "invalid journald multiline pattern");
+            return;
+        }
+    };
+    let mut assembler_tick = tokio::time::interval(ASSEMBLER_CHECK_INTERVAL);
+    assembler_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    assembler_tick.tick().await;
+
     let mut entries_processed: u64 = 0;
     let mut last_cursor: Option<String> = None;
-    let checkpoint_interval = 100u64;
 
     loop {
         tokio::select! {
@@ -115,29 +132,32 @@ pub async fn stream_unit_logs(
                             .unwrap_or_default()
                             .as_nanos() as i64;
 
-                        // Backpressure is the bounded channel: this awaits
-                        // until the actor has room. False means the actor is
-                        // gone — stop streaming.
-                        if !handle.enqueue(message.into_bytes(), now_ns).await {
-                            warn!(unit, "streaming pipeline actor gone, stopping journald stream");
-                            break;
-                        }
+                        let checkpoint = cursor
+                            .as_deref()
+                            .map(|cursor| StreamingCheckpoint::journald(source_id, cursor));
 
-                        if let Some(c) = cursor {
-                            last_cursor = Some(c);
-                        }
-
-                        entries_processed += 1;
-
-                        if entries_processed.is_multiple_of(checkpoint_interval) {
-                            if let Some(ref cursor) = last_cursor {
-                                let _ = handle
-                                    .set_checkpoint(StreamingCheckpoint::journald(
-                                        source_id, cursor,
-                                    ))
-                                    .await;
+                        match assembler
+                            .process_line(handle, message.into_bytes(), now_ns, checkpoint)
+                            .await
+                        {
+                            Ok(emit) => {
+                                if !record_emit(
+                                    handle,
+                                    unit,
+                                    source_id,
+                                    &mut entries_processed,
+                                    &mut last_cursor,
+                                    emit,
+                                )
+                                .await
+                                {
+                                    break;
+                                }
                             }
-                            debug!(unit, entries = entries_processed, "journald stream progress");
+                            Err(_) => {
+                                warn!(unit, "streaming pipeline actor gone, stopping journald stream");
+                                break;
+                            }
                         }
                     }
                     Ok(None) => {
@@ -150,10 +170,56 @@ pub async fn stream_unit_logs(
                     }
                 }
             }
+            _ = assembler_tick.tick() => {
+                match assembler.check_timeout(handle).await {
+                    Ok(emit) => {
+                        if !record_emit(
+                            handle,
+                            unit,
+                            source_id,
+                            &mut entries_processed,
+                            &mut last_cursor,
+                            emit,
+                        )
+                        .await
+                        {
+                            break;
+                        }
+                    }
+                    Err(_) => {
+                        warn!(unit, "streaming pipeline actor gone, stopping journald stream");
+                        break;
+                    }
+                }
+            }
             _ = shutdown.changed() => {
                 info!(unit, "journald stream shutdown signal");
                 break;
             }
+        }
+    }
+
+    match assembler.flush(handle).await {
+        Ok(emit) => {
+            if !record_emit(
+                handle,
+                unit,
+                source_id,
+                &mut entries_processed,
+                &mut last_cursor,
+                emit,
+            )
+            .await
+            {
+                return;
+            }
+        }
+        Err(_) => {
+            warn!(
+                unit,
+                "streaming pipeline actor gone, stopping journald stream"
+            );
+            return;
         }
     }
 
@@ -172,6 +238,48 @@ pub async fn stream_unit_logs(
         backend = "journalctl",
         "journald log streaming stopped"
     );
+}
+
+async fn record_emit(
+    handle: &StreamHandle,
+    unit: &str,
+    source_id: &str,
+    entries_processed: &mut u64,
+    last_cursor: &mut Option<String>,
+    emit: Option<StreamingEmit>,
+) -> bool {
+    let Some(emit) = emit else {
+        return true;
+    };
+
+    *entries_processed += 1;
+
+    if let Some(checkpoint) = emit.checkpoint
+        && let Some(cursor) = checkpoint.journald_cursor()
+    {
+        *last_cursor = Some(cursor.to_string());
+    }
+
+    if entries_processed.is_multiple_of(CHECKPOINT_INTERVAL) {
+        if let Some(cursor) = last_cursor.as_deref()
+            && !handle
+                .set_checkpoint(StreamingCheckpoint::journald(source_id, cursor))
+                .await
+        {
+            warn!(
+                unit,
+                "streaming pipeline actor gone, stopping journald stream"
+            );
+            return false;
+        }
+        debug!(
+            unit,
+            entries = *entries_processed,
+            "journald stream progress"
+        );
+    }
+
+    true
 }
 
 /// Parse a journald JSON entry to extract `__CURSOR` and `MESSAGE`.
