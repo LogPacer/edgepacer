@@ -12,10 +12,13 @@ use quick_xml::reader::Reader;
 use serde_json::{Map, Value, json};
 use tokio::process::Command;
 use tokio::sync::{Semaphore, watch};
+use tokio::time::MissedTickBehavior;
 use tracing::{debug, info, warn};
 
+use crate::config::MultilineConfig;
 use crate::streaming_actor::StreamHandle;
 use crate::streaming_checkpoint::StreamingCheckpoint;
+use crate::streaming_multiline::{StreamingEmit, StreamingEntryAssembler};
 
 const POLL_INTERVAL: Duration = Duration::from_secs(1);
 const QUERY_LIMIT: usize = 100;
@@ -41,6 +44,7 @@ pub async fn stream_event_log(
     channel: &str,
     source_id: &str,
     resume_record_id: Option<u64>,
+    multiline: Option<&MultilineConfig>,
     shutdown: &mut watch::Receiver<bool>,
 ) {
     let started_from_tail = resume_record_id.is_none();
@@ -80,13 +84,52 @@ pub async fn stream_event_log(
         return;
     }
 
+    let mut assembler = match StreamingEntryAssembler::new(multiline) {
+        Ok(assembler) => assembler,
+        Err(error) => {
+            warn!(channel, source_id, error = %error, "invalid Windows Event Log multiline pattern");
+            return;
+        }
+    };
+    let mut assembler_tick = tokio::time::interval(POLL_INTERVAL);
+    assembler_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    assembler_tick.tick().await;
+
     let mut entries_processed = 0u64;
+    let mut last_checkpoint = Some(StreamingCheckpoint::windows_event_log(
+        source_id,
+        channel,
+        last_record_id,
+    ));
 
     loop {
         tokio::select! {
             _ = shutdown.changed() => {
                 info!(channel, source_id, "Windows Event Log stream shutdown signal");
                 break;
+            }
+            _ = assembler_tick.tick() => {
+                match assembler.check_timeout(handle).await {
+                    Ok(emit) => {
+                        if !record_emit(
+                            handle,
+                            channel,
+                            source_id,
+                            &mut entries_processed,
+                            &mut last_checkpoint,
+                            &mut last_record_id,
+                            emit,
+                        )
+                        .await
+                        {
+                            return;
+                        }
+                    }
+                    Err(_) => {
+                        warn!(channel, "streaming pipeline actor gone, stopping Windows Event Log stream");
+                        return;
+                    }
+                }
             }
             _ = tokio::time::sleep(POLL_INTERVAL) => {
                 let records = match query_records_after(channel, last_record_id, QUERY_LIMIT).await {
@@ -103,49 +146,73 @@ pub async fn stream_event_log(
                         .unwrap_or_default()
                         .as_nanos() as i64;
 
-                    if !handle.enqueue(record.json, now_ns).await {
-                        warn!(channel, "streaming pipeline actor gone, stopping Windows Event Log stream");
-                        handle
-                            .set_final_checkpoint(StreamingCheckpoint::windows_event_log(
-                                source_id,
-                                channel,
-                                last_record_id,
-                            ))
-                            .await;
-                        return;
-                    }
+                    let checkpoint = StreamingCheckpoint::windows_event_log(
+                        source_id,
+                        channel,
+                        record.record_id,
+                    );
 
-                    last_record_id = last_record_id.max(record.record_id);
-                    entries_processed += 1;
-
-                    if entries_processed.is_multiple_of(CHECKPOINT_INTERVAL) {
-                        let _ = handle
-                            .set_checkpoint(StreamingCheckpoint::windows_event_log(
-                                source_id,
+                    match assembler
+                        .process_line(handle, record.json, now_ns, Some(checkpoint))
+                        .await
+                    {
+                        Ok(emit) => {
+                            last_record_id = last_record_id.max(record.record_id);
+                            if !record_emit(
+                                handle,
                                 channel,
-                                last_record_id,
-                            ))
-                            .await;
-                        debug!(
-                            channel,
-                            source_id,
-                            entries = entries_processed,
-                            record_id = last_record_id,
-                            "Windows Event Log stream progress"
-                        );
+                                source_id,
+                                &mut entries_processed,
+                                &mut last_checkpoint,
+                                &mut last_record_id,
+                                emit,
+                            )
+                            .await
+                            {
+                                return;
+                            }
+                        }
+                        Err(_) => {
+                            warn!(channel, "streaming pipeline actor gone, stopping Windows Event Log stream");
+                            if let Some(checkpoint) = last_checkpoint {
+                                handle.set_final_checkpoint(checkpoint).await;
+                            }
+                            return;
+                        }
                     }
                 }
             }
         }
     }
 
-    handle
-        .set_final_checkpoint(StreamingCheckpoint::windows_event_log(
-            source_id,
-            channel,
-            last_record_id,
-        ))
-        .await;
+    match assembler.flush(handle).await {
+        Ok(emit) => {
+            if !record_emit(
+                handle,
+                channel,
+                source_id,
+                &mut entries_processed,
+                &mut last_checkpoint,
+                &mut last_record_id,
+                emit,
+            )
+            .await
+            {
+                return;
+            }
+        }
+        Err(_) => {
+            warn!(
+                channel,
+                "streaming pipeline actor gone, stopping Windows Event Log stream"
+            );
+            return;
+        }
+    }
+
+    if let Some(checkpoint) = last_checkpoint {
+        handle.set_final_checkpoint(checkpoint).await;
+    }
 
     info!(
         channel,
@@ -153,6 +220,50 @@ pub async fn stream_event_log(
         total_entries = entries_processed,
         "Windows Event Log streaming stopped"
     );
+}
+
+async fn record_emit(
+    handle: &StreamHandle,
+    channel: &str,
+    source_id: &str,
+    entries_processed: &mut u64,
+    last_checkpoint: &mut Option<StreamingCheckpoint>,
+    last_record_id: &mut u64,
+    emit: Option<StreamingEmit>,
+) -> bool {
+    let Some(emit) = emit else {
+        return true;
+    };
+
+    *entries_processed += 1;
+
+    if let Some(checkpoint) = emit.checkpoint {
+        if let Some(record_id) = checkpoint.windows_event_record_id(channel) {
+            *last_record_id = (*last_record_id).max(record_id);
+        }
+        *last_checkpoint = Some(checkpoint);
+    }
+
+    if entries_processed.is_multiple_of(CHECKPOINT_INTERVAL) {
+        if let Some(checkpoint) = last_checkpoint.clone()
+            && !handle.set_checkpoint(checkpoint).await
+        {
+            warn!(
+                channel,
+                "streaming pipeline actor gone, stopping Windows Event Log stream"
+            );
+            return false;
+        }
+        debug!(
+            channel,
+            source_id,
+            entries = *entries_processed,
+            record_id = *last_record_id,
+            "Windows Event Log stream progress"
+        );
+    }
+
+    true
 }
 
 /// Sample up to `max_lines` rendered (`/f:text`) event lines from a channel for

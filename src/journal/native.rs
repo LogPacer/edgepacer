@@ -12,6 +12,7 @@ use tracing::info;
 
 use crate::streaming_actor::StreamHandle;
 use crate::streaming_checkpoint::StreamingCheckpoint;
+use crate::streaming_multiline::{StreamingEmit, StreamingEntryAssembler};
 
 use super::StreamEntry;
 
@@ -167,24 +168,61 @@ pub async fn enqueue_stream_entry(
     entries_processed: &mut u64,
     last_cursor: &mut Option<String>,
     checkpoint_interval: u64,
+    assembler: &mut StreamingEntryAssembler,
     entry: StreamEntry,
 ) -> bool {
-    if !handle
-        .enqueue(entry.message.into_bytes(), entry.timestamp_ns)
+    let checkpoint = StreamingCheckpoint::journald(source_id, &entry.cursor);
+    match assembler
+        .process_line(
+            handle,
+            entry.message.into_bytes(),
+            entry.timestamp_ns,
+            Some(checkpoint),
+        )
         .await
     {
-        return false;
+        Ok(emit) => {
+            record_emit(
+                handle,
+                source_id,
+                entries_processed,
+                last_cursor,
+                checkpoint_interval,
+                emit,
+            )
+            .await
+        }
+        Err(_) => false,
     }
+}
 
-    *last_cursor = Some(entry.cursor);
+pub async fn record_emit(
+    handle: &StreamHandle,
+    source_id: &str,
+    entries_processed: &mut u64,
+    last_cursor: &mut Option<String>,
+    checkpoint_interval: u64,
+    emit: Option<StreamingEmit>,
+) -> bool {
+    let Some(emit) = emit else {
+        return true;
+    };
+
     *entries_processed += 1;
+
+    if let Some(checkpoint) = emit.checkpoint
+        && let Some(cursor) = checkpoint.journald_cursor()
+    {
+        *last_cursor = Some(cursor.to_string());
+    }
 
     if entries_processed.is_multiple_of(checkpoint_interval)
         && let Some(cursor) = last_cursor.as_deref()
-    {
-        let _ = handle
+        && !handle
             .set_checkpoint(StreamingCheckpoint::journald(source_id, cursor))
-            .await;
+            .await
+    {
+        return false;
     }
     true
 }

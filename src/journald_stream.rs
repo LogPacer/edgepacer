@@ -9,6 +9,7 @@
 
 use tokio::sync::watch;
 
+use crate::config::MultilineConfig;
 use crate::journal;
 use crate::streaming_actor::StreamHandle;
 
@@ -18,7 +19,8 @@ pub async fn stream_journald_logs(
     unit: &str,
     source_id: &str,
     resume_cursor: Option<&str>,
+    multiline: Option<&MultilineConfig>,
     shutdown: &mut watch::Receiver<bool>,
 ) {
-    journal::stream_unit_logs(handle, unit, source_id, resume_cursor, shutdown).await;
+    journal::stream_unit_logs(handle, unit, source_id, resume_cursor, multiline, shutdown).await;
 }

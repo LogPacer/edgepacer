@@ -1,3 +1,5 @@
+use super::logs::MultilineConfig;
+
 /// How to collect logs from a non-file streaming source.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StreamAccessMethod {
@@ -17,5 +19,7 @@ pub struct StreamingSourceConfig {
     /// Stamp the agent's `resource_identifier` into shipped metadata. Default
     /// false; logpacer opts a source in per `stamp_resource_identifier` in the collect map.
     pub stamp_resource_identifier: bool,
+    /// Optional multiline aggregation; applies to every streaming source type.
+    pub multiline: Option<MultilineConfig>,
     pub config_hash: String,
 }
