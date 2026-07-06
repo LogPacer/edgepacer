@@ -110,9 +110,6 @@ dirs = "6"
 chrono = { version = "0.4", features = ["serde"] }
 
 # Persistent storage: SQLite (WAL) backs all buffers and the checkpoint store.
-# redb remains ONLY for the one-shot legacy_migration read side; drop it (and the
-# module) once the fleet is past this revision.
-redb = "2"
 rusqlite = { version = "0.40", features = ["bundled"] }
 
 # Compression (historical import)

@@ -31,7 +31,6 @@ pub mod identity;
 pub mod importer;
 mod journal;
 mod journald_stream;
-pub mod legacy_migration;
 pub mod manager;
 pub mod metrics_pipeline;
 pub mod metrics_shipper;
