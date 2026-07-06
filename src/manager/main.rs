@@ -23,7 +23,7 @@ use edgepacer::token_store;
 #[derive(Parser, Debug)]
 #[command(
     name = "edgepacer-manager",
-    version,
+    version = edgepacer::common::VERSION,
     about = "EdgePacer supervisor — manages agent lifecycle and updates"
 )]
 struct Cli {
@@ -34,42 +34,60 @@ struct Cli {
     run: RunArgs,
 }
 
+// All run options are `global = true` so they parse before OR after a subcommand
+// -- e.g. `edgepacer-manager install --rails URL --account-token TOK` works, not
+// just the env vars or `--rails URL ... install` ordering.
 #[derive(Args, Debug)]
 struct RunArgs {
     /// Path to the edgepacer binary
-    #[arg(long, default_value = "edgepacer", env = "EDGEPACER_PATH")]
+    #[arg(
+        long,
+        default_value = "edgepacer",
+        env = "EDGEPACER_PATH",
+        global = true
+    )]
     edgepacer: PathBuf,
 
     /// Rails control-plane URL
-    #[arg(long, env = "EDGEPACER_RAILS_URL")]
+    #[arg(long, env = "EDGEPACER_RAILS_URL", global = true)]
     rails: Option<String>,
 
     /// Account bootstrap token (for initial setup)
-    #[arg(long, env = "EDGEPACER_ACCOUNT_TOKEN")]
+    #[arg(long, env = "EDGEPACER_ACCOUNT_TOKEN", global = true)]
     account_token: Option<String>,
 
     /// Platform identifier (auto-detected if not set)
-    #[arg(long, default_value_t = detect_platform())]
+    #[arg(long, default_value_t = detect_platform(), global = true)]
     platform: String,
 
     /// Update check interval in seconds
-    #[arg(long, default_value = "30", env = "EDGEPACER_CHECK_INTERVAL")]
+    #[arg(
+        long,
+        default_value = "30",
+        env = "EDGEPACER_CHECK_INTERVAL",
+        global = true
+    )]
     check_interval: u64,
 
     /// Health check timeout in seconds
-    #[arg(long, default_value = "60", env = "EDGEPACER_HEALTH_TIMEOUT")]
+    #[arg(
+        long,
+        default_value = "60",
+        env = "EDGEPACER_HEALTH_TIMEOUT",
+        global = true
+    )]
     health_timeout: u64,
 
     /// Hex-encoded Ed25519 public key used to verify downloaded updates
-    #[arg(long, env = "EDGEPACER_UPDATE_PUBLIC_KEY")]
+    #[arg(long, env = "EDGEPACER_UPDATE_PUBLIC_KEY", global = true)]
     update_public_key: Option<String>,
 
     /// Enable debug logging in the agent child process
-    #[arg(long)]
+    #[arg(long, global = true)]
     debug: bool,
 
     /// Always download latest on startup (development mode)
-    #[arg(long)]
+    #[arg(long, global = true)]
     force_update: bool,
 }
 
@@ -618,6 +636,32 @@ mod tests {
     fn cli_parses_update_subcommand() {
         let cli = Cli::try_parse_from(["edgepacer-manager", "update"]).unwrap();
         assert!(matches!(cli.command, Some(super::ManagerCommand::Update)));
+    }
+
+    #[test]
+    fn subcommand_accepts_run_flags_after_it() {
+        // The run options are global, so they parse after the subcommand too --
+        // `edgepacer-manager install --rails URL --account-token TOK`.
+        let cli = Cli::try_parse_from([
+            "edgepacer-manager",
+            "install",
+            "--rails",
+            "https://example.com",
+            "--account-token",
+            "tok",
+        ])
+        .unwrap();
+        assert!(matches!(cli.command, Some(super::ManagerCommand::Install)));
+        assert_eq!(cli.run.rails.as_deref(), Some("https://example.com"));
+        assert_eq!(cli.run.account_token.as_deref(), Some("tok"));
+    }
+
+    #[test]
+    fn version_flag_uses_the_stamped_version() {
+        // `--version` reports the compiled-in VERSION (stamped EDGEPACER_VERSION
+        // in release builds), not clap's CARGO_PKG_VERSION default.
+        let rendered = Cli::command().render_version();
+        assert!(rendered.contains(edgepacer::common::VERSION));
     }
 
     #[test]
