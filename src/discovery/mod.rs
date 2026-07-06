@@ -72,6 +72,10 @@ pub struct Container {
     pub env: Vec<String>,
     pub runtime: String,
     pub log_path: String,
+    /// Application payload format after removing any runtime log framing.
+    /// Values match LogPacer's source-format vocabulary: `plain_text`, `json`,
+    /// or `ndjson`.
+    pub log_format: String,
     // K8s fields (empty when not K8s)
     pub pod_uid: String,
     pub pod_name: String,
@@ -254,7 +258,7 @@ impl Container {
             "kubernetes" => cache::AccessMethod::Kubernetes,
             "docker" => {
                 if locally_readable_log_path(&self.log_path) {
-                    cache::AccessMethod::File
+                    cache::AccessMethod::DockerJsonFile
                 } else {
                     cache::AccessMethod::DockerApi
                 }
@@ -273,7 +277,9 @@ impl Container {
     /// Concrete locator for the resolved access method.
     pub fn log_locator(&self) -> String {
         match self.determine_access_method() {
-            cache::AccessMethod::Kubernetes | cache::AccessMethod::File => self.log_path.clone(),
+            cache::AccessMethod::Kubernetes
+            | cache::AccessMethod::File
+            | cache::AccessMethod::DockerJsonFile => self.log_path.clone(),
             cache::AccessMethod::DockerApi => {
                 if self.container_id.is_empty() {
                     self.name.clone()
@@ -674,6 +680,7 @@ mod tests {
             env: vec![],
             runtime: "docker".into(),
             log_path: String::new(),
+            log_format: "plain_text".into(),
             pod_uid: String::new(),
             pod_name: String::new(),
             namespace: String::new(),

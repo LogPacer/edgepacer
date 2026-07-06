@@ -83,6 +83,7 @@ pub async fn discover_cri_containers() -> Result<Vec<crate::discovery::Container
                 .unwrap_or_else(|| name.clone());
 
             let id = c.id.unwrap_or_default();
+            let log_format = super::files::detect_container_log_format("containerd", &labels, "");
 
             crate::discovery::Container {
                 id: id.clone(),
@@ -95,6 +96,7 @@ pub async fn discover_cri_containers() -> Result<Vec<crate::discovery::Container
                 env: vec![],
                 runtime: "containerd".into(),
                 log_path: String::new(),
+                log_format,
                 pod_uid,
                 pod_name,
                 namespace,

@@ -4,11 +4,12 @@
 //! Finds all .log files in scan paths, records size/modified/format.
 
 use super::LogFile;
+use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Read};
 use tracing::debug;
 
-const FORMAT_NDJSON: &str = "ndjson";
-const FORMAT_PLAIN_TEXT: &str = "plain_text";
+pub(crate) const FORMAT_NDJSON: &str = "ndjson";
+pub(crate) const FORMAT_PLAIN_TEXT: &str = "plain_text";
 const FORMAT_SAMPLE_MAX_LINES: usize = 20;
 const FORMAT_SAMPLE_MAX_BYTES: u64 = 64 * 1024;
 
@@ -190,27 +191,130 @@ fn count_lines(path: &std::path::Path) -> u64 {
 }
 
 /// Detect log format from a bounded prefix of non-empty lines.
-fn detect_format(path: &std::path::Path) -> String {
-    if is_ndjson_log(path) {
+pub(crate) fn detect_format(path: &std::path::Path) -> String {
+    if is_ndjson_log(path, |line| Some(line.to_vec())) {
         FORMAT_NDJSON.to_string()
     } else {
         FORMAT_PLAIN_TEXT.to_string()
     }
 }
 
-fn is_ndjson_log(path: &std::path::Path) -> bool {
+/// Detect the application payload format inside Docker's json-file storage
+/// wrapper. The outer JSON object is runtime metadata; only the inner `log`
+/// field describes the source format LogPacer should use.
+pub(crate) fn detect_docker_json_file_format(path: &std::path::Path) -> String {
+    if is_ndjson_log(path, |line| {
+        crate::cri::parse_docker_json_line(line).map(|(payload, _)| payload)
+    }) {
+        FORMAT_NDJSON.to_string()
+    } else {
+        FORMAT_PLAIN_TEXT.to_string()
+    }
+}
+
+/// Detect the application payload format inside CRI log records. `path` may be
+/// a direct log file or a Kubernetes container log directory containing numbered
+/// `*.log` files.
+pub(crate) fn detect_cri_log_format(path: &std::path::Path) -> String {
+    let log_path = if path.is_dir() {
+        match active_cri_log_file(path) {
+            Some(path) => path,
+            None => return FORMAT_PLAIN_TEXT.to_string(),
+        }
+    } else {
+        path.to_path_buf()
+    };
+
+    if is_ndjson_log(&log_path, |line| {
+        let (payload, _, _, parsed) = crate::cri::parse_line(line);
+        parsed.then_some(payload)
+    }) {
+        FORMAT_NDJSON.to_string()
+    } else {
+        FORMAT_PLAIN_TEXT.to_string()
+    }
+}
+
+fn active_cri_log_file(dir: &std::path::Path) -> Option<std::path::PathBuf> {
+    let mut best_num = -1i32;
+    let mut best_path = None;
+
+    for entry in std::fs::read_dir(dir).ok()? {
+        let entry = entry.ok()?;
+        if !entry.file_type().ok()?.is_file() {
+            continue;
+        }
+
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        let Some(num) = name
+            .strip_suffix(".log")
+            .and_then(|n| n.parse::<i32>().ok())
+        else {
+            continue;
+        };
+
+        if num > best_num {
+            best_num = num;
+            best_path = Some(entry.path());
+        }
+    }
+
+    best_path
+}
+
+pub(crate) fn detect_container_log_format(
+    runtime: &str,
+    labels: &HashMap<String, String>,
+    log_path: &str,
+) -> String {
+    if let Some(format) = format_from_labels(labels) {
+        return format.to_string();
+    }
+
+    if log_path.is_empty() {
+        return FORMAT_PLAIN_TEXT.to_string();
+    }
+
+    let path = std::path::Path::new(log_path);
+    match runtime {
+        "docker" => detect_docker_json_file_format(path),
+        "kubernetes" | "containerd" | "cri-o" | "podman" => detect_cri_log_format(path),
+        _ => detect_format(path),
+    }
+}
+
+fn format_from_labels(labels: &HashMap<String, String>) -> Option<&'static str> {
+    labels
+        .get("log.format")
+        .and_then(|value| normalize_log_format(value))
+}
+
+fn normalize_log_format(value: &str) -> Option<&'static str> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "json" => Some("json"),
+        "ndjson" => Some(FORMAT_NDJSON),
+        "plain_text" | "text" => Some(FORMAT_PLAIN_TEXT),
+        _ => None,
+    }
+}
+
+fn is_ndjson_log<F>(path: &std::path::Path, mut payload_for_line: F) -> bool
+where
+    F: FnMut(&[u8]) -> Option<Vec<u8>>,
+{
     let file = match std::fs::File::open(path) {
         Ok(file) => file,
         Err(_) => return false,
     };
 
     let mut reader = BufReader::new(file.take(FORMAT_SAMPLE_MAX_BYTES));
-    let mut line = String::new();
+    let mut line = Vec::new();
     let mut checked_lines = 0usize;
 
     loop {
         line.clear();
-        let bytes_read = match reader.read_line(&mut line) {
+        let bytes_read = match reader.read_until(b'\n', &mut line) {
             Ok(bytes) => bytes,
             Err(_) => return false,
         };
@@ -219,7 +323,11 @@ fn is_ndjson_log(path: &std::path::Path) -> bool {
             break;
         }
 
-        let trimmed = line.trim();
+        let Some(payload) = payload_for_line(&line) else {
+            return false;
+        };
+
+        let trimmed = payload.trim_ascii();
         if trimmed.is_empty() {
             continue;
         }
@@ -237,8 +345,8 @@ fn is_ndjson_log(path: &std::path::Path) -> bool {
     checked_lines > 0
 }
 
-fn is_json_object_line(line: &str) -> bool {
-    serde_json::from_str::<serde_json::Value>(line).is_ok_and(|value| value.is_object())
+pub(crate) fn is_json_object_line(line: &[u8]) -> bool {
+    serde_json::from_slice::<serde_json::Value>(line).is_ok_and(|value| value.is_object())
 }
 
 #[cfg(test)]
@@ -381,6 +489,65 @@ mod tests {
             .find(|f| f.path.ends_with("plain.log"))
             .unwrap();
         assert_eq!(plain_file.format, "plain_text");
+    }
+
+    #[test]
+    fn detects_docker_json_file_inner_payload_format() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("container-json.log");
+        std::fs::write(
+            &path,
+            concat!(
+                r#"{"log":"{\"level\":\"info\",\"msg\":\"hello\"}\n","stream":"stdout","time":"2026-07-04T23:35:09Z"}"#,
+                "\n",
+                r#"{"log":"{\"level\":\"warn\",\"msg\":\"again\"}\n","stream":"stderr","time":"2026-07-04T23:35:10Z"}"#,
+                "\n"
+            ),
+        )
+        .unwrap();
+
+        assert_eq!(detect_docker_json_file_format(&path), "ndjson");
+    }
+
+    #[test]
+    fn docker_json_file_with_plain_inner_payload_is_plain_text() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("container-json.log");
+        std::fs::write(
+            &path,
+            concat!(
+                r#"{"log":"INFO hello\n","stream":"stdout","time":"2026-07-04T23:35:09Z"}"#,
+                "\n"
+            ),
+        )
+        .unwrap();
+
+        assert_eq!(detect_docker_json_file_format(&path), "plain_text");
+    }
+
+    #[test]
+    fn detects_cri_inner_payload_format() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("0.log");
+        std::fs::write(
+            &path,
+            concat!(
+                r#"2026-07-04T23:35:09Z stdout F {"level":"info","msg":"hello"}"#,
+                "\n",
+                r#"2026-07-04T23:35:10Z stderr F {"level":"warn","msg":"again"}"#,
+                "\n"
+            ),
+        )
+        .unwrap();
+
+        assert_eq!(detect_cri_log_format(dir.path()), "ndjson");
+    }
+
+    #[test]
+    fn container_format_prefers_label_hint() {
+        let labels = HashMap::from([("log.format".to_string(), "json".to_string())]);
+
+        assert_eq!(detect_container_log_format("docker", &labels, ""), "json");
     }
 
     #[tokio::test]

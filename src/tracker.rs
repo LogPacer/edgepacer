@@ -167,7 +167,11 @@ impl ChangeTracker {
 
             match self.committed_containers.get(&id) {
                 None => report.new_containers.push(container.clone()),
-                Some(prev) if prev.state != container.state || prev.image != container.image => {
+                Some(prev)
+                    if prev.state != container.state
+                        || prev.image != container.image
+                        || prev.log_format != container.log_format =>
+                {
                     report.changed_containers.push(container.clone());
                 }
                 _ => {} // No change
@@ -545,6 +549,7 @@ mod tests {
             env: vec![],
             runtime: "docker".into(),
             log_path: String::new(),
+            log_format: "plain_text".into(),
             pod_uid: String::new(),
             pod_name: String::new(),
             namespace: String::new(),
@@ -843,6 +848,31 @@ mod tests {
         };
         let report = tracker.update_from_scan(&census2);
         assert_eq!(report.changed_containers.len(), 1);
+    }
+
+    #[test]
+    fn detects_container_log_format_change() {
+        let mut tracker = ChangeTracker::new();
+        let mut before = make_container("abc123", "running");
+        before.log_format = "plain_text".into();
+
+        let census1 = Census {
+            containers: vec![before],
+            ..Default::default()
+        };
+        let _ = tracker.update_from_scan(&census1);
+        tracker.commit_scan();
+
+        let mut after = make_container("abc123", "running");
+        after.log_format = "ndjson".into();
+        let census2 = Census {
+            containers: vec![after],
+            ..Default::default()
+        };
+
+        let report = tracker.update_from_scan(&census2);
+        assert_eq!(report.changed_containers.len(), 1);
+        assert_eq!(report.changed_containers[0].log_format, "ndjson");
     }
 
     #[test]

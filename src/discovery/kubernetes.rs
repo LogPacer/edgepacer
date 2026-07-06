@@ -99,6 +99,8 @@ pub fn process_pod(pod: &Pod, pod_logs_dir: &str) -> Vec<Container> {
             "{}/{}_{}_{}/{}",
             pod_logs_dir, namespace, pod_name, pod_uid, container.name
         );
+        let log_format =
+            super::files::detect_container_log_format("kubernetes", &labels_map, &log_path);
 
         containers.push(Container {
             id: format!("{}/{}/{}", namespace, pod_name, container.name),
@@ -111,6 +113,7 @@ pub fn process_pod(pod: &Pod, pod_logs_dir: &str) -> Vec<Container> {
             labels: labels_map.clone(),
             runtime: "kubernetes".into(),
             log_path,
+            log_format,
             pod_uid: pod_uid.to_string(),
             pod_name: pod_name.to_string(),
             namespace: namespace.to_string(),

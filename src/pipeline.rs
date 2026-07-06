@@ -26,7 +26,7 @@ use tracing::{debug, error, info, warn};
 use crate::batch_tracker::BatchTracker;
 use crate::buffer::{DiskBuffer, Durability};
 use crate::checkpoint::{Checkpoint, CheckpointStore};
-use crate::config::MultilineConfig;
+use crate::config::{FileSourceFormat, MultilineConfig};
 use crate::container_reader::ContainerReader;
 use crate::entry_assembler::{EntryAssembler, EventMetadata, LineContext};
 use crate::overflow::SharedOverflow;
@@ -57,21 +57,68 @@ pub(crate) fn ship_batch_max_bytes_for(override_mb: Option<u64>) -> usize {
 /// File-backed reader used by the delivery pipeline.
 enum LogTailer {
     File(FileTailer),
+    DockerJson(FileTailer),
     Kubernetes(ContainerReader),
 }
 
+struct TailedLine {
+    payload: Vec<u8>,
+    source_len: u64,
+}
+
 impl LogTailer {
-    fn read_lines(&mut self, max_lines: usize) -> std::io::Result<Vec<Vec<u8>>> {
+    fn read_lines(&mut self, max_lines: usize) -> std::io::Result<Vec<TailedLine>> {
         match self {
-            Self::File(t) => t.read_lines(max_lines),
-            Self::Kubernetes(t) => t.read_lines(max_lines),
+            Self::File(t) => Ok(t
+                .read_lines(max_lines)?
+                .into_iter()
+                .map(line_with_payload_as_source)
+                .collect()),
+            Self::DockerJson(t) => Ok(t
+                .read_lines(max_lines)?
+                .into_iter()
+                .map(docker_json_payload_line)
+                .collect()),
+            Self::Kubernetes(t) => Ok(t
+                .read_lines(max_lines)?
+                .into_iter()
+                .map(line_with_payload_as_source)
+                .collect()),
         }
     }
 
     fn position(&self) -> crate::tailer::ReadPosition {
         match self {
-            Self::File(t) => t.position(),
+            Self::File(t) | Self::DockerJson(t) => t.position(),
             Self::Kubernetes(t) => t.position(),
+        }
+    }
+}
+
+fn line_with_payload_as_source(payload: Vec<u8>) -> TailedLine {
+    TailedLine {
+        source_len: payload.len() as u64 + 1,
+        payload,
+    }
+}
+
+fn docker_json_payload_line(raw: Vec<u8>) -> TailedLine {
+    let source_len = raw.len() as u64 + 1;
+    let payload = crate::cri::parse_docker_json_line(&raw)
+        .map(|(payload, _)| payload)
+        .unwrap_or(raw);
+    TailedLine {
+        payload,
+        source_len,
+    }
+}
+
+fn file_tailer_for_format(source_format: FileSourceFormat, tailer: FileTailer) -> LogTailer {
+    match source_format {
+        FileSourceFormat::Plain => LogTailer::File(tailer),
+        FileSourceFormat::DockerJson => LogTailer::DockerJson(tailer),
+        FileSourceFormat::KubernetesCri => {
+            unreachable!("Kubernetes CRI sources use ContainerReader")
         }
     }
 }
@@ -152,10 +199,58 @@ struct PipelineOpenParams<'a> {
     data_dir: &'a Path,
     shipper: Shipper,
     config: PipelineConfig,
-    multiline: Option<&'a MultilineConfig>,
-    source_id: &'a str,
-    overflow: Option<Arc<SharedOverflow>>,
-    kubernetes: bool,
+    source: PipelineSourceOptions<'a>,
+}
+
+pub(crate) struct PipelineSourceOptions<'a> {
+    pub(crate) multiline: Option<&'a MultilineConfig>,
+    pub(crate) source_id: &'a str,
+    pub(crate) overflow: Option<Arc<SharedOverflow>>,
+    pub(crate) source_format: FileSourceFormat,
+}
+
+impl<'a> PipelineSourceOptions<'a> {
+    fn plain(source_id: &'a str) -> Self {
+        Self {
+            multiline: None,
+            source_id,
+            overflow: None,
+            source_format: FileSourceFormat::Plain,
+        }
+    }
+}
+
+impl Default for PipelineSourceOptions<'_> {
+    fn default() -> Self {
+        Self {
+            multiline: None,
+            source_id: "",
+            overflow: None,
+            source_format: FileSourceFormat::Plain,
+        }
+    }
+}
+
+impl<'a> PipelineOpenParams<'a> {
+    fn new(
+        file_path: &'a str,
+        data_dir: &'a Path,
+        shipper: Shipper,
+        config: PipelineConfig,
+    ) -> Self {
+        Self {
+            file_path,
+            data_dir,
+            shipper,
+            config,
+            source: PipelineSourceOptions::plain(file_path),
+        }
+    }
+
+    fn with_source(mut self, source: PipelineSourceOptions<'a>) -> Self {
+        self.source = source;
+        self
+    }
 }
 
 impl DeliveryPipeline {
@@ -166,16 +261,9 @@ impl DeliveryPipeline {
         shipper: Shipper,
         config: PipelineConfig,
     ) -> Result<Self, PipelineError> {
-        Self::open_with_multiline_inner(PipelineOpenParams {
-            file_path,
-            data_dir,
-            shipper,
-            config,
-            multiline: None,
-            source_id: file_path,
-            overflow: None,
-            kubernetes: false,
-        })
+        Self::open_with_multiline_inner(PipelineOpenParams::new(
+            file_path, data_dir, shipper, config,
+        ))
     }
 
     /// Attach the shared queue-depth gauge to this pipeline's durable buffer.
@@ -193,37 +281,32 @@ impl DeliveryPipeline {
         source_id: &str,
         overflow: Option<Arc<SharedOverflow>>,
     ) -> Result<Self, PipelineError> {
-        Self::open_with_multiline_inner(PipelineOpenParams {
-            file_path: container_dir,
-            data_dir,
-            shipper,
-            config,
-            multiline,
-            source_id,
-            overflow,
-            kubernetes: true,
-        })
+        Self::open_with_multiline_inner(
+            PipelineOpenParams::new(container_dir, data_dir, shipper, config).with_source(
+                PipelineSourceOptions {
+                    multiline,
+                    source_id,
+                    overflow,
+                    source_format: FileSourceFormat::KubernetesCri,
+                },
+            ),
+        )
     }
 
     /// Create a new pipeline with optional multi-line aggregation.
-    pub fn open_with_multiline(
+    pub(crate) fn open_file_source(
         file_path: &str,
         data_dir: &Path,
         shipper: Shipper,
         config: PipelineConfig,
-        multiline: Option<&MultilineConfig>,
-        source_id: &str,
-        overflow: Option<Arc<SharedOverflow>>,
+        source: PipelineSourceOptions<'_>,
     ) -> Result<Self, PipelineError> {
         Self::open_with_multiline_inner(PipelineOpenParams {
             file_path,
             data_dir,
             shipper,
             config,
-            multiline,
-            source_id,
-            overflow,
-            kubernetes: false,
+            source,
         })
     }
 
@@ -233,10 +316,13 @@ impl DeliveryPipeline {
             data_dir,
             shipper,
             config,
-            multiline,
-            source_id,
-            overflow,
-            kubernetes,
+            source:
+                PipelineSourceOptions {
+                    multiline,
+                    source_id,
+                    overflow,
+                    source_format,
+                },
         } = params;
         let cp_path = data_dir.join("checkpoints.sqlite");
         let buf_path = data_dir.join(format!("buffer_{}.sqlite", sanitize_filename(file_path)));
@@ -252,7 +338,7 @@ impl DeliveryPipeline {
         )?;
 
         // Resume tailer from checkpoint if one exists.
-        let tailer = if kubernetes {
+        let tailer = if source_format == FileSourceFormat::KubernetesCri {
             match checkpoint_store.load(file_path)? {
                 Some(cp) => {
                     info!(
@@ -279,11 +365,14 @@ impl DeliveryPipeline {
                         inode = cp.inode,
                         "resuming from checkpoint"
                     );
-                    LogTailer::File(FileTailer::open_with_checkpoint(Path::new(file_path), &cp)?)
+                    file_tailer_for_format(
+                        source_format,
+                        FileTailer::open_with_checkpoint(Path::new(file_path), &cp)?,
+                    )
                 }
                 None => {
                     info!(path = file_path, "no checkpoint, tailing from end");
-                    LogTailer::File(FileTailer::open(Path::new(file_path))?)
+                    file_tailer_for_format(source_format, FileTailer::open(Path::new(file_path))?)
                 }
             }
         };
@@ -382,7 +471,7 @@ impl DeliveryPipeline {
         if self.assembler.is_none() {
             // Fast path: no aggregation, enqueue raw lines as before.
             let count = lines.len();
-            let batch_bytes: u64 = lines.iter().map(|l| l.len() as u64 + 1).sum();
+            let batch_bytes: u64 = lines.iter().map(|l| l.source_len).sum();
             let start_offset = pos.offset.saturating_sub(batch_bytes);
 
             self.enqueue_batch(lines, start_offset, pos.offset, pos.inode, now_ns, count);
@@ -397,7 +486,7 @@ impl DeliveryPipeline {
         let mut running = self.running_offset;
         let mut emitted: Vec<(Vec<u8>, EventMetadata)> = Vec::new();
         for line in lines {
-            let line_len = line.len() as u64 + 1;
+            let line_len = line.source_len;
             let ctx = LineContext {
                 start_offset: running,
                 end_offset: running + line_len,
@@ -408,7 +497,7 @@ impl DeliveryPipeline {
                 .assembler
                 .as_mut()
                 .expect("assembler checked above")
-                .process(line, ctx)
+                .process(line.payload, ctx)
             {
                 emitted.push(event);
             }
@@ -425,19 +514,22 @@ impl DeliveryPipeline {
     /// Enqueue a batch of raw (non-aggregated) lines.
     fn enqueue_batch(
         &mut self,
-        lines: Vec<Vec<u8>>,
+        records: Vec<TailedLine>,
         start_offset: u64,
         end_offset: u64,
         inode: u64,
         now_ns: i64,
         count: usize,
     ) {
+        let source_lengths: Vec<u64> = records.iter().map(|line| line.source_len).collect();
+        let lines: Vec<Vec<u8>> = records.into_iter().map(|line| line.payload).collect();
+
         match self.buffer.enqueue_batch(&lines, now_ns) {
             Ok((buf_first, buf_last)) => {
                 debug_assert_eq!(buf_last - buf_first + 1, lines.len() as u64);
                 let mut line_start_offset = start_offset;
-                for (index, line) in lines.iter().enumerate() {
-                    let line_end_offset = line_start_offset + line.len() as u64 + 1;
+                for (index, source_len) in source_lengths.iter().enumerate() {
+                    let line_end_offset = line_start_offset + *source_len;
                     let buffer_sequence = buf_first + index as u64;
                     self.tracker.track(
                         line_start_offset,
@@ -783,10 +875,24 @@ mod tests {
         buf
     }
 
+    fn tailed_lines(lines: Vec<Vec<u8>>) -> Vec<TailedLine> {
+        lines.into_iter().map(line_with_payload_as_source).collect()
+    }
+
     #[test]
     fn sanitize_paths() {
         assert_eq!(sanitize_filename("/var/log/app.log"), "var_log_app_log");
         assert_eq!(sanitize_filename("C:\\logs\\app.log"), "C__logs_app_log");
+    }
+
+    #[test]
+    fn docker_json_payload_strips_wrapper_and_keeps_source_length() {
+        let raw = br#"{"log":"http: TLS handshake error\n","stream":"stdout","time":"2026-07-04T23:35:09.566698461Z"}"#.to_vec();
+
+        let line = docker_json_payload_line(raw.clone());
+
+        assert_eq!(line.payload, b"http: TLS handshake error");
+        assert_eq!(line.source_len, raw.len() as u64 + 1);
     }
 
     #[tokio::test]
@@ -838,7 +944,7 @@ mod tests {
             b"dddd".to_vec(),
         ];
         let end_offset = lines.iter().map(|line| line.len() as u64 + 1).sum();
-        pipeline.enqueue_batch(lines, 0, end_offset, 42, now_nanos(), 4);
+        pipeline.enqueue_batch(tailed_lines(lines), 0, end_offset, 42, now_nanos(), 4);
 
         pipeline.drain_cycle().await;
 
@@ -903,7 +1009,7 @@ mod tests {
 
         let lines = vec![b"oversized".to_vec(), b"next".to_vec()];
         let end_offset = lines.iter().map(|line| line.len() as u64 + 1).sum();
-        pipeline.enqueue_batch(lines, 0, end_offset, 42, now_nanos(), 2);
+        pipeline.enqueue_batch(tailed_lines(lines), 0, end_offset, 42, now_nanos(), 2);
 
         pipeline.drain_cycle().await;
 
