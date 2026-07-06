@@ -120,6 +120,7 @@ pub async fn discover_containers() -> anyhow::Result<Vec<Container>> {
         let env_service_name = explicit_service_name_from_env(&env);
         let service_name_explicit = env_service_name.is_some();
         let service_name = env_service_name.unwrap_or(label_service_name);
+        let log_format = super::files::detect_container_log_format("docker", &labels, &log_path);
 
         debug!(name = %name, state = %state, service = %service_name, explicit = service_name_explicit, "discovered container");
 
@@ -134,6 +135,7 @@ pub async fn discover_containers() -> anyhow::Result<Vec<Container>> {
             env,
             runtime: "docker".to_string(),
             log_path,
+            log_format,
             // K8s fields empty for plain Docker
             pod_uid: String::new(),
             pod_name: String::new(),

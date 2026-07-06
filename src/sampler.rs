@@ -246,6 +246,9 @@ async fn read_sample_lines_for_identifier(
         Some((AccessMethod::File | AccessMethod::Kubernetes, locator)) => {
             read_file_lines(&locator, max_lines)
         }
+        Some((AccessMethod::DockerJsonFile, locator)) => {
+            read_docker_json_file_lines(&locator, max_lines)
+        }
         Some((AccessMethod::Journald, unit)) => journal::sample_unit_lines(&unit, max_lines),
         Some((AccessMethod::DockerApi, container_id)) => {
             read_docker_lines(&container_id, max_lines).await
@@ -342,6 +345,22 @@ async fn read_docker_lines(container_id: &str, max_lines: usize) -> Result<Vec<S
 /// Reads from the END of the file (most recent lines are most useful for
 /// format detection). Falls back to reading from start if the file is small.
 fn read_file_lines(path: &str, max_lines: usize) -> Result<Vec<String>, String> {
+    read_file_lines_with(path, max_lines, |line| line.to_string())
+}
+
+fn read_docker_json_file_lines(path: &str, max_lines: usize) -> Result<Vec<String>, String> {
+    read_file_lines_with(path, max_lines, |line| {
+        crate::cri::parse_docker_json_line(line.as_bytes())
+            .map(|(payload, _)| String::from_utf8_lossy(&payload).into_owned())
+            .unwrap_or_else(|| line.to_string())
+    })
+}
+
+fn read_file_lines_with(
+    path: &str,
+    max_lines: usize,
+    transform: impl Fn(&str) -> String,
+) -> Result<Vec<String>, String> {
     let file_path = Path::new(path);
     if !file_path.exists() {
         return Err(format!("file not found: {path}"));
@@ -353,6 +372,7 @@ fn read_file_lines(path: &str, max_lines: usize) -> Result<Vec<String>, String> 
     let all_lines: Vec<String> = reader
         .lines()
         .map_while(Result::ok)
+        .map(|line| transform(&line))
         .filter(|l| !l.trim().is_empty())
         .collect();
 
@@ -392,6 +412,26 @@ mod tests {
 
         let lines = read_sample_lines(path.to_str().unwrap(), 20).unwrap();
         assert_eq!(lines.len(), 2);
+    }
+
+    #[test]
+    fn read_docker_json_file_sample_strips_wrapper() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("container-json.log");
+        std::fs::write(
+            &path,
+            concat!(
+                r#"{"log":"first\n","stream":"stdout","time":"2026-07-04T23:35:08Z"}"#,
+                "\n",
+                r#"{"log":"{\"level\":\"INFO\",\"msg\":\"second\"}\n","stream":"stdout","time":"2026-07-04T23:35:09Z"}"#,
+                "\n",
+            ),
+        )
+        .unwrap();
+
+        let lines = read_docker_json_file_lines(path.to_str().unwrap(), 5).unwrap();
+
+        assert_eq!(lines, vec!["first", r#"{"level":"INFO","msg":"second"}"#]);
     }
 
     #[test]

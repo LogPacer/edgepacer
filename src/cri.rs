@@ -31,19 +31,28 @@ pub fn parse_line(line: &[u8]) -> (Vec<u8>, String, bool, bool) {
         return (message, stream, flag == "P", true);
     }
 
-    if line.first() == Some(&b'{')
-        && line.windows(5).any(|w| w == b"\"log\"")
-        && let Ok(parsed) = serde_json::from_slice::<DockerJsonLog>(line)
-        && !parsed.log.is_empty()
-    {
-        let mut msg = parsed.log.into_bytes();
-        if msg.last() == Some(&b'\n') {
-            msg.pop();
-        }
-        return (msg, parsed.stream, false, true);
+    if let Some((msg, stream)) = parse_docker_json_line(line) {
+        return (msg, stream, false, true);
     }
 
     (line.to_vec(), String::new(), false, false)
+}
+
+/// Parse Docker's json-file log wrapper and return only the application payload.
+pub fn parse_docker_json_line(line: &[u8]) -> Option<(Vec<u8>, String)> {
+    if line.first() != Some(&b'{') || !line.windows(5).any(|w| w == b"\"log\"") {
+        return None;
+    }
+
+    let parsed = serde_json::from_slice::<DockerJsonLog>(line).ok()?;
+    let mut msg = parsed.log.into_bytes();
+    if msg.last() == Some(&b'\n') {
+        msg.pop();
+    }
+    if msg.last() == Some(&b'\r') {
+        msg.pop();
+    }
+    Some((msg, parsed.stream))
 }
 
 #[cfg(test)]
@@ -66,5 +75,13 @@ mod tests {
         let (_, _, partial, ok) = parse_line(line);
         assert!(ok);
         assert!(partial);
+    }
+
+    #[test]
+    fn parses_docker_json_file_line() {
+        let line = br#"{"log":"{\"level\":\"INFO\",\"msg\":\"hello\"}\n","stream":"stdout","time":"2026-07-04T23:35:09.566698461Z"}"#;
+        let (msg, stream) = parse_docker_json_line(line).unwrap();
+        assert_eq!(msg, br#"{"level":"INFO","msg":"hello"}"#);
+        assert_eq!(stream, "stdout");
     }
 }

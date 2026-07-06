@@ -81,6 +81,29 @@ fn byte_capped_take(lines: &[Vec<u8>], max_bytes: usize) -> usize {
     take
 }
 
+fn log_line_body(body: &[u8]) -> wire_log_event::Body {
+    if is_json_object(body) {
+        return wire_log_event::Body::EntryJson(body.to_vec());
+    }
+
+    match std::str::from_utf8(body) {
+        Ok(text) => wire_log_event::Body::RawText(text.to_string()),
+        Err(_) => wire_log_event::Body::RawBytes(body.to_vec()),
+    }
+}
+
+fn is_json_object(body: &[u8]) -> bool {
+    let trimmed = body.trim_ascii();
+    if !trimmed.starts_with(b"{") {
+        return false;
+    }
+
+    matches!(
+        serde_json::from_slice::<serde_json::Value>(trimmed),
+        Ok(serde_json::Value::Object(_))
+    )
+}
+
 /// Ship log batches via the routed logpacer-wire protocol.
 ///
 /// Cheap to clone — `reqwest::Client` and the counters are reference-counted —
@@ -507,8 +530,8 @@ impl Shipper {
     ///
     /// Borrows the lines so a caller can re-encode sub-slices (e.g. shrinking a
     /// batch on a payload-too-large rejection) without cloning the outer Vec.
-    /// Valid UTF-8 is copied into the wire `RawText` string regardless; only the
-    /// rare non-UTF-8 line is cloned. Returns the encoded bytes and line count.
+    /// JSON object entries are reported as `EntryJson`, other valid UTF-8 as
+    /// `RawText`, and rare non-UTF-8 lines as `RawBytes`.
     pub fn encode_batch(&self, lines: &[Vec<u8>]) -> Result<(Vec<u8>, u32), EdgepacerError> {
         let count = checked_wire_count("log entries", lines.len())?;
         let now_ms = unix_epoch_millis_i64();
@@ -516,20 +539,13 @@ impl Shipper {
         let metadata = self.envelope_metadata_bytes();
         let entries: Vec<WireLogEvent> = lines
             .iter()
-            .map(|body| {
-                let wire_body = match std::str::from_utf8(body) {
-                    Ok(text) => wire_log_event::Body::RawText(text.to_string()),
-                    Err(_) => wire_log_event::Body::RawBytes(body.clone()),
-                };
-
-                WireLogEvent {
-                    envelope: Some(EventEnvelope {
-                        source_at_ms: Some(now_ms),
-                        logtime_ms: None,
-                        metadata_json: metadata.clone(),
-                    }),
-                    body: Some(wire_body),
-                }
+            .map(|body| WireLogEvent {
+                envelope: Some(EventEnvelope {
+                    source_at_ms: Some(now_ms),
+                    logtime_ms: None,
+                    metadata_json: metadata.clone(),
+                }),
+                body: Some(log_line_body(body)),
             })
             .collect();
 
@@ -684,6 +700,19 @@ mod tests {
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
+    fn encoded_log_body(line: Vec<u8>) -> wire_log_event::Body {
+        let shipper = Shipper::new("http://localhost:8080", "arc_test", "repo_app", None).unwrap();
+        let lines = vec![line];
+        let (buf, count) = shipper.encode_batch(&lines).unwrap();
+        assert_eq!(count, 1);
+
+        let decoded = WireRequest::decode(&buf[..]).unwrap();
+        let Some(routed_batch::Payload::Logs(logs)) = &decoded.batches[0].payload else {
+            panic!("expected routed log payload");
+        };
+        logs.entries[0].body.clone().unwrap()
+    }
+
     #[test]
     fn byte_cap_limits_batch_and_always_takes_one() {
         // Four 100-byte lines; with overhead each costs 228 bytes.
@@ -715,6 +744,32 @@ mod tests {
                 len: actual
             } if actual == len
         ));
+    }
+
+    #[test]
+    fn encode_batch_reports_json_objects_as_entry_json() {
+        let line = br#"{"time":"2026-07-04T23:35:09Z","level":"INFO","msg":"hello"}"#.to_vec();
+
+        assert_eq!(
+            encoded_log_body(line.clone()),
+            wire_log_event::Body::EntryJson(line)
+        );
+    }
+
+    #[test]
+    fn encode_batch_keeps_non_object_json_as_raw_text() {
+        assert_eq!(
+            encoded_log_body(br#"[{"msg":"array payload"}]"#.to_vec()),
+            wire_log_event::Body::RawText(r#"[{"msg":"array payload"}]"#.into())
+        );
+    }
+
+    #[test]
+    fn encode_batch_keeps_plain_text_as_raw_text() {
+        assert_eq!(
+            encoded_log_body(b"hello world".to_vec()),
+            wire_log_event::Body::RawText("hello world".into())
+        );
     }
 
     #[test]

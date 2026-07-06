@@ -20,7 +20,8 @@ use tokio::task::JoinHandle;
 use tracing::{error, info, warn};
 
 use crate::config::{
-    self, BufferTuning, CollectDiagnostic, LogStreamConfig, SharedConfig, StreamingSourceConfig,
+    self, BufferTuning, CollectDiagnostic, FileSourceFormat, LogStreamConfig, SharedConfig,
+    StreamingSourceConfig,
 };
 use crate::counters::AgentCounters;
 use crate::discovery::SharedDiscoveryCache;
@@ -28,7 +29,7 @@ use crate::discovery::cache::MatchStatus;
 use crate::error_collector::ErrorCollector;
 use crate::identity::AgentIdentity;
 use crate::overflow::SharedOverflow;
-use crate::pipeline::{DeliveryPipeline, PipelineConfig, PipelineError};
+use crate::pipeline::{DeliveryPipeline, PipelineConfig, PipelineError, PipelineSourceOptions};
 use crate::shipper::Shipper;
 use crate::streaming_actor;
 use crate::streaming_pipeline::{StreamingDeliveryPipeline, StreamingPipelineConfig};
@@ -381,7 +382,7 @@ impl Orchestrator {
         let source_dir = self.source_data_dir(&stream.log_source_id);
         std::fs::create_dir_all(&source_dir)?;
 
-        let mut pipeline = if stream.kubernetes {
+        let mut pipeline = if stream.source_format == FileSourceFormat::KubernetesCri {
             DeliveryPipeline::open_kubernetes(
                 &stream.path,
                 &source_dir,
@@ -392,14 +393,17 @@ impl Orchestrator {
                 self.overflow.clone(),
             )?
         } else {
-            DeliveryPipeline::open_with_multiline(
+            DeliveryPipeline::open_file_source(
                 &stream.path,
                 &source_dir,
                 shipper,
                 self.pipeline_config(),
-                stream.multiline.as_ref(),
-                &stream.log_source_id,
-                self.overflow.clone(),
+                PipelineSourceOptions {
+                    multiline: stream.multiline.as_ref(),
+                    source_id: &stream.log_source_id,
+                    overflow: self.overflow.clone(),
+                    source_format: stream.source_format,
+                },
             )?
         };
 
@@ -751,7 +755,7 @@ mod tests {
             "arc1",
             "repo1",
             None,
-            false,
+            FileSourceFormat::Plain,
             false,
         );
         let hash2 = LogStreamConfig::compute_hash(
@@ -760,7 +764,7 @@ mod tests {
             "arc1",
             "repo1",
             None,
-            false,
+            FileSourceFormat::Plain,
             false,
         );
         assert_ne!(hash1, hash2);
@@ -867,10 +871,16 @@ mod tests {
                 archive_id: "arc".into(),
                 repo_id: "repo".into(),
                 stamp_resource_identifier: false,
-                kubernetes: false,
+                source_format: FileSourceFormat::Plain,
                 multiline: None,
                 config_hash: LogStreamConfig::compute_hash(
-                    &path, endpoint, "arc", "repo", None, false, false,
+                    &path,
+                    endpoint,
+                    "arc",
+                    "repo",
+                    None,
+                    FileSourceFormat::Plain,
+                    false,
                 ),
             }
         };
@@ -952,7 +962,7 @@ mod tests {
             archive_id: "arc".into(),
             repo_id: "repo".into(),
             stamp_resource_identifier: false,
-            kubernetes: false,
+            source_format: FileSourceFormat::Plain,
             multiline: None,
             config_hash: String::new(),
         };

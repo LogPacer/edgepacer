@@ -110,6 +110,7 @@ fn service_census_entry(c: &Container) -> serde_json::Value {
         "state": c.state,
         "namespace": c.namespace,
         "deployment": c.deployment,
+        "format": c.log_format,
         "labels": c.labels,
     })
 }
@@ -126,6 +127,7 @@ fn container_census_entry(c: &Container) -> serde_json::Value {
         "namespace": c.namespace,
         "deployment": c.deployment,
         "service_name": c.service_name,
+        "format": c.log_format,
         "labels": c.labels,
     })
 }
@@ -573,6 +575,7 @@ mod tests {
             env: vec![],
             runtime: "kubernetes".into(),
             log_path: "/var/log/pods/default_postgres-0_uid/db".into(),
+            log_format: "plain_text".into(),
             pod_uid: "pod-uid-xyz".into(),
             pod_name: "postgres-0".into(),
             namespace: "default".into(),
@@ -586,7 +589,8 @@ mod tests {
 
     #[test]
     fn census_entries_carry_stable_identity_and_never_volatile_handles() {
-        let c = k8s_statefulset_container();
+        let mut c = k8s_statefulset_container();
+        c.log_format = "ndjson".into();
 
         // Both lanes: the stable per-instance id is present, and no volatile
         // runtime handle (container_id / pod_uid / pod_name) crosses the wire.
@@ -608,6 +612,7 @@ mod tests {
                 obj.get("pod_name").is_none(),
                 "pod_name must never be reported"
             );
+            assert_eq!(obj.get("format").and_then(|v| v.as_str()), Some("ndjson"));
         }
     }
 
@@ -623,6 +628,7 @@ mod tests {
             env: vec![],
             runtime: "docker".into(),
             log_path: String::new(),
+            log_format: "plain_text".into(),
             pod_uid: String::new(),
             pod_name: String::new(),
             namespace: String::new(),

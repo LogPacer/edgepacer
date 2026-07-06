@@ -11,6 +11,7 @@ use super::{Census, Container, EventLogChannel, LogFile, SystemdService};
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AccessMethod {
     File,
+    DockerJsonFile,
     DockerApi,
     Journald,
     Kubernetes,
@@ -500,6 +501,7 @@ mod tests {
             env: vec![],
             runtime: "docker".into(),
             log_path: log_path.into(),
+            log_format: "plain_text".into(),
             pod_uid: String::new(),
             pod_name: String::new(),
             namespace: String::new(),
@@ -544,6 +546,7 @@ mod tests {
             env: vec![],
             runtime: "kubernetes".into(),
             log_path: "/var/log/pods/default_test-pod_uid/app".into(),
+            log_format: "plain_text".into(),
             pod_uid: "uid".into(),
             pod_name: "test-pod".into(),
             namespace: "default".into(),
@@ -578,7 +581,7 @@ mod tests {
     }
 
     #[test]
-    fn resolves_docker_file_when_log_path_present() {
+    fn resolves_docker_json_file_when_log_path_present() {
         let mut cache = DiscoveryCache::new();
         let mut census = Census::default();
         let dir = tempfile::tempdir().unwrap();
@@ -593,7 +596,7 @@ mod tests {
         let (method, loc) = cache
             .resolve_access_method("my-nginx", "container")
             .unwrap();
-        assert_eq!(method, AccessMethod::File);
+        assert_eq!(method, AccessMethod::DockerJsonFile);
         assert_eq!(loc, log_path.to_str().unwrap());
     }
 

@@ -22,16 +22,34 @@ pub struct LogStreamConfig {
     /// Stamp the agent's `resource_identifier` into shipped metadata. Default
     /// false; logpacer opts a source in via `stamp_resource_identifier` in the collect map.
     pub stamp_resource_identifier: bool,
-    /// Tail K8s CRI log directory instead of a plain file.
-    pub kubernetes: bool,
+    /// File-backed source encoding/framing. Plain application files are raw;
+    /// container runtime files need their wrapper stripped before shipping.
+    pub source_format: FileSourceFormat,
     /// Optional multiline-aggregation configuration. When present, the
     /// pipeline runs raw tailed lines through an EntryAssembler that
     /// stitches continuations into single events.
     pub multiline: Option<MultilineConfig>,
     /// SHA256 hash of the config fields that trigger pipeline restart when changed.
-    /// Includes: path, endpoint, archive_id, repo_id, multiline, kubernetes,
-    /// stamp_resource_identifier.
+    /// Includes: path, endpoint, archive_id, repo_id, multiline, source format,
+    /// and stamp_resource_identifier.
     pub config_hash: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FileSourceFormat {
+    Plain,
+    DockerJson,
+    KubernetesCri,
+}
+
+impl FileSourceFormat {
+    pub fn hash_part(self) -> &'static str {
+        match self {
+            FileSourceFormat::Plain => "file",
+            FileSourceFormat::DockerJson => "docker-json",
+            FileSourceFormat::KubernetesCri => "k8s-cri",
+        }
+    }
 }
 
 /// Per-source multiline aggregation settings, mirroring Go's
@@ -92,18 +110,18 @@ impl LogStreamConfig {
         archive_id: &str,
         repo_id: &str,
         multiline: Option<&MultilineConfig>,
-        kubernetes: bool,
+        source_format: FileSourceFormat,
         stamp_resource_identifier: bool,
     ) -> String {
         let multiline_part = multiline_hash_part(multiline);
-        let k8s_part = if kubernetes { "k8s" } else { "file" };
         let stamp_part = if stamp_resource_identifier {
             "stamp"
         } else {
             "nostamp"
         };
         let input = format!(
-            "{path}|{endpoint}|{archive_id}|{repo_id}|{multiline_part}|{k8s_part}|{stamp_part}"
+            "{path}|{endpoint}|{archive_id}|{repo_id}|{multiline_part}|{}|{stamp_part}",
+            source_format.hash_part()
         );
         let mut hasher = Sha256::new();
         hasher.update(input.as_bytes());
@@ -236,9 +254,11 @@ pub fn resolve_collect_streams(
             // A file's stable identity is the path it sits at — an exact-path
             // check, not the argv of whatever process writes it.
             if std::path::Path::new(identifier).is_file() {
-                resolved
-                    .file_streams
-                    .push(log_stream_from_collect(stream, identifier, false));
+                resolved.file_streams.push(log_stream_from_collect(
+                    stream,
+                    identifier,
+                    FileSourceFormat::Plain,
+                ));
                 resolved
                     .diagnostics
                     .push(matched(stream, MatchVia::FilePath));
@@ -291,16 +311,21 @@ fn push_resolved_source(
     } = access;
 
     match access_method {
-        AccessMethod::File => {
-            resolved
-                .file_streams
-                .push(log_stream_from_collect(stream, &access_locator, false))
-        }
-        AccessMethod::Kubernetes => {
-            resolved
-                .file_streams
-                .push(log_stream_from_collect(stream, &access_locator, true))
-        }
+        AccessMethod::File => resolved.file_streams.push(log_stream_from_collect(
+            stream,
+            &access_locator,
+            FileSourceFormat::Plain,
+        )),
+        AccessMethod::DockerJsonFile => resolved.file_streams.push(log_stream_from_collect(
+            stream,
+            &access_locator,
+            FileSourceFormat::DockerJson,
+        )),
+        AccessMethod::Kubernetes => resolved.file_streams.push(log_stream_from_collect(
+            stream,
+            &access_locator,
+            FileSourceFormat::KubernetesCri,
+        )),
         AccessMethod::DockerApi => resolved.streaming_sources.push(streaming_source(
             stream,
             StreamAccessMethod::DockerApi {
@@ -375,7 +400,7 @@ pub fn resolved_collect_from_config(
 fn log_stream_from_collect(
     stream: &CollectStreamConfig,
     path: &str,
-    kubernetes: bool,
+    source_format: FileSourceFormat,
 ) -> LogStreamConfig {
     let config_hash = LogStreamConfig::compute_hash(
         path,
@@ -383,7 +408,7 @@ fn log_stream_from_collect(
         &stream.archive_id,
         &stream.repo_id,
         stream.multiline.as_ref(),
-        kubernetes,
+        source_format,
         stream.stamp_resource_identifier,
     );
     LogStreamConfig {
@@ -393,7 +418,7 @@ fn log_stream_from_collect(
         archive_id: stream.archive_id.clone(),
         repo_id: stream.repo_id.clone(),
         stamp_resource_identifier: stream.stamp_resource_identifier,
-        kubernetes,
+        source_format,
         multiline: stream.multiline.clone(),
         config_hash,
     }
@@ -453,6 +478,7 @@ mod tests {
             env: Vec::new(),
             runtime: "docker".into(),
             log_path: log_path.into(),
+            log_format: "plain_text".into(),
             pod_uid: String::new(),
             pod_name: String::new(),
             namespace: String::new(),
@@ -580,7 +606,7 @@ mod tests {
         assert_eq!(file.endpoint, "https://collect.example.com/wire");
         assert_eq!(file.archive_id, "arc_file");
         assert_eq!(file.repo_id, "repo_file");
-        assert!(!file.kubernetes);
+        assert_eq!(file.source_format, FileSourceFormat::DockerJson);
 
         assert_eq!(resolved.streaming_sources.len(), 1);
         let stream = &resolved.streaming_sources[0];
@@ -754,6 +780,10 @@ mod tests {
         // Present file resolves to a stream; the missing one becomes a NotFound
         // diagnostic (not an inline warn) so the caller can dedup it.
         assert_eq!(resolved.file_streams.len(), 1);
+        assert_eq!(
+            resolved.file_streams[0].source_format,
+            FileSourceFormat::Plain
+        );
         let by_id = |id: &str| {
             resolved
                 .diagnostics
