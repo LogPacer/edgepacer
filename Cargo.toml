@@ -166,18 +166,18 @@ path = "src/bin/edgepacer-release-manifest.rs"
 
 # Linux /proc access (process/port discovery)
 [target.'cfg(target_os = "linux")'.dependencies]
-procfs = "0.17"
+procfs = "0.18"
 sdjournal = { version = "0.1.15", default-features = true }
 # jemalloc with a background purge thread: returns freed pages to the OS so RSS
 # tracks the working set instead of carrying glibc per-arena retention (the
 # customer-visible `ps`/`docker stats` number). Linux-only; macOS keeps system malloc.
-tikv-jemallocator = { version = "0.6", features = [
+tikv-jemallocator = { version = "0.7", features = [
     "background_threads",
     "disable_initial_exec_tls",
 ] }
 # Aya userspace eBPF loader (bpf syscall/netlink/epoll). Pulled in only by the
 # `ebpf` feature; Linux-only, so the feature is never enabled on macOS.
-aya = { version = "0.13", optional = true }
+aya = { version = "0.14", optional = true }
 
 [target.'cfg(target_os = "windows")'.dependencies]
 windows-sys = { version = "0.61", features = [
