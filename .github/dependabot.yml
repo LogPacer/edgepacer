@@ -62,13 +62,6 @@ updates:
         update-types:
           - minor
           - major
-      rust-legacy-storage:
-        applies-to: version-updates
-        patterns:
-          - "redb"
-        update-types:
-          - minor
-          - major
       rust-sqlite-storage:
         applies-to: version-updates
         patterns:

@@ -1,7 +1,7 @@
 use edgepacer::{
     agent, auth_session, common, config, counters, discovery, ebpf, error_collector, identity,
-    legacy_migration, metrics_shipper, orchestrator, sampler, self_telemetry, sender, stats,
-    trace_proxy_manager, upload_token_store,
+    metrics_shipper, orchestrator, sampler, self_telemetry, sender, stats, trace_proxy_manager,
+    upload_token_store,
 };
 
 use config::AppConfig;
@@ -647,7 +647,6 @@ fn prepare_data_dir(data_dir: &Path) -> anyhow::Result<()> {
         anyhow::bail!("failed to create data directory: {e}");
     }
 
-    legacy_migration::migrate_redb_to_sqlite(data_dir);
     Ok(())
 }
 
