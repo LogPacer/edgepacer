@@ -95,8 +95,11 @@ pub struct StoppedItem {
 
 /// Tracks inventory state across discovery cycles.
 pub struct ChangeTracker {
-    /// Committed container state (after Rails ack).
-    committed_containers: HashMap<String, Container>,
+    /// Committed container state (after Rails ack), grouped by lane key: one
+    /// entry per explicit-service instance, one per screener workload. A
+    /// group carries every live replica, so change detection covers replica
+    /// roster moves and per-replica atom drift, not just the representative.
+    committed_containers: HashMap<String, Vec<Container>>,
     /// Committed file state.
     committed_files: HashMap<String, LogFile>,
     /// Committed service state.
@@ -104,12 +107,17 @@ pub struct ChangeTracker {
     /// Committed package lane state.
     committed_packages: PackageState,
     /// Pending state (before commit/rollback).
-    pending_containers: Option<HashMap<String, Container>>,
+    pending_containers: Option<HashMap<String, Vec<Container>>>,
     pending_files: Option<HashMap<String, LogFile>>,
     pending_services: Option<HashMap<String, SystemdService>>,
     pending_packages: Option<PackageState>,
     next_package_sequence: u64,
     force_package_full_snapshot: bool,
+    /// True until the next committed inventory report: the tracker holds no
+    /// acked baseline (fresh start or post-`require_full_resync`), so that
+    /// report re-emits the world and its lane payloads carry `full_report`,
+    /// telling Rails absence-implies-stopped semantics are safe.
+    full_inventory_report: bool,
     /// Identifiers rejected by Rails (don't re-report).
     rejected: HashSet<String>,
 }
@@ -133,8 +141,15 @@ impl ChangeTracker {
             pending_packages: None,
             next_package_sequence: 1,
             force_package_full_snapshot: true,
+            full_inventory_report: true,
             rejected: HashSet::new(),
         }
+    }
+
+    /// Whether the next inventory report re-emits the world (no acked
+    /// baseline). Lane payloads built from such a report carry `full_report`.
+    pub fn full_report(&self) -> bool {
+        self.full_inventory_report
     }
 
     /// Compare current census against committed state and produce a diff report.
@@ -143,8 +158,10 @@ impl ChangeTracker {
         let mut report = InventoryReport::default();
 
         // --- Containers ---
-        let mut current_containers = HashMap::new();
+        let mut current_containers: HashMap<String, Vec<Container>> = HashMap::new();
         let mut seen_container_ids = HashSet::new();
+        // Census order of first sighting, so report order stays deterministic.
+        let mut container_order: Vec<String> = Vec::new();
 
         for container in &census.containers {
             // Explicit-service containers are tracked per INSTANCE, so every
@@ -162,17 +179,31 @@ impl ChangeTracker {
             if self.rejected.contains(&id) {
                 continue;
             }
-            seen_container_ids.insert(id.clone());
-            current_containers.insert(id.clone(), container.clone());
+            if seen_container_ids.insert(id.clone()) {
+                container_order.push(id.clone());
+            }
+            current_containers
+                .entry(id)
+                .or_default()
+                .push(container.clone());
+        }
 
-            match self.committed_containers.get(&id) {
-                None => report.new_containers.push(container.clone()),
-                Some(prev)
-                    if prev.state != container.state
-                        || prev.image != container.image
-                        || prev.log_format != container.log_format =>
-                {
-                    report.changed_containers.push(container.clone());
+        for id in &container_order {
+            let replicas = current_containers
+                .get_mut(id)
+                .expect("every ordered id was inserted");
+            // Deterministic replica order: comparisons and the workload
+            // representative must not depend on runtime enumeration order.
+            replicas.sort_by(|a, b| {
+                a.stable_instance_id()
+                    .cmp(&b.stable_instance_id())
+                    .then_with(|| a.id.cmp(&b.id))
+            });
+
+            match self.committed_containers.get(id) {
+                None => report_container_group(&mut report.new_containers, replicas),
+                Some(prev) if containers_changed(prev, replicas) => {
+                    report_container_group(&mut report.changed_containers, replicas);
                 }
                 _ => {} // No change
             }
@@ -184,7 +215,7 @@ impl ChangeTracker {
                 report.stopped_containers.push(StoppedItem {
                     identifier: id.clone(),
                     item_type: "container".into(),
-                    explicit_service: prev.explicit_service(),
+                    explicit_service: prev.iter().any(Container::explicit_service),
                 });
             }
         }
@@ -268,6 +299,10 @@ impl ChangeTracker {
     pub fn commit_scan(&mut self) {
         if let Some(containers) = self.pending_containers.take() {
             self.committed_containers = containers;
+            // The acked report established a baseline; later reports are
+            // deltas. A late commit after `require_full_resync` never lands
+            // here (pending was dropped), so the marker survives it.
+            self.full_inventory_report = false;
         }
         if let Some(files) = self.pending_files.take() {
             self.committed_files = files;
@@ -386,8 +421,35 @@ impl ChangeTracker {
         self.pending_containers = None;
         self.pending_files = None;
         self.pending_services = None;
+        self.full_inventory_report = true;
         self.require_package_full_resync();
         debug!("full inventory resync requested");
+    }
+}
+
+/// Whether a tracked container group must re-report: runtime state, image,
+/// log format, identifier atoms, or the replica roster moved. Atom equality is
+/// what re-reports an in-place label edit — Rails evaluates service selectors
+/// over these atoms, so a drifted set means drifted membership. Both sides are
+/// sorted by (stable_instance_id, id), so replica pairing is deterministic.
+fn containers_changed(prev: &[Container], current: &[Container]) -> bool {
+    prev.len() != current.len()
+        || prev.iter().zip(current).any(|(p, c)| {
+            p.state != c.state
+                || p.image != c.image
+                || p.log_format != c.log_format
+                || p.identifier_set() != c.identifier_set()
+        })
+}
+
+/// Push a tracked group into a report bucket. Explicit services stay
+/// per-instance entries; a screener workload reports one representative (its
+/// replicas ride in the census entry's `active_instances`).
+fn report_container_group(bucket: &mut Vec<Container>, replicas: &[Container]) {
+    if replicas.iter().any(Container::explicit_service) {
+        bucket.extend(replicas.iter().cloned());
+    } else if let Some(representative) = replicas.first() {
+        bucket.push(representative.clone());
     }
 }
 
@@ -1031,5 +1093,190 @@ mod tests {
 
         let report = tracker.update_from_scan(&census);
         assert_eq!(report.new_containers.len(), 1);
+    }
+
+    fn kamal_container(name: &str) -> Container {
+        let mut c = make_container(name, "running");
+        c.labels.insert("service".into(), "logpacer".into());
+        c.labels.insert("destination".into(), "prod".into());
+        c
+    }
+
+    #[test]
+    fn label_edit_with_unchanged_state_and_image_re_emits() {
+        // A Kamal container gains a `role` label in place: state, image, and
+        // log format are untouched, but the identifier atoms moved — census
+        // must re-report or selector membership goes stale.
+        let mut tracker = ChangeTracker::new();
+        let _ = tracker.update_from_scan(&Census {
+            containers: vec![kamal_container("logpacer-prod-1a2b3c4")],
+            ..Default::default()
+        });
+        tracker.commit_scan();
+
+        let mut edited = kamal_container("logpacer-prod-1a2b3c4");
+        edited.labels.insert("role".into(), "web".into());
+        let report = tracker.update_from_scan(&Census {
+            containers: vec![edited],
+            ..Default::default()
+        });
+
+        assert_eq!(report.changed_containers.len(), 1);
+        assert_eq!(
+            report.changed_containers[0]
+                .identifier_set()
+                .get("kamal.role")
+                .map(String::as_str),
+            Some("web")
+        );
+    }
+
+    #[test]
+    fn unchanged_identifier_atoms_do_not_re_emit() {
+        let mut tracker = ChangeTracker::new();
+        let census = Census {
+            containers: vec![kamal_container("logpacer-prod-1a2b3c4")],
+            ..Default::default()
+        };
+        let _ = tracker.update_from_scan(&census);
+        tracker.commit_scan();
+
+        assert!(tracker.update_from_scan(&census).is_empty());
+    }
+
+    #[test]
+    fn gaining_explicit_service_name_re_emits_and_re_routes() {
+        // In-place opt-in: the container gains LOGPACER_SERVICE_NAME with
+        // state/image unchanged. The atoms gain `service_name`, so the entry
+        // re-emits — and the partition in agent.rs routes it to the services
+        // census because it is now explicit.
+        let mut tracker = ChangeTracker::new();
+        let _ = tracker.update_from_scan(&Census {
+            containers: vec![make_container("api-1", "running")],
+            ..Default::default()
+        });
+        tracker.commit_scan();
+
+        let mut opted_in = make_container("api-1", "running");
+        opted_in.service_name = "api".into();
+        opted_in.service_name_explicit = true;
+        let report = tracker.update_from_scan(&Census {
+            containers: vec![opted_in],
+            ..Default::default()
+        });
+
+        assert_eq!(report.changed_containers.len(), 1);
+        assert!(report.changed_containers[0].explicit_service());
+    }
+
+    #[test]
+    fn multi_replica_screener_workload_reports_one_entry_without_churn() {
+        // Three screener replicas share one workload key, so census gets ONE
+        // entry (replicas ride in active_instances). Replica names differ —
+        // container.name is an atom — so the comparison must pair replicas
+        // deterministically or every scan would falsely re-emit.
+        let mut tracker = ChangeTracker::new();
+        let replicas = || {
+            vec![
+                compose_replica("1", false),
+                compose_replica("2", false),
+                compose_replica("3", false),
+            ]
+        };
+        let report = tracker.update_from_scan(&Census {
+            containers: replicas(),
+            ..Default::default()
+        });
+        assert_eq!(report.new_containers.len(), 1);
+        assert_eq!(report.new_containers[0].stable_id(), "shop/web");
+        tracker.commit_scan();
+
+        // Same replicas, reversed enumeration order: no change.
+        let mut reversed = replicas();
+        reversed.reverse();
+        assert!(
+            tracker
+                .update_from_scan(&Census {
+                    containers: reversed,
+                    ..Default::default()
+                })
+                .is_empty()
+        );
+        tracker.commit_scan();
+
+        // The replica roster is part of the census entry: scaling 3 → 2
+        // re-emits the workload (as changed, not stopped — it still runs).
+        let report = tracker.update_from_scan(&Census {
+            containers: vec![compose_replica("1", false), compose_replica("2", false)],
+            ..Default::default()
+        });
+        assert_eq!(report.changed_containers.len(), 1);
+        assert!(report.stopped_containers.is_empty());
+    }
+
+    #[test]
+    fn single_replica_drift_re_emits_the_workload() {
+        let mut tracker = ChangeTracker::new();
+        let _ = tracker.update_from_scan(&Census {
+            containers: vec![compose_replica("1", false), compose_replica("2", false)],
+            ..Default::default()
+        });
+        tracker.commit_scan();
+
+        // Replica 2 rolls to a new image while replica 1 is untouched.
+        let mut rolled = compose_replica("2", false);
+        rolled.image = "nginx:1.29".into();
+        let report = tracker.update_from_scan(&Census {
+            containers: vec![compose_replica("1", false), rolled],
+            ..Default::default()
+        });
+
+        assert_eq!(report.changed_containers.len(), 1);
+    }
+
+    #[test]
+    fn full_report_marks_first_report_until_committed() {
+        let mut tracker = ChangeTracker::new();
+        // A fresh tracker has no acked baseline: its first report IS full.
+        assert!(tracker.full_report());
+
+        let census = Census {
+            containers: vec![make_container("abc123", "running")],
+            ..Default::default()
+        };
+        let _ = tracker.update_from_scan(&census);
+        // Still full while the report is in flight; a failed POST (rollback)
+        // must retry as a full report.
+        assert!(tracker.full_report());
+        tracker.rollback_scan();
+        assert!(tracker.full_report());
+
+        let _ = tracker.update_from_scan(&census);
+        tracker.commit_scan();
+        assert!(!tracker.full_report(), "acked baseline makes deltas");
+    }
+
+    #[test]
+    fn full_report_marks_first_report_after_resync_clear() {
+        let mut tracker = ChangeTracker::new();
+        let census = Census {
+            containers: vec![make_container("abc123", "running")],
+            ..Default::default()
+        };
+        let _ = tracker.update_from_scan(&census);
+        tracker.commit_scan();
+        assert!(!tracker.full_report());
+
+        tracker.require_full_resync();
+        assert!(tracker.full_report());
+        // The late commit of the same cycle is a no-op (pending dropped) and
+        // must not consume the marker before the full re-emit is acked.
+        tracker.commit_scan();
+        assert!(tracker.full_report());
+
+        let report = tracker.update_from_scan(&census);
+        assert_eq!(report.new_containers.len(), 1);
+        tracker.commit_scan();
+        assert!(!tracker.full_report(), "subsequent deltas are not full");
     }
 }
