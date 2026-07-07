@@ -11,7 +11,7 @@ use std::io::{BufRead, BufReader};
 use std::path::Path;
 use std::time::Duration;
 
-use bollard::container::LogsOptions;
+use bollard::query_parameters::LogsOptions;
 use futures_util::StreamExt;
 use serde::Deserialize;
 use tokio::sync::watch;
@@ -311,7 +311,7 @@ async fn read_docker_lines(container_id: &str, max_lines: usize) -> Result<Vec<S
         Err(error) => return Err(format!("docker connect failed: {error}")),
     };
 
-    let options = LogsOptions::<String> {
+    let options = LogsOptions {
         follow: false,
         stdout: true,
         stderr: true,
