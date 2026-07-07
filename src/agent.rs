@@ -183,18 +183,14 @@ async fn report_inventory(
     // services census lane; everything else is server-sourced inventory for
     // the screener. (service_name alone is not consent: docker/CRI fill it
     // from compose labels / container names for every container.)
-    // K8s containers without explicit service-name opt-in stay skipped from
-    // the container census — matches Go agent behavior.
+    // Non-explicit k8s containers ride the containers lane like docker ones:
+    // the tracker keys screener containers per stable_id, so volume stays
+    // workload-bounded, and their atoms make them selector-composable.
     let (services, containers): (Vec<&Container>, Vec<&Container>) = report
         .new_containers
         .iter()
         .chain(report.changed_containers.iter())
         .partition(|c| c.explicit_service());
-
-    let containers: Vec<&Container> = containers
-        .into_iter()
-        .filter(|c| c.runtime != "kubernetes")
-        .collect();
 
     // Stop deltas split the same way: explicit services report to the services
     // census, plain containers to the containers census.
@@ -867,6 +863,124 @@ mod tests {
         assert_eq!(instances.len(), 2);
         assert_eq!(instances[0]["identifiers"]["kamal.role"], "rpc");
         assert_eq!(instances[1]["identifiers"]["kamal.role"], "web");
+    }
+
+    fn k8s_deployment_pod(pod: &str) -> Container {
+        Container {
+            id: format!("prod/{pod}/api"),
+            name: format!("{pod}-api"),
+            // Derived label echo, NOT the explicit LOGPACER opt-in.
+            service_name: "api".into(),
+            service_name_explicit: false,
+            image: "ghcr.io/logpacer/api:v1.4.3".into(),
+            state: "running".into(),
+            labels: Default::default(),
+            env: vec![],
+            runtime: "kubernetes".into(),
+            log_path: format!("/var/log/pods/prod_{pod}_uid/api"),
+            log_format: "plain_text".into(),
+            pod_uid: format!("{pod}-uid"),
+            pod_name: pod.into(),
+            namespace: "prod".into(),
+            node_name: "node-1".into(),
+            deployment: "api".into(),
+            workload_kind: "deployment".into(),
+            container_id: format!("containerd://{pod}"),
+            container_name: "api".into(),
+        }
+    }
+
+    /// Non-explicit k8s containers ride the containers census lane like docker
+    /// ones — at workload granularity, with their atoms — so they are
+    /// selector-composable without a LOGPACER_SERVICE_NAME redeploy.
+    #[tokio::test]
+    async fn non_explicit_k8s_workload_reports_once_on_the_containers_lane() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/v1/census/containers"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "status": "accepted"
+            })))
+            .mount(&server)
+            .await;
+
+        let config = test_app_config(server.uri());
+        let client = Client::new_for_test(&config, "installation-1").unwrap();
+        client.set_bearer_token("access-1");
+        let mut tracker = ChangeTracker::new();
+
+        let census = discovery::Census {
+            containers: vec![
+                k8s_deployment_pod("api-7b4f9c8d5-aaaaa"),
+                k8s_deployment_pod("api-7b4f9c8d5-bbbbb"),
+            ],
+            ..Default::default()
+        };
+        let report = tracker.update_from_scan(&census);
+        report_inventory(&client, &mut tracker, &report, &census.containers)
+            .await
+            .unwrap();
+
+        let bodies: Vec<serde_json::Value> = server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .map(|r| serde_json::from_slice(&r.body).unwrap())
+            .collect();
+        // Only the containers (screener) lane posts — no explicit opt-in means
+        // no services-lane traffic.
+        assert_eq!(bodies.len(), 1);
+        let containers = bodies[0]["containers"].as_array().unwrap();
+        assert_eq!(
+            containers.len(),
+            1,
+            "replicas coarsen to one workload entry"
+        );
+
+        let entry = &containers[0];
+        assert_eq!(entry["identifier"], "prod/api/api");
+        assert_eq!(entry["identifiers"]["k8s.namespace"], "prod");
+        assert_eq!(entry["identifiers"]["k8s.workload"], "api");
+        assert_eq!(entry["identifiers"]["k8s.container"], "api");
+        assert_eq!(entry["identifiers"]["image.repo"], "ghcr.io/logpacer/api");
+        // Each live pod rides inside the workload entry, never as its own entry.
+        let instances = entry["active_instances"].as_array().unwrap();
+        assert_eq!(instances.len(), 2);
+    }
+
+    /// Explicit LOGPACER_SERVICE_NAME k8s containers keep their services-lane
+    /// routing — the gate lift only adds the screener lane for the rest.
+    #[tokio::test]
+    async fn explicit_k8s_container_still_reports_on_the_services_lane() {
+        let server = MockServer::start().await;
+        for lane in ["containers", "services"] {
+            Mock::given(method("POST"))
+                .and(path(format!("/api/v1/census/{lane}")))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "status": "accepted"
+                })))
+                .mount(&server)
+                .await;
+        }
+
+        let config = test_app_config(server.uri());
+        let client = Client::new_for_test(&config, "installation-1").unwrap();
+        client.set_bearer_token("access-1");
+        let mut tracker = ChangeTracker::new();
+
+        let census = discovery::Census {
+            containers: vec![k8s_statefulset_container()],
+            ..Default::default()
+        };
+        let report = tracker.update_from_scan(&census);
+        report_inventory(&client, &mut tracker, &report, &census.containers)
+            .await
+            .unwrap();
+
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 1);
+        assert!(requests[0].url.path().ends_with("/census/services"));
     }
 
     #[tokio::test]

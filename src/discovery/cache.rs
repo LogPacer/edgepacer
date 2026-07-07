@@ -189,14 +189,15 @@ impl DiscoveryCache {
         self.epoch += 1;
     }
 
+    // Kubernetes containers are cached whether or not they carry the explicit
+    // opt-in: a selector match is consent too, and it can only resolve against
+    // a cached container. Collection consent survives at the directive layer —
+    // no selector match and no explicit opt-in means no directive, and no
+    // directive means no pipeline.
     fn update_containers(&mut self, containers: &[Container]) {
         self.containers.clear();
         for container in containers {
             let c = container.clone();
-            if c.runtime == "kubernetes" && !c.explicit_service() {
-                continue;
-            }
-
             let spec_name = if !c.container_name.is_empty() {
                 c.container_name.clone()
             } else {
@@ -671,23 +672,22 @@ mod tests {
     }
 
     #[test]
-    fn refuses_non_explicit_kubernetes_container_resolution() {
+    fn resolves_non_explicit_kubernetes_container() {
+        // A selector match is consent, and it can only resolve against a cached
+        // container — so k8s containers are cached without the explicit opt-in.
+        // Consent survives at the directive layer: no selector match and no
+        // opt-in means no directive, and no directive means no pipeline.
         let mut cache = DiscoveryCache::new();
         let mut census = Census::default();
         census.containers.push(kubernetes_container(false));
         cache.update_all(&census);
 
-        assert!(
-            cache
-                .resolve_access_method("default/checkout/app", "container")
-                .is_none()
-        );
-        assert!(
-            cache
-                .resolve_access_method("/var/log/pods/default_test-pod_uid/app", "container")
-                .is_none()
-        );
-        assert_eq!(cache.stats().containers, 0);
+        let (method, loc) = cache
+            .resolve_access_method("default/checkout/app", "container")
+            .unwrap();
+        assert_eq!(method, AccessMethod::Kubernetes);
+        assert_eq!(loc, "/var/log/pods/default_test-pod_uid/app");
+        assert_eq!(cache.stats().containers, 1);
     }
 
     #[test]

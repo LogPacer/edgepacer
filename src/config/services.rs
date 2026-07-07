@@ -706,4 +706,39 @@ mod tests {
             "service-42/web.1"
         );
     }
+
+    #[test]
+    fn non_explicit_k8s_workload_collects_only_via_selector() {
+        // The selector IS the consent for k8s: a workload that never opted in
+        // via LOGPACER_SERVICE_NAME collects when a description matches its
+        // atoms...
+        let mut pod = k8s_deployment_pod("api-7b4f9c8d5-aaaaa");
+        pod.service_name = String::new();
+        pod.service_name_explicit = false;
+        let cache = cache_with(vec![pod]);
+
+        let matching = unified(json!({
+            "services": [service_entry(
+                json!({"k8s.namespace": "prod", "k8s.workload": "api"})
+            )]
+        }));
+        let resolved = resolved_collect_from_config(&matching, &cache);
+        assert_eq!(resolved.file_streams.len(), 1);
+        let stream = &resolved.file_streams[0];
+        assert_eq!(
+            stream.log_source_id,
+            "service-42/prod/api/api/api-7b4f9c8d5-aaaaa"
+        );
+        assert_eq!(
+            stream.source_format,
+            crate::config::FileSourceFormat::KubernetesCri
+        );
+
+        // ...and stays resolvable-but-uncollected without one: no matching
+        // description and no opt-in means no directive, hence no pipeline.
+        let no_descriptions = unified(json!({}));
+        let resolved = resolved_collect_from_config(&no_descriptions, &cache);
+        assert!(resolved.file_streams.is_empty());
+        assert!(resolved.streaming_sources.is_empty());
+    }
 }
