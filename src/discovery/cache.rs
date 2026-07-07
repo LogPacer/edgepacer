@@ -163,11 +163,21 @@ pub struct DiscoveryCache {
     files: HashMap<String, LogFile>,
     systemd_services: HashMap<String, SystemdService>,
     event_log_channels: HashMap<String, EventLogChannel>,
+    /// Monotonic count of applied census scans. The orchestrator reconciles
+    /// when this moves, so directive resolution re-runs on discovery changes,
+    /// not only on config changes. Advanced under the same write lock as the
+    /// entries, so an observed epoch always matches the cached contents.
+    epoch: u64,
 }
 
 impl DiscoveryCache {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// The discovery epoch as of the last applied scan.
+    pub fn epoch(&self) -> u64 {
+        self.epoch
     }
 
     /// Replace all cache entries from a census scan.
@@ -176,6 +186,7 @@ impl DiscoveryCache {
         self.update_files(&census.log_files);
         self.update_systemd_services(&census.systemd_services);
         self.update_event_log_channels(&census.event_log_channels);
+        self.epoch += 1;
     }
 
     fn update_containers(&mut self, containers: &[Container]) {
@@ -532,6 +543,21 @@ mod tests {
         let mut cache = DiscoveryCache::new();
         cache.update_all(&census);
         cache
+    }
+
+    #[test]
+    fn epoch_advances_on_every_applied_scan() {
+        let mut cache = DiscoveryCache::new();
+        assert_eq!(cache.epoch(), 0, "no scan applied yet");
+
+        cache.update_all(&Census::default());
+        assert_eq!(cache.epoch(), 1);
+
+        // Identical census content still advances the epoch: the epoch marks
+        // "a scan was applied", and reconcile cost for an unchanged scan is a
+        // cheap no-op re-resolve.
+        cache.update_all(&Census::default());
+        assert_eq!(cache.epoch(), 2);
     }
 
     fn kubernetes_container(service_name_explicit: bool) -> Container {

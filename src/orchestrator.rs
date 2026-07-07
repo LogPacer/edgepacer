@@ -17,7 +17,7 @@ use std::time::Duration;
 
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::config::{
     self, BufferTuning, CollectDiagnostic, FileSourceFormat, LogStreamConfig, SharedConfig,
@@ -635,12 +635,13 @@ pub async fn run(
         .with_monitoring(counters, error_collector.clone())
         .with_overflow(overflow);
     let mut last_checksum = String::new();
+    let mut last_discovery_epoch = 0u64;
     let mut last_tuning: Option<BufferTuning> = None;
     // Per-source last-logged resolution status, so unchanged misses don't
     // re-warn every reconcile (see [`log_collect_resolution`]).
     let mut resolution_log: HashMap<String, MatchStatus> = HashMap::new();
 
-    info!("orchestrator started, watching for config changes");
+    info!("orchestrator started, watching for config and discovery changes");
 
     let poll_interval = Duration::from_secs(2);
 
@@ -656,11 +657,21 @@ pub async fn run(
 
         orchestrator.update_operational_stats();
 
+        let discovery_epoch = discovery_cache.read().await.epoch();
         let reconcile = {
             let cfg = shared_config.read().await;
             match cfg.as_ref() {
-                Some(unified) if unified.checksum != last_checksum => {
+                Some(unified)
+                    if reconcile_due(
+                        &unified.checksum,
+                        &last_checksum,
+                        discovery_epoch,
+                        last_discovery_epoch,
+                    ) =>
+                {
+                    let config_changed = unified.checksum != last_checksum;
                     last_checksum = unified.checksum.clone();
+                    last_discovery_epoch = discovery_epoch;
                     // Apply any re-pinned identity before reconciling. This only
                     // updates the shared cell (read live at ship time), so it does
                     // not restart pipelines — a stamp-flag change does, via the
@@ -675,13 +686,16 @@ pub async fn run(
                         resolved.streaming_sources,
                         resolved.diagnostics,
                         BufferTuning::resolve(Some(unified)),
+                        config_changed,
                     ))
                 }
                 _ => None,
             }
         };
 
-        if let Some((file_streams, streaming_sources, diagnostics, tuning)) = reconcile {
+        if let Some((file_streams, streaming_sources, diagnostics, tuning, config_changed)) =
+            reconcile
+        {
             log_collect_resolution(&mut resolution_log, &diagnostics);
 
             // Changed buffer/delivery tuning requires reopening every buffer
@@ -707,17 +721,42 @@ pub async fn run(
                 error_collector.set_config_version(&checksum);
             }
 
-            info!(
-                file_streams = file_streams.len(),
-                streaming_sources = streaming_sources.len(),
-                "config changed, reconciling pipelines"
-            );
+            // Discovery-only reconciles happen every scan and usually no-op
+            // (`plan_source_reconciliation` skips unchanged sources), so they
+            // log at debug to keep steady-state info logs quiet.
+            if config_changed {
+                info!(
+                    file_streams = file_streams.len(),
+                    streaming_sources = streaming_sources.len(),
+                    "config changed, reconciling pipelines"
+                );
+            } else {
+                debug!(
+                    file_streams = file_streams.len(),
+                    streaming_sources = streaming_sources.len(),
+                    "discovery changed, reconciling pipelines"
+                );
+            }
             orchestrator
                 .reconcile(&file_streams, &streaming_sources)
                 .await;
             orchestrator.update_operational_stats();
         }
     }
+}
+
+/// Whether the orchestrator must re-resolve directives and reconcile
+/// pipelines: the unified config moved, or discovery applied a new scan since
+/// the last reconcile. The discovery edge is what lets a directive that
+/// resolved `NotFound` retry as soon as its container appears, instead of
+/// waiting for an unrelated config edit.
+fn reconcile_due(
+    checksum: &str,
+    last_checksum: &str,
+    discovery_epoch: u64,
+    last_discovery_epoch: u64,
+) -> bool {
+    checksum != last_checksum || discovery_epoch != last_discovery_epoch
 }
 
 fn sanitize_id(id: &str) -> String {
@@ -948,6 +987,183 @@ mod tests {
         log_collect_resolution(&mut log, &[diag("b", MatchStatus::Matched)]);
         assert!(!log.contains_key("a"));
         assert_eq!(log.get("b"), Some(&MatchStatus::Matched));
+    }
+
+    fn docker_container(id: &str, name: &str, log_path: &str) -> crate::discovery::Container {
+        crate::discovery::Container {
+            id: id.into(),
+            name: name.into(),
+            service_name: String::new(),
+            service_name_explicit: false,
+            image: "nginx:latest".into(),
+            state: "running".into(),
+            labels: std::collections::HashMap::new(),
+            env: vec![],
+            runtime: "docker".into(),
+            log_path: log_path.into(),
+            log_format: "plain_text".into(),
+            pod_uid: String::new(),
+            pod_name: String::new(),
+            namespace: String::new(),
+            node_name: String::new(),
+            deployment: String::new(),
+            workload_kind: String::new(),
+            container_id: id.into(),
+            container_name: String::new(),
+        }
+    }
+
+    fn container_collect_config(locator: &str) -> config::UnifiedConfig {
+        config::UnifiedConfig::new(
+            serde_json::json!({
+                "collect": {
+                    "collect-web": {
+                        "locator": locator,
+                        "matching_strategy": "container_name",
+                        "subbox_endpoint": "http://127.0.0.1:9/wire",
+                        "archive_id": "arc",
+                        "repo_id": "repo"
+                    }
+                }
+            }),
+            "etag-1".into(),
+        )
+    }
+
+    #[test]
+    fn reconcile_is_due_on_config_or_discovery_change_only() {
+        // Unchanged config + unchanged discovery performs no reconcile work.
+        assert!(!reconcile_due("sum-1", "sum-1", 3, 3));
+        // Config moved.
+        assert!(reconcile_due("sum-2", "sum-1", 3, 3));
+        // Discovery applied a new scan, config unchanged.
+        assert!(reconcile_due("sum-1", "sum-1", 4, 3));
+    }
+
+    /// A directive that resolved `NotFound` must resolve — and its pipeline
+    /// must start — on the scan where its container appears, with no config
+    /// change involved.
+    #[tokio::test]
+    async fn discovery_epoch_bump_resolves_directive_and_starts_pipeline() {
+        let dir = tempfile::tempdir().unwrap();
+        let log_path = dir.path().join("web.log");
+        std::fs::write(&log_path, "line\n").unwrap();
+
+        let unified = container_collect_config("web-app");
+        let mut cache = crate::discovery::DiscoveryCache::new();
+        cache.update_all(&crate::discovery::Census::default());
+
+        let mut orch = Orchestrator::new(dir.path(), test_identity());
+        let mut last_checksum = String::new();
+        let mut last_epoch = 0u64;
+
+        // Tick 1: config arrives; the container is not discovered yet, so the
+        // directive resolves NotFound and nothing starts.
+        assert!(reconcile_due(
+            &unified.checksum,
+            &last_checksum,
+            cache.epoch(),
+            last_epoch
+        ));
+        last_checksum = unified.checksum.clone();
+        last_epoch = cache.epoch();
+        let resolved = config::resolved_collect_from_config(&unified, &cache);
+        assert_eq!(resolved.diagnostics[0].status, MatchStatus::NotFound);
+        orch.reconcile(&resolved.file_streams, &resolved.streaming_sources)
+            .await;
+        assert_eq!(orch.active_count(), 0);
+
+        // Steady state: nothing moved, so no reconcile is due.
+        assert!(!reconcile_due(
+            &unified.checksum,
+            &last_checksum,
+            cache.epoch(),
+            last_epoch
+        ));
+
+        // Scan 2: the container appears. The epoch alone makes reconcile due;
+        // the directive resolves and its pipeline starts.
+        cache.update_all(&crate::discovery::Census {
+            containers: vec![docker_container(
+                "web-abc123def456",
+                "web-app",
+                log_path.to_str().unwrap(),
+            )],
+            ..Default::default()
+        });
+        assert!(reconcile_due(
+            &unified.checksum,
+            &last_checksum,
+            cache.epoch(),
+            last_epoch
+        ));
+        last_epoch = cache.epoch();
+        let resolved = config::resolved_collect_from_config(&unified, &cache);
+        assert_eq!(resolved.diagnostics[0].status, MatchStatus::Matched);
+        orch.reconcile(&resolved.file_streams, &resolved.streaming_sources)
+            .await;
+        assert_eq!(orch.active_count(), 1);
+
+        // And the loop settles again until the next config or discovery edge.
+        assert!(!reconcile_due(
+            &unified.checksum,
+            &last_checksum,
+            cache.epoch(),
+            last_epoch
+        ));
+
+        orch.shutdown_all().await;
+    }
+
+    /// Every discovery scan bumps the epoch, so steady-state reconciles are
+    /// no-ops: identical resolution must never restart a running pipeline.
+    #[tokio::test]
+    async fn epoch_bump_with_unchanged_directives_restarts_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let log_path = dir.path().join("web.log");
+        std::fs::write(&log_path, "line\n").unwrap();
+        let container = docker_container("web-abc123def456", "web-app", log_path.to_str().unwrap());
+
+        let unified = container_collect_config("web-app");
+        let mut cache = crate::discovery::DiscoveryCache::new();
+        cache.update_all(&crate::discovery::Census {
+            containers: vec![container.clone()],
+            ..Default::default()
+        });
+
+        let mut orch = Orchestrator::new(dir.path(), test_identity());
+        let resolved = config::resolved_collect_from_config(&unified, &cache);
+        orch.reconcile(&resolved.file_streams, &resolved.streaming_sources)
+            .await;
+        assert_eq!(orch.active_count(), 1);
+
+        // Watch the running pipeline's shutdown channel: a restart would
+        // signal (or drop) it.
+        let rx = orch
+            .pipelines
+            .values()
+            .next()
+            .expect("pipeline is running")
+            .shutdown_tx
+            .subscribe();
+
+        // A scan with identical content: the epoch moves, resolution is
+        // identical, and the reconcile plan no-ops.
+        cache.update_all(&crate::discovery::Census {
+            containers: vec![container],
+            ..Default::default()
+        });
+        let resolved = config::resolved_collect_from_config(&unified, &cache);
+        orch.reconcile(&resolved.file_streams, &resolved.streaming_sources)
+            .await;
+
+        assert_eq!(orch.active_count(), 1);
+        assert!(
+            !rx.has_changed().unwrap_or(true),
+            "epoch bump with unchanged directives must not restart pipelines"
+        );
+
+        orch.shutdown_all().await;
     }
 
     #[test]
