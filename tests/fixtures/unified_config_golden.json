@@ -1,0 +1,88 @@
+{
+  "version": "6f67999421087a72",
+  "resource_identifier": "golden-host",
+  "config": {
+    "poll_secs": 60,
+    "send_stats": true,
+    "stats_interval_secs": 30,
+    "error_callback": "/api/v1/agents/errors"
+  },
+  "discovery": {
+    "enabled": true,
+    "scan_paths": [
+      "/var/log",
+      "/var/lib/docker/containers"
+    ],
+    "exclude_paths": [],
+    "deep_scan": false
+  },
+  "telemetry": {
+    "enabled": false
+  },
+  "collect": {
+    "service-3": {
+      "archive_id": "account-6",
+      "repo_id": "golden-web-repo",
+      "locator": "golden-web",
+      "matching_strategy": "env_var",
+      "subbox_endpoint": "https://subbox.golden.example/v1/logpacer-wire",
+      "container_identifier": "golden-web",
+      "metadata": {
+        "service_name": "Golden Web",
+        "kind": "container"
+      }
+    }
+  },
+  "services": [
+    {
+      "service_slug": "golden-web",
+      "selector": {
+        "kamal.role": "web",
+        "kamal.service": "golden",
+        "kamal.destination": "prod"
+      },
+      "collect": {
+        "log_source_id": "service-3",
+        "archive_id": "account-6",
+        "repo_id": "golden-web-repo",
+        "locator": "golden-web",
+        "container_identifier": "golden-web",
+        "matching_strategy": "env_var",
+        "subbox_endpoint": "https://subbox.golden.example/v1/logpacer-wire",
+        "metadata": {
+          "service_name": "Golden Web",
+          "kind": "container"
+        },
+        "forwarding_enabled": false
+      }
+    }
+  ],
+  "traces": {
+    "8": {
+      "subbox_endpoint": "https://subbox.golden.example/v1/logpacer-wire",
+      "listen_address": "127.0.0.1:4318",
+      "archive_id": "account-6",
+      "repo_id": "traces",
+      "stamp_resource_identifier": true
+    }
+  },
+  "metrics": {
+    "8": {
+      "subbox_endpoint": "https://subbox.golden.example/v1/logpacer-wire",
+      "archive_id": "account-6",
+      "repo_id": "metrics",
+      "collection_interval_secs": 1,
+      "send_interval_secs": 10,
+      "stamp_resource_identifier": true
+    }
+  },
+  "ebpf": {
+    "enabled": false,
+    "receiver_port": 4318,
+    "network_flows": {
+      "enabled": false,
+      "cidrs": []
+    },
+    "targets": {}
+  }
+}
