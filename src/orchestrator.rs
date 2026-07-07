@@ -324,11 +324,35 @@ impl Orchestrator {
                 continue;
             }
             match std::fs::rename(&legacy_dir, &source_dir) {
-                Ok(()) => info!(
-                    legacy_log_source_id = %adoption.legacy_log_source_id,
-                    log_source_id = %adoption.log_source_id,
-                    "adopted legacy checkpoint state dir"
-                ),
+                Ok(()) => {
+                    // The dir rename carries the store file; the checkpoint row
+                    // inside it is keyed by source id and must follow too, or
+                    // the synthesized source misses its resume point and
+                    // replays the whole container log from zero.
+                    let rekeyed = crate::checkpoint::CheckpointStore::open(
+                        &source_dir.join("streaming_checkpoints.sqlite"),
+                    )
+                    .and_then(|store| {
+                        store.rekey_streaming(
+                            &adoption.legacy_log_source_id,
+                            &adoption.log_source_id,
+                        )
+                    });
+                    match rekeyed {
+                        Ok(moved) => info!(
+                            legacy_log_source_id = %adoption.legacy_log_source_id,
+                            log_source_id = %adoption.log_source_id,
+                            checkpoint_rekeyed = moved,
+                            "adopted legacy checkpoint state dir"
+                        ),
+                        Err(e) => warn!(
+                            legacy_log_source_id = %adoption.legacy_log_source_id,
+                            log_source_id = %adoption.log_source_id,
+                            error = %e,
+                            "adopted legacy state dir but checkpoint rekey failed"
+                        ),
+                    }
+                }
                 Err(e) => warn!(
                     legacy_log_source_id = %adoption.legacy_log_source_id,
                     log_source_id = %adoption.log_source_id,
@@ -1420,6 +1444,23 @@ mod tests {
         let legacy_dir = dir.path().join("service-42");
         std::fs::create_dir_all(&legacy_dir).unwrap();
         std::fs::write(legacy_dir.join("checkpoint.marker"), "42").unwrap();
+        // A real resume point under the LEGACY source id — adoption must
+        // re-key it, or the synthesized source replays from zero.
+        {
+            let store = crate::checkpoint::CheckpointStore::open(
+                &legacy_dir.join("streaming_checkpoints.sqlite"),
+            )
+            .unwrap();
+            store
+                .save_streaming(
+                    "service-42",
+                    &crate::streaming_checkpoint::StreamingCheckpoint::journald(
+                        "service-42",
+                        "s=resume-token",
+                    ),
+                )
+                .unwrap();
+        }
 
         // Fresh orchestrator: nothing managed, config already dual-emitting.
         let mut orch = Orchestrator::new(dir.path(), test_identity());
@@ -1440,6 +1481,22 @@ mod tests {
                 .join("checkpoint.marker")
                 .exists()
         );
+        // The resume point followed the rename AND the key: the synthesized
+        // source finds it under its own id, so nothing replays from zero.
+        {
+            let store = crate::checkpoint::CheckpointStore::open(
+                &dir.path()
+                    .join("service-42_web-app")
+                    .join("streaming_checkpoints.sqlite"),
+            )
+            .unwrap();
+            let adopted = store.load_streaming("service-42/web-app").unwrap();
+            assert!(
+                adopted.is_some(),
+                "checkpoint row must be re-keyed to the synthesized id"
+            );
+            assert!(store.load_streaming("service-42").unwrap().is_none());
+        }
 
         orch.shutdown_all().await;
     }
