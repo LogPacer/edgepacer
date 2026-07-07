@@ -474,7 +474,7 @@ fn package_state_digest(packages: &PackageState) -> String {
         hash_part(&mut hasher, &package.name);
         hash_part(&mut hasher, &package.version);
     }
-    format!("{:x}", hasher.finalize())
+    hex::encode(hasher.finalize())
 }
 
 fn package_item_version_hash(package: &Package) -> String {
@@ -483,7 +483,7 @@ fn package_item_version_hash(package: &Package) -> String {
     hash_part(&mut hasher, &package.manager);
     hash_part(&mut hasher, &package.name);
     hash_part(&mut hasher, &package.version);
-    format!("{:x}", hasher.finalize())
+    hex::encode(hasher.finalize())
 }
 
 fn package_tombstone_version_hash(item_id: &str, package: &Package) -> String {
@@ -492,7 +492,7 @@ fn package_tombstone_version_hash(item_id: &str, package: &Package) -> String {
     hash_part(&mut hasher, "delete");
     hash_part(&mut hasher, item_id);
     hash_part(&mut hasher, &package_item_version_hash(package));
-    format!("{:x}", hasher.finalize())
+    hex::encode(hasher.finalize())
 }
 
 fn package_baseline_id(digest: &str) -> String {
