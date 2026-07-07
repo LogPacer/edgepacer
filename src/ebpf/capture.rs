@@ -9,9 +9,11 @@
 //! it lives in `manager.rs` and is tested on every platform via a fake.
 
 use std::collections::HashSet;
+use std::num::NonZeroU32;
 
 use aya::Ebpf;
 use aya::maps::{HashMap as AyaHashMap, MapData, RingBuf};
+use aya::programs::uprobe::UProbeScope;
 use aya::programs::{TracePoint, UProbe};
 use tokio::io::unix::AsyncFd;
 use tokio::sync::mpsc;
@@ -542,7 +544,7 @@ fn attach_uprobe(ebpf: &mut Ebpf, name: &str, symbol: &str) -> Result<(), String
         .map_err(|e| format!("{name} verifier load: {e}"))?;
     let mut last_err = String::new();
     for target in LIBSSL_TARGETS {
-        match program.attach(Some(symbol), 0, target, None) {
+        match program.attach(symbol, target, UProbeScope::AllProcesses) {
             Ok(_) => return Ok(()),
             Err(e) => last_err = format!("{target}: {e}"),
         }
@@ -556,6 +558,9 @@ fn attach_uprobe(ebpf: &mut Ebpf, name: &str, symbol: &str) -> Result<(), String
 /// misses. Best-effort; feeds the same TLS drain. The programs are already loaded
 /// by `attach_tls_uprobes` in `start()`, so this only attaches.
 fn attach_tls_to_lib(ebpf: &mut Ebpf, lib: &str, pid: i32) {
+    let Some(pid) = u32::try_from(pid).ok().and_then(NonZeroU32::new) else {
+        return;
+    };
     for (name, symbol) in TLS_PROBES {
         let Some(program) = ebpf.program_mut(name) else {
             continue;
@@ -564,7 +569,7 @@ fn attach_tls_to_lib(ebpf: &mut Ebpf, lib: &str, pid: i32) {
             Ok(uprobe) => uprobe,
             Err(_) => continue,
         };
-        let _ = uprobe.attach(Some(symbol), 0, lib, Some(pid));
+        let _ = uprobe.attach(symbol, lib, UProbeScope::OneProcess(pid));
     }
 }
 
