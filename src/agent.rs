@@ -112,6 +112,7 @@ fn service_census_entry(c: &Container) -> serde_json::Value {
         "deployment": c.deployment,
         "format": c.log_format,
         "labels": c.labels,
+        "identifiers": c.identifier_set(),
     })
 }
 
@@ -129,6 +130,7 @@ fn container_census_entry(c: &Container) -> serde_json::Value {
         "service_name": c.service_name,
         "format": c.log_format,
         "labels": c.labels,
+        "identifiers": c.identifier_set(),
     })
 }
 
@@ -613,6 +615,36 @@ mod tests {
                 "pod_name must never be reported"
             );
             assert_eq!(obj.get("format").and_then(|v| v.as_str()), Some("ndjson"));
+        }
+    }
+
+    #[test]
+    fn census_entries_carry_identifier_atoms() {
+        let c = k8s_statefulset_container();
+
+        for entry in [service_census_entry(&c), container_census_entry(&c)] {
+            let atoms = entry
+                .get("identifiers")
+                .and_then(|v| v.as_object())
+                .expect("census entry carries an identifiers object");
+            assert_eq!(
+                atoms.get("service_name").and_then(|v| v.as_str()),
+                Some("postgres")
+            );
+            assert_eq!(
+                atoms.get("k8s.namespace").and_then(|v| v.as_str()),
+                Some("default")
+            );
+            assert_eq!(
+                atoms.get("k8s.workload").and_then(|v| v.as_str()),
+                Some("postgres")
+            );
+            assert_eq!(
+                atoms.get("image.repo").and_then(|v| v.as_str()),
+                Some("postgres")
+            );
+            // Volatile handles are never atoms.
+            assert!(atoms.keys().all(|k| k != "container_id" && k != "pod_uid"));
         }
     }
 
