@@ -1,3 +1,5 @@
+use std::collections::HashSet;
+
 use sha2::{Digest, Sha256};
 
 use super::fields::{
@@ -5,6 +7,7 @@ use super::fields::{
     optional_string_field, required_config_key, required_config_string, required_string_field,
     u32_field_or,
 };
+use super::services::{CheckpointAdoption, all_service_descriptions, resolve_service_descriptions};
 use super::{StreamAccessMethod, StreamingSourceConfig, UnifiedConfig};
 use crate::discovery::cache::{
     AccessMethod, CollectMatch, MatchStatus, MatchVia, ResolvedAccess, infer_loggable_type,
@@ -88,6 +91,9 @@ pub struct ResolvedCollectStreams {
     pub file_streams: Vec<LogStreamConfig>,
     pub streaming_sources: Vec<StreamingSourceConfig>,
     pub diagnostics: Vec<CollectDiagnostic>,
+    /// Legacy→synthesized state-dir adoption candidates from this pass, one per
+    /// selector-synthesized source (see [`CheckpointAdoption`]).
+    pub checkpoint_adoptions: Vec<CheckpointAdoption>,
 }
 
 /// How one collect directive resolved this pass. Carries the coarse status so
@@ -222,7 +228,21 @@ pub fn resolve_collect_streams(
     cache: &crate::discovery::cache::DiscoveryCache,
 ) -> ResolvedCollectStreams {
     let mut resolved = ResolvedCollectStreams::default();
+    resolve_collect_streams_into(&mut resolved, streams, cache, &HashSet::new());
+    resolved
+}
 
+/// Claims-aware legacy resolution: a directive that resolves to a container
+/// already claimed by a service description (matched on the access locator —
+/// the concrete thing a pipeline would tail) yields no source. One pipeline
+/// per container, even while Rails dual-emits a legacy stream alongside its
+/// selector-backed description.
+fn resolve_collect_streams_into(
+    resolved: &mut ResolvedCollectStreams,
+    streams: &[CollectStreamConfig],
+    cache: &crate::discovery::cache::DiscoveryCache,
+    claimed_locators: &HashSet<String>,
+) {
     for stream in streams {
         let identifier = if !stream.container_identifier.is_empty() {
             stream.container_identifier.as_str()
@@ -272,7 +292,14 @@ pub fn resolve_collect_streams(
 
         let loggable_type = infer_loggable_type(&stream.matching_strategy);
         match cache.resolve(identifier, loggable_type) {
-            CollectMatch::Matched(access) => push_resolved_source(&mut resolved, stream, access),
+            CollectMatch::Matched(access) if claimed_locators.contains(&access.access_locator) => {
+                resolved.diagnostics.push(CollectDiagnostic {
+                    log_source_id: stream.log_source_id.clone(),
+                    status: MatchStatus::Matched,
+                    detail: "container claimed by a service description".into(),
+                });
+            }
+            CollectMatch::Matched(access) => push_resolved_source(resolved, stream, access),
             CollectMatch::Ambiguous { candidates } => {
                 resolved.diagnostics.push(CollectDiagnostic {
                     log_source_id: stream.log_source_id.clone(),
@@ -292,8 +319,6 @@ pub fn resolve_collect_streams(
             )),
         }
     }
-
-    resolved
 }
 
 /// Route one resolved access to the right pipeline lane and record a matched
@@ -310,6 +335,19 @@ fn push_resolved_source(
         ..
     } = access;
 
+    route_source(resolved, stream, access_method, access_locator);
+    resolved.diagnostics.push(matched(stream, matched_via));
+}
+
+/// Route one stream to the pipeline lane its access method demands. Shared by
+/// legacy directive resolution and selector-synthesized sources, so both ride
+/// the exact same lanes.
+pub(super) fn route_source(
+    resolved: &mut ResolvedCollectStreams,
+    stream: &CollectStreamConfig,
+    access_method: AccessMethod,
+    access_locator: String,
+) {
     match access_method {
         AccessMethod::File => resolved.file_streams.push(log_stream_from_collect(
             stream,
@@ -345,8 +383,6 @@ fn push_resolved_source(
             },
         )),
     }
-
-    resolved.diagnostics.push(matched(stream, matched_via));
 }
 
 fn streaming_source(
@@ -388,13 +424,19 @@ fn not_found(stream: &CollectStreamConfig, detail: String) -> CollectDiagnostic 
     }
 }
 
-/// Resolve active collect streams from the unified `collect` map.
+/// Resolve active collection from unified config: service descriptions first
+/// (they claim containers in array order), then the legacy `collect` map with
+/// claimed containers excluded.
 pub fn resolved_collect_from_config(
     config: &UnifiedConfig,
     cache: &crate::discovery::cache::DiscoveryCache,
 ) -> ResolvedCollectStreams {
+    let mut resolved = ResolvedCollectStreams::default();
+    let descriptions = all_service_descriptions(config);
+    let claimed_locators = resolve_service_descriptions(&descriptions, cache, &mut resolved);
     let collect = all_collect_streams(config);
-    resolve_collect_streams(&collect, cache)
+    resolve_collect_streams_into(&mut resolved, &collect, cache, &claimed_locators);
+    resolved
 }
 
 fn log_stream_from_collect(
@@ -424,7 +466,7 @@ fn log_stream_from_collect(
     }
 }
 
-fn parse_multiline_config(
+pub(super) fn parse_multiline_config(
     value: Option<&serde_json::Value>,
     ctx: FieldContext<'_>,
 ) -> Option<MultilineConfig> {

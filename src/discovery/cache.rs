@@ -272,6 +272,20 @@ impl DiscoveryCache {
         }
     }
 
+    /// Every distinct discovered container (the alias map indexes each one
+    /// under many keys), ordered by per-instance identity so selector
+    /// evaluation and source synthesis are deterministic across scans.
+    pub fn distinct_containers(&self) -> Vec<&Container> {
+        let mut seen = std::collections::HashSet::new();
+        let mut containers: Vec<&Container> = self
+            .containers
+            .values()
+            .filter(|c| seen.insert(c.id.as_str()))
+            .collect();
+        containers.sort_by_cached_key(|c| (c.stable_instance_id(), c.id.clone()));
+        containers
+    }
+
     /// Resolve a collect directive (identifier + type hint) to a concrete
     /// reader, reporting how the match was made and how durable it is.
     pub fn resolve(&self, identifier: &str, loggable_type: &str) -> CollectMatch {
@@ -910,6 +924,24 @@ mod tests {
         let two = matched(cache.resolve("shop/web/2", "container"));
         assert_eq!(two.matched_via, MatchVia::StableInstanceId);
         assert_eq!(two.access_locator, "id-web-2");
+    }
+
+    #[test]
+    fn distinct_containers_dedups_aliases_in_stable_order() {
+        // Each container is indexed under many alias keys; enumeration must
+        // yield it once, ordered by per-instance identity so selector
+        // evaluation is deterministic across scans.
+        let cache = cache_with(vec![
+            compose_replica("id-web-2", "shop", "web", "2"),
+            compose_replica("id-web-1", "shop", "web", "1"),
+        ]);
+
+        let ids: Vec<&str> = cache
+            .distinct_containers()
+            .iter()
+            .map(|c| c.id.as_str())
+            .collect();
+        assert_eq!(ids, vec!["id-web-1", "id-web-2"]);
     }
 
     #[test]

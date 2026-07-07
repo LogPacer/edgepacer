@@ -1,0 +1,83 @@
+{
+  "_comment": "Shared matcher truth table for composite service identity. AND-equality of selector criteria over identifier atoms; no patterns, no semantics. MUST stay byte-identical with edgepacer tests/fixtures/matcher_parity.json — both suites assert every case (Ruby: Loggable::IdentifierResolvable#matches_criteria?, Rust: service description selector matching).",
+  "cases": [
+    {
+      "name": "single atom exact match",
+      "atoms": {"kamal.service": "web", "kamal.destination": "prod"},
+      "criteria": {"kamal.service": "web"},
+      "matches": true
+    },
+    {
+      "name": "subset criteria all equal",
+      "atoms": {"kamal.service": "web", "kamal.destination": "prod", "image.repo": "ghcr.io/x/web", "container.name": "web-abc123"},
+      "criteria": {"kamal.service": "web", "kamal.destination": "prod"},
+      "matches": true
+    },
+    {
+      "name": "criteria equal to full atom set",
+      "atoms": {"compose.project": "shop", "compose.service": "api"},
+      "criteria": {"compose.project": "shop", "compose.service": "api"},
+      "matches": true
+    },
+    {
+      "name": "value mismatch fails",
+      "atoms": {"kamal.service": "web", "kamal.destination": "prod"},
+      "criteria": {"kamal.service": "web", "kamal.destination": "staging"},
+      "matches": false
+    },
+    {
+      "name": "criterion kind absent from atoms fails",
+      "atoms": {"compose.project": "shop"},
+      "criteria": {"compose.project": "shop", "compose.service": "api"},
+      "matches": false
+    },
+    {
+      "name": "AND semantics: one of two mismatching fails",
+      "atoms": {"k8s.namespace": "prod", "k8s.workload": "api"},
+      "criteria": {"k8s.namespace": "prod", "k8s.workload": "worker"},
+      "matches": false
+    },
+    {
+      "name": "equality is case-sensitive",
+      "atoms": {"kamal.service": "Web"},
+      "criteria": {"kamal.service": "web"},
+      "matches": false
+    },
+    {
+      "name": "empty criteria never match",
+      "atoms": {"kamal.service": "web"},
+      "criteria": {},
+      "matches": false
+    },
+    {
+      "name": "empty atoms never match nonempty criteria",
+      "atoms": {},
+      "criteria": {"kamal.service": "web"},
+      "matches": false
+    },
+    {
+      "name": "explicit service name atom matches raw value",
+      "atoms": {"service_name": "My.Service NAME", "image.repo": "nginx"},
+      "criteria": {"service_name": "My.Service NAME"},
+      "matches": true
+    },
+    {
+      "name": "parameterized slug does not match raw value",
+      "atoms": {"service_name": "My.Service NAME"},
+      "criteria": {"service_name": "my-service-name"},
+      "matches": false
+    },
+    {
+      "name": "unknown future atom kind participates in equality",
+      "atoms": {"nomad.job": "batcher", "image.repo": "x/batcher"},
+      "criteria": {"nomad.job": "batcher"},
+      "matches": true
+    },
+    {
+      "name": "value equality is exact, not substring",
+      "atoms": {"image.repo": "ghcr.io/logpacer/api"},
+      "criteria": {"image.repo": "ghcr.io/logpacer"},
+      "matches": false
+    }
+  ]
+}
