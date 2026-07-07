@@ -7,7 +7,7 @@
 //! to the Docker API. Duplicates around the resume point are accepted — this is
 //! the at-least-once contract, not exactly-once.
 
-use bollard::container::LogsOptions;
+use bollard::query_parameters::LogsOptions;
 use futures_util::StreamExt;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::watch;
@@ -59,11 +59,13 @@ pub async fn stream_container_logs(
         "starting Docker log stream"
     );
 
-    let options = LogsOptions::<String> {
+    // Docker's API types `since` as a 32-bit epoch; on overflow fall back to a
+    // full replay (0), which the at-least-once contract absorbs as duplicates.
+    let options = LogsOptions {
         follow: true,
         stdout: true,
         stderr: true,
-        since: parse_since_timestamp(since_str),
+        since: i32::try_from(parse_since_timestamp(since_str)).unwrap_or(0),
         timestamps: true,
         ..Default::default()
     };

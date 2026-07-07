@@ -8,7 +8,7 @@
 
 use super::Container;
 use crate::rate_limiter::docker_limiter;
-use bollard::container::{InspectContainerOptions, ListContainersOptions};
+use bollard::query_parameters::{InspectContainerOptions, ListContainersOptions};
 use bollard::{API_DEFAULT_VERSION, Docker};
 use serde::Deserialize;
 use std::collections::HashMap;
@@ -58,7 +58,7 @@ pub async fn discover_containers() -> anyhow::Result<Vec<Container>> {
     };
 
     // List all containers (running + stopped)
-    let list_opts = ListContainersOptions::<String> {
+    let list_opts = ListContainersOptions {
         all: true,
         ..Default::default()
     };
@@ -76,7 +76,10 @@ pub async fn discover_containers() -> anyhow::Result<Vec<Container>> {
         let name = clean_name(raw_name);
 
         let image = raw.image.as_deref().unwrap_or("unknown").to_string();
-        let state = raw.state.as_deref().unwrap_or("unknown").to_string();
+        let state = raw
+            .state
+            .as_ref()
+            .map_or_else(|| "unknown".to_string(), ToString::to_string);
         let labels = raw.labels.clone().unwrap_or_default();
 
         let label_service_name = extract_service_name(&labels, &name);
