@@ -68,7 +68,7 @@ pub async fn run(
         }
 
         if !report.is_empty() {
-            match report_inventory(client, &mut tracker, &report).await {
+            match report_inventory(client, &mut tracker, &report, &census.containers).await {
                 Ok(()) => tracker.commit_scan(),
                 Err(e) => {
                     error!(error = %e, "failed to report inventory");
@@ -117,8 +117,10 @@ fn service_census_entry(c: &Container) -> serde_json::Value {
 }
 
 /// Plain-container (screener) census entry. Stable identity only — the volatile
-/// container_id / pod_name never cross the wire.
-fn container_census_entry(c: &Container) -> serde_json::Value {
+/// container_id / pod_name never cross the wire. The entry is workload-keyed;
+/// each live replica rides in `active_instances` with its own per-instance
+/// identity and atoms (a scaled Compose service, a Kamal web/rpc pair).
+fn container_census_entry(c: &Container, active_instances: &[&Container]) -> serde_json::Value {
     json!({
         "identifier": c.stable_id(),
         "stable_instance_id": c.stable_instance_id(),
@@ -131,7 +133,35 @@ fn container_census_entry(c: &Container) -> serde_json::Value {
         "format": c.log_format,
         "labels": c.labels,
         "identifiers": c.identifier_set(),
+        "active_instances": active_instances.iter().map(|i| json!({
+            "stable_instance_id": i.stable_instance_id(),
+            "log_path": i.log_path,
+            "identifiers": i.identifier_set(),
+        })).collect::<Vec<_>>(),
     })
+}
+
+/// Every live replica of the workload a screener census entry stands for —
+/// the tracker reports one representative per workload, so the replicas are
+/// re-enumerated from the same scan's discovered containers.
+fn workload_instances<'a>(entry: &Container, discovered: &'a [Container]) -> Vec<&'a Container> {
+    let workload = entry.stable_id();
+    let mut instances: Vec<&Container> = discovered
+        .iter()
+        .filter(|c| !c.explicit_service() && c.stable_id() == workload)
+        .collect();
+    instances.sort_by_key(|c| c.stable_instance_id());
+    instances
+}
+
+/// Stamp the post-resync marker on a lane payload. A full report re-emits the
+/// agent's whole world, so Rails may treat absent identifiers as stopped;
+/// delta payloads stay unmarked (and byte-identical to before the marker).
+fn stamp_full_report(mut payload: serde_json::Value, full_report: bool) -> serde_json::Value {
+    if full_report {
+        payload["full_report"] = json!(true);
+    }
+    payload
 }
 
 /// Report inventory changes to Rails via type-specific endpoints.
@@ -139,9 +169,15 @@ async fn report_inventory(
     client: &Client,
     tracker: &mut ChangeTracker,
     report: &InventoryReport,
+    discovered_containers: &[Container],
 ) -> Result<(), crate::common::EdgepacerError> {
     // Server identity comes from the access token, not the request body.
     // Rails census controllers use AgentAuthentication to identify the server.
+
+    // Captured once per cycle: a mid-cycle resync response sets the tracker's
+    // marker for the NEXT cycle and must not stamp the remaining lane payloads
+    // of this delta cycle.
+    let full_report = tracker.full_report();
 
     // Report containers — ONLY explicit LogPacer service-name opt-ins take the
     // services census lane; everything else is server-sourced inventory for
@@ -169,12 +205,15 @@ async fn report_inventory(
 
     // Services: containers explicitly opted in via a LogPacer service-name gate.
     if !services.is_empty() || !stopped_services.is_empty() {
-        let payload = json!({
-                        "services": services.iter().map(|&c| service_census_entry(c)).collect::<Vec<_>>(),
-            "stopped_services": stopped_services.iter()
-                .map(|s| json!({ "identifier": s.identifier }))
-                .collect::<Vec<_>>(),
-        });
+        let payload = stamp_full_report(
+            json!({
+                            "services": services.iter().map(|&c| service_census_entry(c)).collect::<Vec<_>>(),
+                "stopped_services": stopped_services.iter()
+                    .map(|s| json!({ "identifier": s.identifier }))
+                    .collect::<Vec<_>>(),
+            }),
+            full_report,
+        );
 
         match client.report_service_inventory(&payload).await {
             Ok(resp) => {
@@ -196,12 +235,17 @@ async fn report_inventory(
 
     // Plain containers (no explicit opt-in) — the screener's inventory
     if !containers.is_empty() || !stopped_containers.is_empty() {
-        let payload = json!({
-                        "containers": containers.iter().map(|&c| container_census_entry(c)).collect::<Vec<_>>(),
-            "stopped_containers": stopped_containers.iter()
-                .map(|s| json!({ "identifier": s.identifier, "stable_identifier": s.identifier }))
-                .collect::<Vec<_>>(),
-        });
+        let payload = stamp_full_report(
+            json!({
+                            "containers": containers.iter()
+                    .map(|&c| container_census_entry(c, &workload_instances(c, discovered_containers)))
+                    .collect::<Vec<_>>(),
+                "stopped_containers": stopped_containers.iter()
+                    .map(|s| json!({ "identifier": s.identifier, "stable_identifier": s.identifier }))
+                    .collect::<Vec<_>>(),
+            }),
+            full_report,
+        );
 
         match client.report_container_inventory(&payload).await {
             Ok(resp) => {
@@ -596,7 +640,7 @@ mod tests {
 
         // Both lanes: the stable per-instance id is present, and no volatile
         // runtime handle (container_id / pod_uid / pod_name) crosses the wire.
-        for entry in [service_census_entry(&c), container_census_entry(&c)] {
+        for entry in [service_census_entry(&c), container_census_entry(&c, &[])] {
             let obj = entry.as_object().expect("census entry is a JSON object");
             assert_eq!(
                 obj.get("stable_instance_id").and_then(|v| v.as_str()),
@@ -622,7 +666,7 @@ mod tests {
     fn census_entries_carry_identifier_atoms() {
         let c = k8s_statefulset_container();
 
-        for entry in [service_census_entry(&c), container_census_entry(&c)] {
+        for entry in [service_census_entry(&c), container_census_entry(&c, &[])] {
             let atoms = entry
                 .get("identifiers")
                 .and_then(|v| v.as_object())
@@ -697,7 +741,7 @@ mod tests {
         // First cycle: report the new container; the server demands a resync.
         let report = tracker.update_from_scan(&census);
         assert!(!report.is_empty());
-        report_inventory(&client, &mut tracker, &report)
+        report_inventory(&client, &mut tracker, &report, &census.containers)
             .await
             .unwrap();
         // The caller commits on success — the resync must survive it.
@@ -751,5 +795,145 @@ mod tests {
 
         let next = tracker.update_from_scan(&census);
         assert_eq!(next.new_containers.len(), 1);
+    }
+
+    fn compose_replica(ordinal: &str) -> Container {
+        let mut c = plain_container(&format!("shop-web-{ordinal}"));
+        c.labels
+            .insert("com.docker.compose.project".into(), "shop".into());
+        c.labels
+            .insert("com.docker.compose.service".into(), "web".into());
+        c.labels
+            .insert("com.docker.compose.container-number".into(), ordinal.into());
+        c.log_path = format!("/var/lib/docker/containers/{ordinal}/{ordinal}-json.log");
+        c
+    }
+
+    #[test]
+    fn screener_census_entry_lists_every_replica_in_active_instances() {
+        let discovered = vec![
+            compose_replica("2"),
+            compose_replica("1"),
+            compose_replica("3"),
+        ];
+        let entry = container_census_entry(
+            &discovered[0],
+            &workload_instances(&discovered[0], &discovered),
+        );
+
+        // One workload-keyed entry; the replicas ride inside it, in stable order.
+        assert_eq!(entry["identifier"], "shop/web");
+        let instances = entry["active_instances"].as_array().unwrap();
+        assert_eq!(instances.len(), 3);
+        assert_eq!(
+            instances
+                .iter()
+                .map(|i| i["stable_instance_id"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            vec!["shop/web/1", "shop/web/2", "shop/web/3"]
+        );
+
+        // Each instance ships its own log path and atom set; shared atoms
+        // agree while container.name varies per replica.
+        assert_eq!(
+            instances[0]["log_path"],
+            "/var/lib/docker/containers/1/1-json.log"
+        );
+        assert_eq!(instances[0]["identifiers"]["compose.project"], "shop");
+        assert_eq!(instances[0]["identifiers"]["container.name"], "shop-web-1");
+        assert_eq!(instances[2]["identifiers"]["container.name"], "shop-web-3");
+    }
+
+    fn kamal_replica(role: &str) -> Container {
+        let mut c = plain_container(&format!("logpacer-{role}-prod-1a2b3c4"));
+        c.labels.insert("service".into(), "logpacer".into());
+        c.labels.insert("role".into(), role.into());
+        c.labels.insert("destination".into(), "prod".into());
+        c
+    }
+
+    #[test]
+    fn active_instances_carry_role_varying_atoms() {
+        // Kamal web + rpc share one workload; the census entry stays single
+        // but each instance carries its own kamal.role atom.
+        let discovered = vec![kamal_replica("web"), kamal_replica("rpc")];
+        let entry = container_census_entry(
+            &discovered[0],
+            &workload_instances(&discovered[0], &discovered),
+        );
+
+        assert_eq!(entry["identifier"], "logpacer-prod");
+        let instances = entry["active_instances"].as_array().unwrap();
+        assert_eq!(instances.len(), 2);
+        assert_eq!(instances[0]["identifiers"]["kamal.role"], "rpc");
+        assert_eq!(instances[1]["identifiers"]["kamal.role"], "web");
+    }
+
+    #[tokio::test]
+    async fn census_lanes_stamp_full_report_only_on_full_re_emits() {
+        let server = MockServer::start().await;
+        for lane in ["containers", "services"] {
+            Mock::given(method("POST"))
+                .and(path(format!("/api/v1/census/{lane}")))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "status": "accepted"
+                })))
+                .mount(&server)
+                .await;
+        }
+
+        let config = test_app_config(server.uri());
+        let client = Client::new_for_test(&config, "installation-1").unwrap();
+        client.set_bearer_token("access-1");
+        let mut tracker = ChangeTracker::new();
+
+        let mut service = plain_container("api-1");
+        service.service_name = "api".into();
+        service.service_name_explicit = true;
+        let census = discovery::Census {
+            containers: vec![plain_container("web-1"), service],
+            ..Default::default()
+        };
+
+        // Cycle 1: a fresh tracker's first report is a full re-emit.
+        let report = tracker.update_from_scan(&census);
+        report_inventory(&client, &mut tracker, &report, &census.containers)
+            .await
+            .unwrap();
+        tracker.commit_scan();
+
+        // Cycle 2: a state change is a delta.
+        let mut changed = census.clone();
+        changed.containers[0].state = "exited".into();
+        changed.containers[1].state = "exited".into();
+        let report = tracker.update_from_scan(&changed);
+        report_inventory(&client, &mut tracker, &report, &changed.containers)
+            .await
+            .unwrap();
+        tracker.commit_scan();
+
+        // Cycle 3: the control plane demanded a resync — full again.
+        tracker.require_full_resync();
+        let report = tracker.update_from_scan(&changed);
+        report_inventory(&client, &mut tracker, &report, &changed.containers)
+            .await
+            .unwrap();
+
+        let bodies: Vec<serde_json::Value> = server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .map(|r| serde_json::from_slice(&r.body).unwrap())
+            .collect();
+        assert_eq!(bodies.len(), 6, "two lanes over three cycles");
+        // Full re-emits (start + post-resync) are marked on both lanes...
+        for body in [&bodies[0], &bodies[1], &bodies[4], &bodies[5]] {
+            assert_eq!(body["full_report"], true);
+        }
+        // ...deltas carry no marker at all (absent, not false).
+        for body in [&bodies[2], &bodies[3]] {
+            assert!(body.get("full_report").is_none());
+        }
     }
 }
