@@ -200,6 +200,18 @@ impl ChangeTracker {
                     .then_with(|| a.id.cmp(&b.id))
             });
 
+            // Kamal (and other orchestrators) leave prior-deploy containers
+            // exited on the host; they share the SHA-free stable_instance_id
+            // with the live one and only differ by the container.name SHA. A
+            // workload with any running replica is represented by its running
+            // replicas alone, so a leftover exited container can't become the
+            // representative and report a live workload as stopped. A workload
+            // with no running replica keeps them, so a genuine stop still
+            // surfaces as a state change.
+            if replicas.iter().any(|c| c.state == "running") {
+                replicas.retain(|c| c.state == "running");
+            }
+
             match self.committed_containers.get(id) {
                 None => report_container_group(&mut report.new_containers, replicas),
                 Some(prev) if containers_changed(prev, replicas) => {
@@ -910,6 +922,42 @@ mod tests {
         };
         let report = tracker.update_from_scan(&census2);
         assert_eq!(report.changed_containers.len(), 1);
+    }
+
+    // Kamal leaves prior-deploy containers exited on the host, sharing the
+    // SHA-free stable id with the live one. The live workload must report
+    // running via its running replica — not stopped via a leftover exited one.
+    fn kamal_replica(container_id: &str, state: &str) -> Container {
+        let mut c = make_container(container_id, state);
+        c.name = format!("web-{container_id}");
+        c.labels.insert("service".into(), "docpacer".into());
+        c.labels.insert("role".into(), "web".into());
+        c.labels.insert("destination".into(), "prod".into());
+        c
+    }
+
+    #[test]
+    fn exited_prior_deploy_containers_do_not_mask_the_live_replica() {
+        let mut tracker = ChangeTracker::new();
+        // One live container plus four exited leftovers, all one kamal workload.
+        let census = Census {
+            containers: vec![
+                kamal_replica("ef6a884c", "exited"),
+                kamal_replica("188183d1", "exited"),
+                kamal_replica("dcd2cf76", "running"),
+                kamal_replica("f7306ef5", "exited"),
+                kamal_replica("ff2064e2", "exited"),
+            ],
+            ..Default::default()
+        };
+
+        let report = tracker.update_from_scan(&census);
+
+        // One workload entry, reported RUNNING, represented by the live SHA.
+        assert_eq!(report.new_containers.len(), 1);
+        let rep = &report.new_containers[0];
+        assert_eq!(rep.state, "running");
+        assert_eq!(rep.id, "dcd2cf76");
     }
 
     #[test]
