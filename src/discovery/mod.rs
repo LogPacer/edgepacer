@@ -22,7 +22,7 @@ pub mod systemd;
 pub mod windows_services;
 
 use serde::Serialize;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use tracing::{debug, warn};
 
 pub use cache::DiscoveryCache;
@@ -240,6 +240,71 @@ impl Container {
         self.name.clone()
     }
 
+    /// The normalized identifier atoms for this container — every stable,
+    /// low-entropy fact discovery observed, as `kind: value` pairs. Rails lets
+    /// a user compose a Service selector from a subset of these atoms; agents
+    /// match selectors against this same set. Volatile handles (container_id,
+    /// pod_uid, image tag) are never atoms: they identify an instance, not a
+    /// service. `container.name` is the one high-entropy member (Kamal names
+    /// embed the deploy SHA) — shipped so it is selectable, warned server-side.
+    pub fn identifier_set(&self) -> BTreeMap<&'static str, String> {
+        let mut atoms = BTreeMap::new();
+
+        // The explicit LOGPACER opt-in is the highest-confidence atom and the
+        // only one carrying consent. Derived (non-explicit) service names are
+        // label echoes and already appear as their own atoms below.
+        if self.explicit_service() {
+            atoms.insert("service_name", self.service_name.clone());
+        }
+
+        // Kamal sets `service` + `destination` together; gate on the pair so a
+        // stray unprefixed `service` label on a non-Kamal container is not
+        // misread as Kamal identity.
+        if let (Some(service), Some(destination)) =
+            (self.labels.get("service"), self.labels.get("destination"))
+        {
+            atoms.insert("kamal.service", service.clone());
+            atoms.insert("kamal.destination", destination.clone());
+            if let Some(role) = self.labels.get("role") {
+                atoms.insert("kamal.role", role.clone());
+            }
+        }
+
+        if let Some(project) = self.labels.get("com.docker.compose.project") {
+            atoms.insert("compose.project", project.clone());
+        }
+        if let Some(service) = self.labels.get("com.docker.compose.service") {
+            atoms.insert("compose.service", service.clone());
+        }
+
+        if let Some(stack) = self.labels.get("com.docker.stack.namespace") {
+            atoms.insert("swarm.stack", stack.clone());
+        }
+        if let Some(service) = self.labels.get("com.docker.swarm.service.name") {
+            atoms.insert("swarm.service", service.clone());
+        }
+
+        if !self.namespace.is_empty() {
+            atoms.insert("k8s.namespace", self.namespace.clone());
+        }
+        if !self.deployment.is_empty() {
+            atoms.insert("k8s.workload", self.deployment.clone());
+        }
+        if !self.container_name.is_empty() {
+            atoms.insert("k8s.container", self.container_name.clone());
+        }
+
+        if let Some(repo) = image_repo(&self.image) {
+            atoms.insert("image.repo", repo);
+        }
+
+        if !self.name.is_empty() {
+            atoms.insert("container.name", self.name.clone());
+        }
+
+        atoms
+    }
+
     /// Whether this container has a LOGPACER_SERVICE_NAME (makes it a "collecting service").
     pub fn has_service_name(&self) -> bool {
         !self.service_name.is_empty()
@@ -301,6 +366,19 @@ fn locally_readable_log_path(path: &str) -> bool {
 }
 
 /// Non-empty and all ASCII digits — a usable replica ordinal/slot.
+/// Image reference with the volatile parts stripped: the repo is a
+/// service-level fact, the tag/digest move on every deploy. A `:` only counts
+/// as a tag separator after the last `/`, so registry ports survive
+/// (`registry:5000/app:v1` → `registry:5000/app`).
+fn image_repo(image: &str) -> Option<String> {
+    let without_digest = image.split('@').next().unwrap_or(image);
+    let repo = match without_digest.rfind(':') {
+        Some(idx) if idx > without_digest.rfind('/').unwrap_or(0) => &without_digest[..idx],
+        _ => without_digest,
+    };
+    (!repo.is_empty()).then(|| repo.to_string())
+}
+
 fn is_numeric(s: &str) -> bool {
     !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit())
 }
@@ -909,5 +987,102 @@ mod tests {
         c.labels.remove("role");
         assert_eq!(c.stable_instance_id(), "logpacer-prod");
         assert_eq!(c.stable_instance_id(), c.stable_id());
+    }
+
+    #[test]
+    fn identifier_set_kamal_atoms() {
+        let c = make_kamal_container("web", "logpacer-web-prod-1a2b3c4");
+        let atoms = c.identifier_set();
+        assert_eq!(atoms.get("kamal.service").unwrap(), "logpacer");
+        assert_eq!(atoms.get("kamal.role").unwrap(), "web");
+        assert_eq!(atoms.get("kamal.destination").unwrap(), "prod");
+        assert_eq!(atoms.get("image.repo").unwrap(), "nginx");
+        assert_eq!(
+            atoms.get("container.name").unwrap(),
+            "logpacer-web-prod-1a2b3c4"
+        );
+        // No explicit opt-in — the derived service name is a label echo and
+        // must not masquerade as the consent-carrying atom.
+        assert!(!atoms.contains_key("service_name"));
+    }
+
+    #[test]
+    fn identifier_set_survives_redeploy_except_container_name() {
+        let before = make_kamal_container("web", "logpacer-web-prod-1a2b3c4");
+        let after = make_kamal_container("web", "logpacer-web-prod-9f8e7d6");
+        let (mut b, mut a) = (before.identifier_set(), after.identifier_set());
+        assert_ne!(b.remove("container.name"), a.remove("container.name"));
+        assert_eq!(b, a);
+    }
+
+    #[test]
+    fn identifier_set_k8s_atoms() {
+        let mut c = make_container("api-7b4f9c8d5-xyz");
+        c.runtime = "kubernetes".into();
+        c.namespace = "prod".into();
+        c.deployment = "api".into();
+        c.workload_kind = "deployment".into();
+        c.container_name = "api".into();
+        c.image = "ghcr.io/logpacer/api:v1.4.3".into();
+        let atoms = c.identifier_set();
+        assert_eq!(atoms.get("k8s.namespace").unwrap(), "prod");
+        assert_eq!(atoms.get("k8s.workload").unwrap(), "api");
+        assert_eq!(atoms.get("k8s.container").unwrap(), "api");
+        assert_eq!(atoms.get("image.repo").unwrap(), "ghcr.io/logpacer/api");
+    }
+
+    #[test]
+    fn identifier_set_compose_atoms() {
+        let mut c = make_container("shop-web-1");
+        c.labels
+            .insert("com.docker.compose.project".into(), "shop".into());
+        c.labels
+            .insert("com.docker.compose.service".into(), "web".into());
+        let atoms = c.identifier_set();
+        assert_eq!(atoms.get("compose.project").unwrap(), "shop");
+        assert_eq!(atoms.get("compose.service").unwrap(), "web");
+        assert!(!atoms.contains_key("kamal.service"));
+    }
+
+    #[test]
+    fn identifier_set_explicit_service_name_carries_consent() {
+        let mut c = make_container("api-1");
+        c.service_name = "api".into();
+        c.service_name_explicit = true;
+        assert_eq!(c.identifier_set().get("service_name").unwrap(), "api");
+
+        c.service_name_explicit = false;
+        assert!(!c.identifier_set().contains_key("service_name"));
+    }
+
+    #[test]
+    fn identifier_set_stray_service_label_is_not_kamal() {
+        let mut c = make_container("my-app");
+        c.labels.insert("service".into(), "something".into());
+        // No `destination` — the unpaired label must not be read as Kamal.
+        assert!(!c.identifier_set().contains_key("kamal.service"));
+    }
+
+    #[test]
+    fn image_repo_strips_tag_digest_and_keeps_registry_port() {
+        assert_eq!(image_repo("nginx:latest").as_deref(), Some("nginx"));
+        assert_eq!(image_repo("nginx").as_deref(), Some("nginx"));
+        assert_eq!(
+            image_repo("ghcr.io/logpacer/api:v1.4.3").as_deref(),
+            Some("ghcr.io/logpacer/api")
+        );
+        assert_eq!(
+            image_repo("registry:5000/app:v1").as_deref(),
+            Some("registry:5000/app")
+        );
+        assert_eq!(
+            image_repo("registry:5000/app").as_deref(),
+            Some("registry:5000/app")
+        );
+        assert_eq!(
+            image_repo("nginx@sha256:deadbeef").as_deref(),
+            Some("nginx")
+        );
+        assert_eq!(image_repo(""), None);
     }
 }
