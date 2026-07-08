@@ -135,6 +135,7 @@ fn container_census_entry(c: &Container, active_instances: &[&Container]) -> ser
         "identifiers": c.identifier_set(),
         "active_instances": active_instances.iter().map(|i| json!({
             "stable_instance_id": i.stable_instance_id(),
+            "state": i.state,
             "log_path": i.log_path,
             "identifiers": i.identifier_set(),
         })).collect::<Vec<_>>(),
@@ -148,7 +149,10 @@ fn workload_instances<'a>(entry: &Container, discovered: &'a [Container]) -> Vec
     let workload = entry.stable_id();
     let mut instances: Vec<&Container> = discovered
         .iter()
-        .filter(|c| !c.explicit_service() && c.stable_id() == workload)
+        // Running only: leftover exited containers from prior kamal deploys
+        // share this workload's stable id but are not live replicas, so they
+        // must not inflate the instance roster the control plane counts.
+        .filter(|c| !c.explicit_service() && c.state == "running" && c.stable_id() == workload)
         .collect();
     instances.sort_by_key(|c| c.stable_instance_id());
     instances
