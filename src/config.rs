@@ -15,6 +15,7 @@ mod ebpf;
 mod fields;
 mod logs;
 mod metrics;
+mod services;
 mod streaming;
 mod telemetry;
 mod trace_proxy;
@@ -29,6 +30,9 @@ pub use logs::{
     resolved_collect_from_config,
 };
 pub use metrics::{MetricsStreamConfig, all_metrics_streams};
+pub use services::{
+    CheckpointAdoption, ServiceDescription, all_service_descriptions, selector_matches,
+};
 pub use streaming::{StreamAccessMethod, StreamingSourceConfig};
 pub use telemetry::{TelemetryConfig, TelemetryContext, telemetry_config};
 pub use trace_proxy::{TraceProxyStreamConfig, all_trace_proxies};

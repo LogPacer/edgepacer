@@ -145,7 +145,11 @@ async fn configured_collect_file_source_reaches_logrelay() {
         edgepacer::identity::AgentIdentity::new("windows-host-1".into()),
     );
     orchestrator
-        .reconcile(&resolved.file_streams, &resolved.streaming_sources)
+        .reconcile(
+            &resolved.file_streams,
+            &resolved.streaming_sources,
+            &resolved.checkpoint_adoptions,
+        )
         .await;
 
     {
@@ -209,7 +213,11 @@ async fn configured_windows_event_log_source_reaches_logrelay() {
         edgepacer::identity::AgentIdentity::new("windows-host-1".into()),
     );
     orchestrator
-        .reconcile(&resolved.file_streams, &resolved.streaming_sources)
+        .reconcile(
+            &resolved.file_streams,
+            &resolved.streaming_sources,
+            &resolved.checkpoint_adoptions,
+        )
         .await;
 
     tokio::time::sleep(Duration::from_millis(1500)).await;

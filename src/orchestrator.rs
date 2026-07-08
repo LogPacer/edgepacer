@@ -20,8 +20,8 @@ use tokio::task::JoinHandle;
 use tracing::{debug, error, info, warn};
 
 use crate::config::{
-    self, BufferTuning, CollectDiagnostic, FileSourceFormat, LogStreamConfig, SharedConfig,
-    StreamingSourceConfig,
+    self, BufferTuning, CheckpointAdoption, CollectDiagnostic, FileSourceFormat, LogStreamConfig,
+    SharedConfig, StreamingSourceConfig,
 };
 use crate::counters::AgentCounters;
 use crate::discovery::SharedDiscoveryCache;
@@ -269,12 +269,101 @@ impl Orchestrator {
         &mut self,
         file_streams: &[LogStreamConfig],
         streaming_sources: &[StreamingSourceConfig],
+        checkpoint_adoptions: &[CheckpointAdoption],
     ) {
-        self.reconcile_file_streams(file_streams).await;
-        self.reconcile_streaming_sources(streaming_sources).await;
+        // Both lanes stop stale sources BEFORE anything starts: a legacy
+        // pipeline suppressed in favor of a selector-synthesized source may
+        // live in either lane, and its state dir must be released (and
+        // possibly adopted) before the replacement opens it.
+        self.stop_stale_file_pipelines(file_streams).await;
+        self.stop_stale_streaming_sources(streaming_sources).await;
+        self.adopt_legacy_state_dirs(checkpoint_adoptions, file_streams, streaming_sources);
+        self.start_missing_file_pipelines(file_streams);
+        self.start_missing_streaming_sources(streaming_sources);
     }
 
-    async fn reconcile_file_streams(&mut self, streams: &[LogStreamConfig]) {
+    /// One-time checkpoint adoption at the env-var→selector cutover: when a
+    /// synthesized source has no state dir yet and its description's legacy
+    /// stream is no longer among the desired sources (claim-dedup suppressed
+    /// it, or the account already cut over), the legacy dir is renamed to the
+    /// synthesized dir so the migrated service neither gaps nor duplicates.
+    ///
+    /// Gated on the legacy id being absent from BOTH desired lanes — a legacy
+    /// stream that still legitimately resolves (e.g. to a different container)
+    /// keeps its state untouched. The desired-set gate, rather than a
+    /// removed-this-pass gate, also covers an agent restart mid-migration:
+    /// the first reconcile after boot removes nothing, but the orphaned legacy
+    /// dir must still carry over. Runs after the stop phase so a suppressed
+    /// legacy pipeline has released its files.
+    fn adopt_legacy_state_dirs(
+        &self,
+        adoptions: &[CheckpointAdoption],
+        file_streams: &[LogStreamConfig],
+        streaming_sources: &[StreamingSourceConfig],
+    ) {
+        if adoptions.is_empty() {
+            return;
+        }
+
+        let desired: std::collections::HashSet<&str> = file_streams
+            .iter()
+            .map(|s| s.log_source_id.as_str())
+            .chain(streaming_sources.iter().map(|s| s.log_source_id.as_str()))
+            .collect();
+
+        for adoption in adoptions {
+            if desired.contains(adoption.legacy_log_source_id.as_str()) {
+                continue;
+            }
+            let legacy_dir = self.source_data_dir(&adoption.legacy_log_source_id);
+            let source_dir = self.source_data_dir(&adoption.log_source_id);
+            // Never clobber existing synthesized state; adoption is for the
+            // first start only. A missing legacy dir means there is nothing to
+            // carry over (or an earlier replica already adopted it).
+            if source_dir.exists() || !legacy_dir.is_dir() {
+                continue;
+            }
+            match std::fs::rename(&legacy_dir, &source_dir) {
+                Ok(()) => {
+                    // The dir rename carries the store file; the checkpoint row
+                    // inside it is keyed by source id and must follow too, or
+                    // the synthesized source misses its resume point and
+                    // replays the whole container log from zero.
+                    let rekeyed = crate::checkpoint::CheckpointStore::open(
+                        &source_dir.join("streaming_checkpoints.sqlite"),
+                    )
+                    .and_then(|store| {
+                        store.rekey_streaming(
+                            &adoption.legacy_log_source_id,
+                            &adoption.log_source_id,
+                        )
+                    });
+                    match rekeyed {
+                        Ok(moved) => info!(
+                            legacy_log_source_id = %adoption.legacy_log_source_id,
+                            log_source_id = %adoption.log_source_id,
+                            checkpoint_rekeyed = moved,
+                            "adopted legacy checkpoint state dir"
+                        ),
+                        Err(e) => warn!(
+                            legacy_log_source_id = %adoption.legacy_log_source_id,
+                            log_source_id = %adoption.log_source_id,
+                            error = %e,
+                            "adopted legacy state dir but checkpoint rekey failed"
+                        ),
+                    }
+                }
+                Err(e) => warn!(
+                    legacy_log_source_id = %adoption.legacy_log_source_id,
+                    log_source_id = %adoption.log_source_id,
+                    error = %e,
+                    "failed to adopt legacy checkpoint state dir"
+                ),
+            }
+        }
+    }
+
+    async fn stop_stale_file_pipelines(&mut self, streams: &[LogStreamConfig]) {
         let plan = plan_source_reconciliation(
             self.pipelines
                 .iter()
@@ -295,7 +384,9 @@ impl Orchestrator {
         let mut to_stop = plan.to_remove;
         to_stop.extend(plan.to_restart);
         self.stop_file_pipelines(&to_stop).await;
+    }
 
+    fn start_missing_file_pipelines(&mut self, streams: &[LogStreamConfig]) {
         for stream in streams {
             if !self.pipelines.contains_key(&stream.log_source_id) {
                 match self.start_file_pipeline(stream) {
@@ -322,7 +413,7 @@ impl Orchestrator {
         }
     }
 
-    async fn reconcile_streaming_sources(&mut self, streams: &[StreamingSourceConfig]) {
+    async fn stop_stale_streaming_sources(&mut self, streams: &[StreamingSourceConfig]) {
         let plan = plan_source_reconciliation(
             self.streaming_sources
                 .iter()
@@ -343,7 +434,9 @@ impl Orchestrator {
         let mut to_stop = plan.to_remove;
         to_stop.extend(plan.to_restart);
         self.stop_streaming_sources(&to_stop).await;
+    }
 
+    fn start_missing_streaming_sources(&mut self, streams: &[StreamingSourceConfig]) {
         for stream in streams {
             if !self.streaming_sources.contains_key(&stream.log_source_id) {
                 match self.start_streaming_source(stream) {
@@ -682,9 +775,7 @@ pub async fn run(
                     let cache = discovery_cache.read().await;
                     let resolved = config::resolved_collect_from_config(unified, &cache);
                     Some((
-                        resolved.file_streams,
-                        resolved.streaming_sources,
-                        resolved.diagnostics,
+                        resolved,
                         BufferTuning::resolve(Some(unified)),
                         config_changed,
                     ))
@@ -693,10 +784,8 @@ pub async fn run(
             }
         };
 
-        if let Some((file_streams, streaming_sources, diagnostics, tuning, config_changed)) =
-            reconcile
-        {
-            log_collect_resolution(&mut resolution_log, &diagnostics);
+        if let Some((resolved, tuning, config_changed)) = reconcile {
+            log_collect_resolution(&mut resolution_log, &resolved.diagnostics);
 
             // Changed buffer/delivery tuning requires reopening every buffer
             // (redb fixes the cache size at open). Drop all managed pipelines so
@@ -726,19 +815,23 @@ pub async fn run(
             // log at debug to keep steady-state info logs quiet.
             if config_changed {
                 info!(
-                    file_streams = file_streams.len(),
-                    streaming_sources = streaming_sources.len(),
+                    file_streams = resolved.file_streams.len(),
+                    streaming_sources = resolved.streaming_sources.len(),
                     "config changed, reconciling pipelines"
                 );
             } else {
                 debug!(
-                    file_streams = file_streams.len(),
-                    streaming_sources = streaming_sources.len(),
+                    file_streams = resolved.file_streams.len(),
+                    streaming_sources = resolved.streaming_sources.len(),
                     "discovery changed, reconciling pipelines"
                 );
             }
             orchestrator
-                .reconcile(&file_streams, &streaming_sources)
+                .reconcile(
+                    &resolved.file_streams,
+                    &resolved.streaming_sources,
+                    &resolved.checkpoint_adoptions,
+                )
                 .await;
             orchestrator.update_operational_stats();
         }
@@ -848,7 +941,7 @@ mod tests {
         let mut orch = Orchestrator::new(dir.path(), test_identity());
 
         assert_eq!(orch.active_count(), 0);
-        orch.reconcile(&[], &[]).await;
+        orch.reconcile(&[], &[], &[]).await;
         assert_eq!(orch.active_count(), 0);
     }
 
@@ -856,7 +949,7 @@ mod tests {
     async fn shutdown_all_on_empty_is_safe() {
         let dir = tempfile::tempdir().unwrap();
         let mut orch = Orchestrator::new(dir.path(), test_identity());
-        orch.reconcile(&[], &[]).await;
+        orch.reconcile(&[], &[], &[]).await;
         orch.shutdown_all().await;
         assert_eq!(orch.active_count(), 0);
     }
@@ -925,14 +1018,14 @@ mod tests {
         };
 
         let mut orch = Orchestrator::new(dir.path(), test_identity());
-        orch.reconcile(&[stream("http://127.0.0.1:9/old")], &[])
+        orch.reconcile(&[stream("http://127.0.0.1:9/old")], &[], &[])
             .await;
         assert_eq!(orch.active_count(), 1);
 
         // Endpoint change → hash change → stop + start in one pass. If the
         // old instance still held the redb flocks, the new start would fail
         // and the source would vanish from the active set.
-        orch.reconcile(&[stream("http://127.0.0.1:9/new")], &[])
+        orch.reconcile(&[stream("http://127.0.0.1:9/new")], &[], &[])
             .await;
         assert_eq!(orch.active_count(), 1, "restarted pipeline must be running");
 
@@ -1069,8 +1162,12 @@ mod tests {
         last_epoch = cache.epoch();
         let resolved = config::resolved_collect_from_config(&unified, &cache);
         assert_eq!(resolved.diagnostics[0].status, MatchStatus::NotFound);
-        orch.reconcile(&resolved.file_streams, &resolved.streaming_sources)
-            .await;
+        orch.reconcile(
+            &resolved.file_streams,
+            &resolved.streaming_sources,
+            &resolved.checkpoint_adoptions,
+        )
+        .await;
         assert_eq!(orch.active_count(), 0);
 
         // Steady state: nothing moved, so no reconcile is due.
@@ -1100,8 +1197,12 @@ mod tests {
         last_epoch = cache.epoch();
         let resolved = config::resolved_collect_from_config(&unified, &cache);
         assert_eq!(resolved.diagnostics[0].status, MatchStatus::Matched);
-        orch.reconcile(&resolved.file_streams, &resolved.streaming_sources)
-            .await;
+        orch.reconcile(
+            &resolved.file_streams,
+            &resolved.streaming_sources,
+            &resolved.checkpoint_adoptions,
+        )
+        .await;
         assert_eq!(orch.active_count(), 1);
 
         // And the loop settles again until the next config or discovery edge.
@@ -1133,8 +1234,12 @@ mod tests {
 
         let mut orch = Orchestrator::new(dir.path(), test_identity());
         let resolved = config::resolved_collect_from_config(&unified, &cache);
-        orch.reconcile(&resolved.file_streams, &resolved.streaming_sources)
-            .await;
+        orch.reconcile(
+            &resolved.file_streams,
+            &resolved.streaming_sources,
+            &resolved.checkpoint_adoptions,
+        )
+        .await;
         assert_eq!(orch.active_count(), 1);
 
         // Watch the running pipeline's shutdown channel: a restart would
@@ -1154,8 +1259,12 @@ mod tests {
             ..Default::default()
         });
         let resolved = config::resolved_collect_from_config(&unified, &cache);
-        orch.reconcile(&resolved.file_streams, &resolved.streaming_sources)
-            .await;
+        orch.reconcile(
+            &resolved.file_streams,
+            &resolved.streaming_sources,
+            &resolved.checkpoint_adoptions,
+        )
+        .await;
 
         assert_eq!(orch.active_count(), 1);
         assert!(
@@ -1202,5 +1311,289 @@ mod tests {
             orch.source_data_dir("collectable-9"),
             orch.source_data_dir("collectable-10"),
         );
+    }
+
+    /// Unified config with a selector-backed service description AND its
+    /// still-emitted legacy V3 stream (transition-era dual emission).
+    fn dual_emission_config(container_name: &str) -> config::UnifiedConfig {
+        config::UnifiedConfig::new(
+            serde_json::json!({
+                "services": [{
+                    "service_slug": "web",
+                    "selector": { "container.name": container_name },
+                    "collect": {
+                        "log_source_id": "service-42",
+                        "locator": container_name,
+                        "matching_strategy": "env_var",
+                        "subbox_endpoint": "http://127.0.0.1:9/wire",
+                        "archive_id": "arc",
+                        "repo_id": "repo"
+                    }
+                }],
+                "collect": {
+                    "service-42": {
+                        "locator": container_name,
+                        "matching_strategy": "container_name",
+                        "subbox_endpoint": "http://127.0.0.1:9/wire",
+                        "archive_id": "arc",
+                        "repo_id": "repo"
+                    }
+                }
+            }),
+            "etag-2".into(),
+        )
+    }
+
+    fn cache_with_containers(
+        containers: Vec<crate::discovery::Container>,
+    ) -> crate::discovery::DiscoveryCache {
+        let mut cache = crate::discovery::DiscoveryCache::new();
+        cache.update_all(&crate::discovery::Census {
+            containers,
+            ..Default::default()
+        });
+        cache
+    }
+
+    /// The env-var→selector swap: the reconcile that drops the legacy stream
+    /// in favor of its selector-synthesized source must carry the legacy
+    /// checkpoint state dir over — migrated services neither gap nor duplicate.
+    #[tokio::test]
+    async fn legacy_to_selector_swap_adopts_checkpoint_state_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let log_path = dir.path().join("web.log");
+        std::fs::write(&log_path, "line\n").unwrap();
+        let cache = cache_with_containers(vec![docker_container(
+            "web-abc123def456",
+            "web-app",
+            log_path.to_str().unwrap(),
+        )]);
+
+        // Seed the legacy source's state dir with a marker standing in for its
+        // checkpoint, then run the legacy stream against it.
+        let legacy_dir = dir.path().join("service-42");
+        std::fs::create_dir_all(&legacy_dir).unwrap();
+        std::fs::write(legacy_dir.join("checkpoint.marker"), "42").unwrap();
+
+        let legacy_only = config::UnifiedConfig::new(
+            serde_json::json!({
+                "collect": {
+                    "service-42": {
+                        "locator": "web-app",
+                        "matching_strategy": "container_name",
+                        "subbox_endpoint": "http://127.0.0.1:9/wire",
+                        "archive_id": "arc",
+                        "repo_id": "repo"
+                    }
+                }
+            }),
+            "etag-1".into(),
+        );
+
+        let mut orch = Orchestrator::new(dir.path(), test_identity());
+        let resolved = config::resolved_collect_from_config(&legacy_only, &cache);
+        orch.reconcile(
+            &resolved.file_streams,
+            &resolved.streaming_sources,
+            &resolved.checkpoint_adoptions,
+        )
+        .await;
+        assert_eq!(orch.active_ids(), vec!["service-42"]);
+
+        // The config gains the services block (dual emission). Claim-dedup
+        // supplants the legacy stream, and the swap adopts its state dir.
+        let swapped = dual_emission_config("web-app");
+        let resolved = config::resolved_collect_from_config(&swapped, &cache);
+        orch.reconcile(
+            &resolved.file_streams,
+            &resolved.streaming_sources,
+            &resolved.checkpoint_adoptions,
+        )
+        .await;
+
+        assert_eq!(orch.active_ids(), vec!["service-42/web-app"]);
+        assert!(
+            !legacy_dir.exists(),
+            "legacy state dir must be renamed away"
+        );
+        let adopted = dir.path().join("service-42_web-app");
+        assert_eq!(
+            std::fs::read_to_string(adopted.join("checkpoint.marker")).unwrap(),
+            "42",
+            "checkpoint state survives the swap in the synthesized source's dir"
+        );
+
+        orch.shutdown_all().await;
+    }
+
+    /// The upgrade path restarts the agent process, so the first reconcile
+    /// after boot removes nothing — the orphaned legacy dir must still carry
+    /// over (adoption gates on the legacy id being absent from the desired
+    /// sources, not on a removal in the same pass).
+    #[tokio::test]
+    async fn adoption_covers_agent_restart_mid_migration() {
+        let dir = tempfile::tempdir().unwrap();
+        let log_path = dir.path().join("web.log");
+        std::fs::write(&log_path, "line\n").unwrap();
+        let cache = cache_with_containers(vec![docker_container(
+            "web-abc123def456",
+            "web-app",
+            log_path.to_str().unwrap(),
+        )]);
+
+        let legacy_dir = dir.path().join("service-42");
+        std::fs::create_dir_all(&legacy_dir).unwrap();
+        std::fs::write(legacy_dir.join("checkpoint.marker"), "42").unwrap();
+        // A real resume point under the LEGACY source id — adoption must
+        // re-key it, or the synthesized source replays from zero.
+        {
+            let store = crate::checkpoint::CheckpointStore::open(
+                &legacy_dir.join("streaming_checkpoints.sqlite"),
+            )
+            .unwrap();
+            store
+                .save_streaming(
+                    "service-42",
+                    &crate::streaming_checkpoint::StreamingCheckpoint::journald(
+                        "service-42",
+                        "s=resume-token",
+                    ),
+                )
+                .unwrap();
+        }
+
+        // Fresh orchestrator: nothing managed, config already dual-emitting.
+        let mut orch = Orchestrator::new(dir.path(), test_identity());
+        let resolved =
+            config::resolved_collect_from_config(&dual_emission_config("web-app"), &cache);
+        orch.reconcile(
+            &resolved.file_streams,
+            &resolved.streaming_sources,
+            &resolved.checkpoint_adoptions,
+        )
+        .await;
+
+        assert_eq!(orch.active_ids(), vec!["service-42/web-app"]);
+        assert!(!legacy_dir.exists());
+        assert!(
+            dir.path()
+                .join("service-42_web-app")
+                .join("checkpoint.marker")
+                .exists()
+        );
+        // The resume point followed the rename AND the key: the synthesized
+        // source finds it under its own id, so nothing replays from zero.
+        {
+            let store = crate::checkpoint::CheckpointStore::open(
+                &dir.path()
+                    .join("service-42_web-app")
+                    .join("streaming_checkpoints.sqlite"),
+            )
+            .unwrap();
+            let adopted = store.load_streaming("service-42/web-app").unwrap();
+            assert!(
+                adopted.is_some(),
+                "checkpoint row must be re-keyed to the synthesized id"
+            );
+            assert!(store.load_streaming("service-42").unwrap().is_none());
+        }
+
+        orch.shutdown_all().await;
+    }
+
+    /// A legacy stream that still legitimately resolves (e.g. to a different
+    /// container than the one its description claimed) keeps its state dir —
+    /// adoption only fires for a supplanted stream.
+    #[tokio::test]
+    async fn adoption_skips_while_legacy_stream_is_still_desired() {
+        let dir = tempfile::tempdir().unwrap();
+        let legacy_log = dir.path().join("legacy.log");
+        let new_log = dir.path().join("new.log");
+        std::fs::write(&legacy_log, "line\n").unwrap();
+        std::fs::write(&new_log, "line\n").unwrap();
+
+        let legacy_dir = dir.path().join("service-42");
+        std::fs::create_dir_all(&legacy_dir).unwrap();
+        std::fs::write(legacy_dir.join("checkpoint.marker"), "42").unwrap();
+
+        let stream = |id: &str, path: &std::path::Path| LogStreamConfig {
+            log_source_id: id.into(),
+            path: path.to_str().unwrap().into(),
+            endpoint: "http://127.0.0.1:9/wire".into(),
+            archive_id: "arc".into(),
+            repo_id: "repo".into(),
+            stamp_resource_identifier: false,
+            source_format: FileSourceFormat::Plain,
+            multiline: None,
+            config_hash: format!("hash-{id}"),
+        };
+
+        let mut orch = Orchestrator::new(dir.path(), test_identity());
+        orch.reconcile(
+            &[
+                stream("service-42", &legacy_log),
+                stream("service-42/web-app", &new_log),
+            ],
+            &[],
+            &[CheckpointAdoption {
+                legacy_log_source_id: "service-42".into(),
+                log_source_id: "service-42/web-app".into(),
+            }],
+        )
+        .await;
+
+        assert_eq!(orch.active_count(), 2);
+        assert!(
+            legacy_dir.join("checkpoint.marker").exists(),
+            "a still-desired legacy stream keeps its state dir"
+        );
+        assert!(
+            !dir.path()
+                .join("service-42_web-app")
+                .join("checkpoint.marker")
+                .exists(),
+            "the synthesized source starts fresh instead of stealing state"
+        );
+
+        orch.shutdown_all().await;
+    }
+
+    /// A container leaving the match set (stopped, or a selector edit) drops
+    /// its synthesized source from resolution, so the reconcile plan removes
+    /// its pipeline — the existing `to_remove` drain path.
+    #[tokio::test]
+    async fn container_leaving_the_match_set_stops_its_pipeline() {
+        let dir = tempfile::tempdir().unwrap();
+        let log_path = dir.path().join("web.log");
+        std::fs::write(&log_path, "line\n").unwrap();
+        let container = docker_container("web-abc123def456", "web-app", log_path.to_str().unwrap());
+        let mut cache = cache_with_containers(vec![container]);
+
+        let unified = dual_emission_config("web-app");
+        let mut orch = Orchestrator::new(dir.path(), test_identity());
+        let resolved = config::resolved_collect_from_config(&unified, &cache);
+        orch.reconcile(
+            &resolved.file_streams,
+            &resolved.streaming_sources,
+            &resolved.checkpoint_adoptions,
+        )
+        .await;
+        assert_eq!(orch.active_ids(), vec!["service-42/web-app"]);
+
+        // The container disappears from discovery: the source resolves away
+        // and the pipeline stops (checkpoints stay on disk).
+        cache.update_all(&crate::discovery::Census::default());
+        let resolved = config::resolved_collect_from_config(&unified, &cache);
+        orch.reconcile(
+            &resolved.file_streams,
+            &resolved.streaming_sources,
+            &resolved.checkpoint_adoptions,
+        )
+        .await;
+
+        assert_eq!(orch.active_count(), 0);
+        assert!(dir.path().join("service-42_web-app").exists());
+
+        orch.shutdown_all().await;
     }
 }

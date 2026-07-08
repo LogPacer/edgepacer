@@ -170,6 +170,25 @@ impl CheckpointStore {
         })
     }
 
+    /// Move a streaming checkpoint to a new source id. Checkpoint rows are
+    /// keyed by source id, so adopting a legacy source's state dir is not
+    /// enough — the row itself must follow, or the successor source misses
+    /// its resume point and replays from zero. Returns whether a row moved.
+    pub fn rekey_streaming(
+        &self,
+        old_source_id: &str,
+        new_source_id: &str,
+    ) -> Result<bool, CheckpointError> {
+        let old_key = format!("stream:{old_source_id}");
+        let new_key = format!("stream:{new_source_id}");
+        let conn = self.conn.lock().expect("checkpoint store mutex poisoned");
+        let moved = conn.execute(
+            "UPDATE OR REPLACE checkpoints SET path = ?1 WHERE path = ?2",
+            rusqlite::params![new_key, old_key],
+        )?;
+        Ok(moved > 0)
+    }
+
     /// Load a streaming checkpoint for a source.
     pub fn load_streaming(
         &self,
