@@ -8,7 +8,10 @@
 #![no_main]
 
 use aya_ebpf::{
-    helpers::{bpf_get_current_pid_tgid, bpf_probe_read_user, bpf_probe_read_user_buf},
+    helpers::{
+        bpf_get_current_cgroup_id, bpf_get_current_pid_tgid, bpf_probe_read_user,
+        bpf_probe_read_user_buf,
+    },
     macros::{map, tracepoint, uprobe, uretprobe},
     maps::{HashMap, RingBuf},
     programs::{ProbeContext, RetProbeContext, TracePointContext},
@@ -132,6 +135,7 @@ fn try_capture(ctx: &TracePointContext) -> Result<(), i64> {
     // are written straight through the ring-buffer pointer.
     let record = entry.as_mut_ptr();
     unsafe {
+        (*record).cgroup_id = bpf_get_current_cgroup_id();
         (*record).pid = pid;
         (*record).fd = fd as u32;
         (*record).len = if count > CHUNK_LEN as u64 {
@@ -195,6 +199,7 @@ fn try_capture_writev(ctx: &TracePointContext) -> Result<(), i64> {
     // Gather all fields before the (fallible) buffer read; discard on fault.
     let record = entry.as_mut_ptr();
     unsafe {
+        (*record).cgroup_id = bpf_get_current_cgroup_id();
         (*record).pid = pid;
         (*record).fd = fd as u32;
         (*record).len = if iov_len > CHUNK_LEN as u64 {
@@ -241,6 +246,7 @@ fn try_connect(ctx: &TracePointContext) -> Result<(), i64> {
         return Ok(()); // AF_INET only for this capture path
     }
     let event = ConnectEvent {
+        cgroup_id: unsafe { bpf_get_current_cgroup_id() },
         pid,
         daddr: [raw[4], raw[5], raw[6], raw[7]],
         dport: u16::from_be_bytes([raw[2], raw[3]]),
@@ -273,6 +279,7 @@ fn emit_l7(pid: u32, fd: u32, direction: u8, buf: *const u8, count: u64) -> Resu
     };
     let record = entry.as_mut_ptr();
     unsafe {
+        (*record).cgroup_id = bpf_get_current_cgroup_id();
         (*record).pid = pid;
         (*record).fd = fd;
         (*record).direction = direction;
@@ -379,6 +386,7 @@ fn emit_tls(pid: u32, ssl: u64, direction: u8, buf: *const u8, count: u64) -> Re
     };
     let record = entry.as_mut_ptr();
     unsafe {
+        (*record).cgroup_id = bpf_get_current_cgroup_id();
         (*record).ssl = ssl;
         (*record).pid = pid;
         (*record).direction = direction;

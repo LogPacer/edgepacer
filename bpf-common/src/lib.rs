@@ -29,6 +29,9 @@ pub const CHUNK_LEN: usize = 128;
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct LogChunk {
+    /// The capturing task's v2 cgroup id (`bpf_get_current_cgroup_id`) — the
+    /// tamper-proof container/service key, joined to identity in userspace.
+    pub cgroup_id: u64,
     pub pid: u32,
     pub fd: u32,
     pub len: u32,
@@ -41,6 +44,8 @@ pub struct LogChunk {
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct ConnectEvent {
+    /// The connecting task's v2 cgroup id — see `LogChunk::cgroup_id`.
+    pub cgroup_id: u64,
     pub pid: u32,
     pub daddr: [u8; 4],
     pub dport: u16,
@@ -63,6 +68,8 @@ pub const L7_DIR_OUTBOUND: u8 = 1; // write/send — response bytes
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct L7Chunk {
+    /// The capturing task's v2 cgroup id — see `LogChunk::cgroup_id`.
+    pub cgroup_id: u64,
     pub pid: u32,
     pub fd: u32,
     pub len: u32,
@@ -78,6 +85,8 @@ pub struct L7Chunk {
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct TlsChunk {
+    /// The capturing task's v2 cgroup id — see `LogChunk::cgroup_id`.
+    pub cgroup_id: u64,
     pub ssl: u64,
     pub pid: u32,
     pub len: u32,

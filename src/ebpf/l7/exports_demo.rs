@@ -42,6 +42,7 @@ fn demo(out: &mut String, name: &str, key: Option<&str>, req: &[u8], resp: &[u8]
     let mut reg = ConnRegistry::new();
     let inbound = CapturedSegment {
         pid: 4242,
+        cgroup_id: 0,
         fd: 7,
         direction: Direction::Inbound,
         timestamp_nano: REQ_TS,
@@ -49,6 +50,7 @@ fn demo(out: &mut String, name: &str, key: Option<&str>, req: &[u8], resp: &[u8]
     };
     let outbound = CapturedSegment {
         pid: 4242,
+        cgroup_id: 0,
         fd: 7,
         direction: Direction::Outbound,
         timestamp_nano: RESP_TS,

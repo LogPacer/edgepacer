@@ -204,7 +204,7 @@ pub async fn run(
                     let ctx = SpanContext {
                         service_name: service.to_string(),
                         pid,
-                        cgroup_id: 0,
+                        cgroup_id: seg.cgroup_id,
                         trace_id: mint_id(16, span_seq ^ ((pid as u64) << 32) ^ ts as u64),
                         span_id: mint_id(8, span_seq.wrapping_mul(0x100_0000_01b3) ^ pid as u64),
                         peer: peer.clone(),
@@ -226,14 +226,15 @@ pub async fn run(
     }
 }
 
-/// Map a captured connect into the wire `NetworkFlow`. The capture currently
-/// yields the destination IPv4 + port + pid; `saddr`/`sport`/byte+packet counts
-/// /`cgroup_id` stay zero until the capture is enriched.
+/// Map a captured connect into the wire `NetworkFlow`. The capture yields the
+/// destination IPv4 + port + pid + cgroup id; `saddr`/`sport`/byte+packet counts
+/// stay zero until the capture is enriched.
 fn to_network_flow(flow: &CapturedFlow) -> NetworkFlow {
     NetworkFlow {
         daddr: flow.daddr.to_vec(),
         dport: flow.dport as u32,
         pid: flow.pid,
+        cgroup_id: flow.cgroup_id,
         protocol: IPPROTO_TCP,
         direction: DIRECTION_EGRESS,
         ..Default::default()
