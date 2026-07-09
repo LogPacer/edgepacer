@@ -1,6 +1,9 @@
 //! Listening port discovery — enumerates network sockets in LISTEN state.
 //!
-//! Linux: native procfs-based enumeration (tcp/tcp6/udp/udp6 + inode→PID mapping).
+//! Linux: native procfs-based enumeration (tcp/tcp6/udp/udp6 + inode→PID
+//! mapping), plus a sweep of non-host network namespaces so container-internal
+//! listeners surface with their real pids — the host tables only show
+//! docker-proxy on published ports, which iptables DNAT bypasses.
 //! macOS: shells out to `lsof -i -P -n` and parses output.
 //! Both paths produce the same `ListeningPort` struct matching legacy EdgePacer's JSON shape.
 
@@ -35,7 +38,10 @@ fn discover_ports_native() -> Result<Vec<ListeningPort>, String> {
     use std::path::Path;
 
     // Step 1: Build inode → (pid, process_name) map by scanning /proc/[pid]/fd/
+    // While walking, record one representative pid per distinct network
+    // namespace so step 4 can read each container netns's socket tables.
     let mut inode_map: HashMap<u64, (u32, String)> = HashMap::new();
+    let mut netns_reps: HashMap<u64, u32> = HashMap::new();
 
     if let Ok(entries) = fs::read_dir("/proc") {
         for entry in entries.flatten() {
@@ -45,6 +51,10 @@ fn discover_ports_native() -> Result<Vec<ListeningPort>, String> {
                 Ok(p) => p,
                 Err(_) => continue,
             };
+
+            if let Some(ns) = netns_inode(&format!("/proc/{pid}/ns/net")) {
+                netns_reps.entry(ns).or_insert(pid);
+            }
 
             // Read process name from /proc/[pid]/comm
             let comm_path = format!("/proc/{pid}/comm");
@@ -116,12 +126,75 @@ fn discover_ports_native() -> Result<Vec<ListeningPort>, String> {
         });
     }
 
-    // Deduplicate (same port may appear in both v4 and v6)
-    ports.sort_by_key(|p| (p.port, p.protocol.clone()));
-    ports.dedup_by_key(|p| (p.port, p.protocol.clone()));
+    // Step 4: sweep non-host network namespaces. A containerized listener
+    // lives in its own netns and never appears in the host tables above; the
+    // host shows only docker-proxy on the published port, which iptables DNAT
+    // bypasses — so pid attribution (and eBPF targeting) lands on a process
+    // that carries no traffic. Read each distinct netns's TCP tables through a
+    // representative pid's /proc/<pid>/net/tcp[6]; the inode map already spans
+    // every pid, so owners resolve across namespaces.
+    let self_netns = netns_inode("/proc/self/ns/net");
+    for (netns, rep_pid) in netns_reps {
+        if Some(netns) == self_netns {
+            continue; // host netns is covered by steps 2-3
+        }
+        for table in ["tcp", "tcp6"] {
+            let Ok(content) = fs::read_to_string(format!("/proc/{rep_pid}/net/{table}")) else {
+                continue; // representative exited or unreadable — next cycle heals
+            };
+            for (port, inode) in listen_ports_from_proc_net_tcp(&content) {
+                // Attribution is the sweep's whole purpose: a row whose socket
+                // owner can't be resolved adds nothing over the host pass.
+                let Some((pid, process)) = inode_map.get(&inode).cloned() else {
+                    continue;
+                };
+                ports.push(ListeningPort {
+                    port,
+                    protocol: "tcp".to_string(),
+                    process,
+                    pid,
+                });
+            }
+        }
+    }
+
+    // Deduplicate (v4/v6 double-report; the sweep can re-surface host-visible
+    // listeners). Pid stays in the key so distinct owners of one port survive:
+    // SO_REUSEPORT pools, and docker-proxy vs the container process behind the
+    // same published port.
+    ports.sort_by_key(|p| (p.port, p.protocol.clone(), p.pid));
+    ports.dedup_by_key(|p| (p.port, p.protocol.clone(), p.pid));
 
     debug!(count = ports.len(), "discovered listening ports via procfs");
     Ok(ports)
+}
+
+/// Parse the inode out of a `/proc/<pid>/ns/net` symlink ("net:[4026531840]").
+#[cfg(target_os = "linux")]
+fn netns_inode(path: &str) -> Option<u64> {
+    let link = std::fs::read_link(path).ok()?;
+    let link = link.to_string_lossy();
+    link.strip_prefix("net:[")?.strip_suffix(']')?.parse().ok()
+}
+
+/// Parse `/proc/net/tcp[6]` text into (local_port, socket_inode) pairs for
+/// rows in LISTEN state. Whitespace-split columns: 1 = local address
+/// (hex ip:port), 3 = state (`0A` = LISTEN), 9 = inode.
+#[cfg(any(test, target_os = "linux"))]
+fn listen_ports_from_proc_net_tcp(table: &str) -> Vec<(u16, u64)> {
+    table
+        .lines()
+        .skip(1)
+        .filter_map(|line| {
+            let cols: Vec<&str> = line.split_whitespace().collect();
+            if *cols.get(3)? != "0A" {
+                return None;
+            }
+            let port = u16::from_str_radix(cols.get(1)?.rsplit(':').next()?, 16).ok()?;
+            let inode: u64 = cols.get(9)?.parse().ok()?;
+            Some((port, inode))
+        })
+        .collect()
 }
 
 /// Shell-out fallback: parse `lsof -i -P -n` output.
@@ -305,6 +378,69 @@ fn discover_ports_sync() -> Result<Vec<ListeningPort>, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Real /proc/net/tcp shape: header + one row per socket. 0100007F:1F90 =
+    // 127.0.0.1:8080 LISTEN (st 0A); the second row is an ESTABLISHED (01)
+    // connection and the third a LISTEN on 0.0.0.0:50 (port 0x0050 = 80).
+    const SAMPLE_PROC_NET_TCP: &str = "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n   0: 0100007F:1F90 00000000:0000 0A 00000000:00000000 00:00000000 00000000     0        0 424242 1 0000000000000000 100 0 0 10 0\n   1: 0100007F:1F90 0100007F:C350 01 00000000:00000000 00:00000000 00000000     0        0 424243 1 0000000000000000 20 4 30 10 -1\n   2: 00000000:0050 00000000:0000 0A 00000000:00000000 00:00000000 00000000     0        0 424244 1 0000000000000000 100 0 0 10 0\n";
+
+    #[test]
+    fn listen_rows_parse_port_and_inode() {
+        let rows = listen_ports_from_proc_net_tcp(SAMPLE_PROC_NET_TCP);
+        assert_eq!(vec![(8080, 424242), (80, 424244)], rows);
+    }
+
+    #[test]
+    fn non_listen_states_are_skipped() {
+        let rows = listen_ports_from_proc_net_tcp(SAMPLE_PROC_NET_TCP);
+        assert!(!rows.iter().any(|(_, inode)| *inode == 424243));
+    }
+
+    #[test]
+    fn malformed_lines_are_skipped() {
+        let rows = listen_ports_from_proc_net_tcp("header\ngarbage line\n   0: nonsense\n");
+        assert!(rows.is_empty());
+    }
+
+    /// Proves the netns sweep end-to-end: a listener inside a fresh network
+    /// namespace (invisible to the host tables) must surface with its real
+    /// pid. Needs root (unshare -n) — run on the VM alongside the capture
+    /// e2e tests: `sudo -E cargo test --release netns_listener -- --ignored`.
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore]
+    fn netns_listener_surfaces_with_its_pid() {
+        use std::process::{Command, Stdio};
+
+        let port = 39321;
+        let mut child = Command::new("unshare")
+            .args([
+                "-n",
+                "python3",
+                "-c",
+                &format!(
+                    "import socket, time\ns = socket.socket()\ns.bind((\"127.0.0.1\", {port}))\ns.listen()\ntime.sleep(30)"
+                ),
+            ])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn unshare listener (needs root)");
+        let child_pid = child.id();
+
+        let mut found = false;
+        for _ in 0..25 {
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            let ports = discover_ports_native().expect("discover ports");
+            if ports.iter().any(|p| p.port == port && p.pid == child_pid) {
+                found = true;
+                break;
+            }
+        }
+        let _ = child.kill();
+        let _ = child.wait();
+        assert!(found, "netns listener on {port} (pid {child_pid}) never surfaced in the sweep");
+    }
 
     const SAMPLE_LSOF: &str = r#"COMMAND     PID   USER   FD   TYPE             DEVICE SIZE/OFF NODE NAME
 sshd        843   root    3u  IPv4 0x12345      0t0  TCP *:22 (LISTEN)

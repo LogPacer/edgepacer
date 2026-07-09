@@ -41,6 +41,8 @@ pub struct StatsReport {
     pub ebpf_last_error: Option<String>,
     #[serde(default)]
     pub ebpf_build_support: bool,
+    #[serde(default)]
+    pub ebpf_pids_targeted: usize,
 }
 
 // --- Stream config status ---
@@ -183,6 +185,7 @@ pub async fn run(
             ebpf_running: ebpf.running,
             ebpf_last_error: ebpf.last_error.clone(),
             ebpf_build_support: ebpf.build_support,
+            ebpf_pids_targeted: ebpf.pids_targeted,
         };
 
         // Report to Rails. Only advance the dedup signature once the snapshot is
@@ -328,6 +331,7 @@ mod tests {
             ebpf_running: false,
             ebpf_last_error: None,
             ebpf_build_support: false,
+            ebpf_pids_targeted: 0,
         };
 
         let json = serde_json::to_string(&report).unwrap();
@@ -376,6 +380,7 @@ mod tests {
             ebpf_running: false,
             ebpf_last_error: None,
             ebpf_build_support: false,
+            ebpf_pids_targeted: 0,
         };
 
         let json = serde_json::to_string(&report).unwrap();

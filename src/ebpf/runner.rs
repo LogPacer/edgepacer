@@ -123,6 +123,7 @@ pub async fn run(
                     let mut guard = status.write().await;
                     guard.running = false;
                     guard.last_error = None;
+                    guard.pids_targeted = 0;
                     continue;
                 };
 
@@ -153,6 +154,7 @@ pub async fn run(
                 let mut guard = status.write().await;
                 guard.running = outcome.running;
                 guard.last_error = outcome.last_error;
+                guard.pids_targeted = routing.len();
             }
 
             Some(line) = captured_rx.recv() => {
