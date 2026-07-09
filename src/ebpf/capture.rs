@@ -74,6 +74,7 @@ const L7_READ_EXIT: (&str, &[(&str, &str)]) = (
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CapturedLine {
     pub pid: u32,
+    pub cgroup_id: u64,
     pub fd: u32,
     pub bytes: Vec<u8>,
 }
@@ -82,6 +83,7 @@ pub struct CapturedLine {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CapturedFlow {
     pub pid: u32,
+    pub cgroup_id: u64,
     pub daddr: [u8; 4],
     pub dport: u16,
     pub family: u16,
@@ -283,6 +285,7 @@ fn spawn_drain(ring: RingBuf<MapData>, tx: mpsc::Sender<CapturedLine>) -> JoinHa
                 let n = (chunk.len as usize).min(CHUNK_LEN);
                 let line = CapturedLine {
                     pid: chunk.pid,
+                    cgroup_id: chunk.cgroup_id,
                     fd: chunk.fd,
                     bytes: chunk.data[..n].to_vec(),
                 };
@@ -326,6 +329,7 @@ fn spawn_flow_drain(ring: RingBuf<MapData>, tx: mpsc::Sender<CapturedFlow>) -> J
                 let ev = unsafe { std::ptr::read_unaligned(bytes.as_ptr() as *const ConnectEvent) };
                 let flow = CapturedFlow {
                     pid: ev.pid,
+                    cgroup_id: ev.cgroup_id,
                     daddr: ev.daddr,
                     dport: ev.dport,
                     family: ev.family,
@@ -379,6 +383,7 @@ fn spawn_l7_drain(ring: RingBuf<MapData>, tx: mpsc::Sender<CapturedSegment>) -> 
                     .unwrap_or(0);
                 let seg = CapturedSegment {
                     pid: chunk.pid,
+                    cgroup_id: chunk.cgroup_id,
                     fd: chunk.fd,
                     direction,
                     timestamp_nano,
@@ -435,6 +440,7 @@ fn spawn_tls_drain(ring: RingBuf<MapData>, tx: mpsc::Sender<CapturedSegment>) ->
                     .unwrap_or(0);
                 let seg = CapturedSegment {
                     pid: chunk.pid,
+                    cgroup_id: chunk.cgroup_id,
                     // Stable per-connection id from the SSL* pointer (drop alignment
                     // bits); real fds are small ints, so there's no collision.
                     fd: (chunk.ssl >> 4) as u32,
@@ -668,15 +674,19 @@ a.recv(4096)
         // (the client side, and fds reused from earlier file reads) yield no
         // matching record, so we filter by operation rather than taking the first.
         let mut conns = ConnRegistry::new();
-        let record = tokio::time::timeout(Duration::from_secs(8), async {
+        let (record, cgroup_id) = tokio::time::timeout(Duration::from_secs(8), async {
+            let mut last_cgroup = 0u64;
             loop {
                 let seg = l7_rx.recv().await.expect("L7 channel closed");
+                if seg.pid == pid {
+                    last_cgroup = seg.cgroup_id;
+                }
                 if let Some(rec) = conns
                     .on_segment(&seg)
                     .into_iter()
                     .find(|r| r.operation == "GET /l7test")
                 {
-                    return rec;
+                    return (rec, last_cgroup);
                 }
             }
         })
@@ -685,6 +695,10 @@ a.recv(4096)
 
         assert_eq!(record.status_code, 200);
         assert!(!record.error);
+        assert_ne!(
+            cgroup_id, 0,
+            "L7 capture must stamp the target task's cgroup id in-kernel"
+        );
 
         let _ = child.wait();
     }

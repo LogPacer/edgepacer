@@ -31,6 +31,8 @@ const MAX_TRACKED_CONNS: usize = 16_384;
 #[derive(Debug, Clone)]
 pub struct CapturedSegment {
     pub pid: u32,
+    /// The capturing task's v2 cgroup id — the container/service identity key.
+    pub cgroup_id: u64,
     pub fd: u32,
     pub direction: Direction,
     /// When the segment was observed in userspace (unix nanos) — the timing source
@@ -389,6 +391,7 @@ mod tests {
     fn seg(pid: u32, fd: u32, direction: Direction, bytes: &[u8]) -> CapturedSegment {
         CapturedSegment {
             pid,
+            cgroup_id: 0,
             fd,
             direction,
             timestamp_nano: 0,
