@@ -8,6 +8,7 @@
 #![no_main]
 
 use aya_ebpf::{
+    bindings::BPF_TCP_LISTEN,
     helpers::{
         bpf_get_current_cgroup_id, bpf_get_current_pid_tgid, bpf_probe_read_user,
         bpf_probe_read_user_buf,
@@ -18,8 +19,8 @@ use aya_ebpf::{
     EbpfContext,
 };
 use edgepacer_ebpf_common::{
-    ConnectEvent, ExecEvent, LogChunk, L7Chunk, TlsChunk, CHUNK_LEN, L7_CHUNK_LEN, L7_DIR_INBOUND,
-    L7_DIR_OUTBOUND,
+    ConnectEvent, ExecEvent, ListenerEvent, LogChunk, L7Chunk, TlsChunk, CHUNK_LEN, L7_CHUNK_LEN,
+    L7_DIR_INBOUND, L7_DIR_OUTBOUND,
 };
 
 // 256 KiB ring buffer (power of two, page-aligned) shared with userspace.
@@ -37,6 +38,19 @@ static LOG_EVENTS: RingBuf = RingBuf::with_byte_size(256 * 1024, 0);
 // Outbound connect(2) events, drained by the userspace loader.
 #[map]
 static CONNECT_EVENTS: RingBuf = RingBuf::with_byte_size(64 * 1024, 0);
+
+// Successful TCP listener discovery events (port→cgroup), drained by the
+// userspace loader. Unfiltered by TARGET_PIDS: discovery must see every
+// listener host-wide to resolve which cgroup owns a targeted port. Listener
+// transitions are rare, so the volume is negligible.
+#[map]
+static LISTENER_EVENTS: RingBuf = RingBuf::with_byte_size(64 * 1024, 0);
+
+// inet_sock_set_state announces TCP_LISTEN before listen(2) has completed.
+// Stage the candidate per calling thread; sys_exit_listen emits it only when
+// the syscall succeeds and removes it on every exit.
+#[map]
+static LISTEN_CANDIDATES: HashMap<u64, ListenerEvent> = HashMap::with_max_entries(1024, 0);
 
 // L7 (APM) socket payloads — both directions, drained separately from LOG_EVENTS.
 #[map]
@@ -254,6 +268,85 @@ fn try_connect(ctx: &TracePointContext) -> Result<(), i64> {
     };
 
     let Some(mut entry) = CONNECT_EVENTS.reserve::<ConnectEvent>(0) else {
+        return Err(0);
+    };
+    entry.write(event);
+    entry.submit(0);
+    Ok(())
+}
+
+/// Stage a listener's `port → cgroup` when TCP enters LISTEN (event-driven,
+/// host-wide, NOT filtered by TARGET_PIDS). `capture_listen_exit` publishes the
+/// candidate only after listen(2) succeeds.
+#[tracepoint]
+pub fn capture_listen(ctx: TracePointContext) -> u32 {
+    match try_listen(&ctx) {
+        Ok(()) => 0,
+        Err(_) => 1,
+    }
+}
+
+fn try_listen(ctx: &TracePointContext) -> Result<(), i64> {
+    // sock:inet_sock_set_state tracepoint layout on the supported 64-bit Linux
+    // kernels: newstate @20, sport @24, family @28, protocol @30. `sport` is
+    // already host-order. IPPROTO_TCP=6.
+    let new_state: i32 = unsafe { ctx.read_at(20).map_err(|_| 1_i64)? };
+    if new_state != BPF_TCP_LISTEN as i32 {
+        return Ok(());
+    }
+    let protocol: u16 = unsafe { ctx.read_at(30).map_err(|_| 1_i64)? };
+    if protocol != 6 {
+        return Ok(());
+    }
+    let port: u16 = unsafe { ctx.read_at(24).map_err(|_| 1_i64)? };
+    let family: u16 = unsafe { ctx.read_at(28).map_err(|_| 1_i64)? };
+    if port == 0 || (family != 2 && family != 10) {
+        return Ok(());
+    }
+
+    let cgroup_id = unsafe { bpf_get_current_cgroup_id() };
+    if cgroup_id == 0 {
+        return Ok(());
+    }
+
+    let event = ListenerEvent {
+        cgroup_id,
+        tgid: ctx.tgid(),
+        port,
+        family,
+    };
+    let key = bpf_get_current_pid_tgid();
+    LISTEN_CANDIDATES
+        .insert(&key, &event, 0)
+        .map_err(|_| 1_i64)?;
+    Ok(())
+}
+
+/// Publish a staged listener only when listen(2) returns success. The candidate
+/// is removed before reading the return value so every exit path cleans it up.
+#[tracepoint]
+pub fn capture_listen_exit(ctx: TracePointContext) -> u32 {
+    match try_listen_exit(&ctx) {
+        Ok(()) => 0,
+        Err(_) => 1,
+    }
+}
+
+fn try_listen_exit(ctx: &TracePointContext) -> Result<(), i64> {
+    let key = bpf_get_current_pid_tgid();
+    let event = match unsafe { LISTEN_CANDIDATES.get(&key) } {
+        Some(event) => *event,
+        None => return Ok(()),
+    };
+    let _ = LISTEN_CANDIDATES.remove(&key);
+
+    // sys_exit tracepoint layout: syscall return value is a signed long @16.
+    let ret: i64 = unsafe { ctx.read_at(16).map_err(|_| 1_i64)? };
+    if ret != 0 {
+        return Ok(());
+    }
+
+    let Some(mut entry) = LISTENER_EVENTS.reserve::<ListenerEvent>(0) else {
         return Err(0);
     };
     entry.write(event);
