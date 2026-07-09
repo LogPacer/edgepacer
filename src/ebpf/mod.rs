@@ -62,6 +62,10 @@ pub struct EbpfStatus {
     pub build_support: bool,
     pub running: bool,
     pub last_error: Option<String>,
+    /// PIDs seeded into the kernel filter this tick. Distinguishes healthy
+    /// capture from capture that targets nothing (e.g. docker-proxy pids
+    /// bypassed by DNAT) — `running` alone can't tell those apart.
+    pub pids_targeted: usize,
 }
 
 /// Shared, hot-readable eBPF status. The stats reporter reads it each tick.
