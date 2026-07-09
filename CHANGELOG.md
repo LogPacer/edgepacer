@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Build release binaries with fat LTO and a single codegen unit, shrinking the
+  agent binary by roughly 25% and improving optimized codegen. Symbols are kept
+  so panic backtraces stay readable in self-telemetry.
+
 - Honor the control plane's `full_resync_required` census response on every
   inventory lane (containers, services, files, journald, processes, ports,
   Windows event logs, packages), not just packages. The flag now clears the
