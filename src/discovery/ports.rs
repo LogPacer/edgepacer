@@ -439,7 +439,10 @@ mod tests {
         }
         let _ = child.kill();
         let _ = child.wait();
-        assert!(found, "netns listener on {port} (pid {child_pid}) never surfaced in the sweep");
+        assert!(
+            found,
+            "netns listener on {port} (pid {child_pid}) never surfaced in the sweep"
+        );
     }
 
     const SAMPLE_LSOF: &str = r#"COMMAND     PID   USER   FD   TYPE             DEVICE SIZE/OFF NODE NAME
