@@ -11,6 +11,16 @@ publish = false
 members = [".", "crates/logpacer_wire"]
 resolver = "3"
 
+# Release binaries: fat LTO + a single codegen unit trade a ~2x longer build
+# (free on public GitHub runners) for ~25% smaller binaries and better codegen.
+# Symbols deliberately stay in — panic backtraces shipped via self-telemetry
+# are worth more on a fleet agent than the ~2 MB stripping would save. Keep
+# `panic = "abort"` out: a long-running agent must unwind a panicking task,
+# not abort the whole process.
+[profile.release]
+lto = "fat"
+codegen-units = 1
+
 [dependencies]
 # CLI
 clap = { version = "4", features = ["derive", "env"] }
