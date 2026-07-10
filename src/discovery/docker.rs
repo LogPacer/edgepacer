@@ -6,7 +6,7 @@
 //! 3. Extract service name from labels (compose/swarm/k8s priority)
 //! 4. Filter env vars to LOGPACER_ prefix
 
-use super::Container;
+use super::{Container, RuntimeProcessIdentity};
 use crate::rate_limiter::docker_limiter;
 use bollard::query_parameters::{InspectContainerOptions, ListContainersOptions};
 use bollard::{API_DEFAULT_VERSION, Docker};
@@ -28,6 +28,11 @@ const DEFAULT_WINDOWS_DOCKER_HOST: &str = "npipe:////./pipe/docker_engine";
 enum DockerConnectionTarget {
     Environment(&'static str),
     Host(String),
+}
+
+struct DockerConnection {
+    client: Docker,
+    runtime_processes_are_local: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -52,10 +57,20 @@ struct DockerContextEndpoint {
 
 /// Discover all Docker-compatible containers through the configured endpoint.
 pub async fn discover_containers() -> anyhow::Result<Vec<Container>> {
-    let Some(docker) = connect_docker()? else {
+    discover_containers_with_runtime_processes(false).await
+}
+
+pub(crate) async fn discover_containers_with_runtime_processes(
+    include_runtime_processes: bool,
+) -> anyhow::Result<Vec<Container>> {
+    let Some(connection) = connect_docker_with_locality()? else {
         debug!("docker discovery skipped: no Docker-compatible endpoint configured");
         return Ok(Vec::new());
     };
+    let DockerConnection {
+        client: docker,
+        runtime_processes_are_local,
+    } = connection;
 
     // List all containers (running + stopped)
     let list_opts = ListContainersOptions {
@@ -85,7 +100,7 @@ pub async fn discover_containers() -> anyhow::Result<Vec<Container>> {
         let label_service_name = extract_service_name(&labels, &name);
 
         // Inspect running containers for log path and env
-        let (log_path, env) = if state == "running" {
+        let (log_path, env, runtime_process) = if state == "running" {
             docker_limiter().wait().await;
             match docker
                 .inspect_container(id, None::<InspectContainerOptions>)
@@ -105,16 +120,23 @@ pub async fn discover_containers() -> anyhow::Result<Vec<Container>> {
                         .and_then(|c| c.env.as_ref())
                         .map(|e| filter_env(e))
                         .unwrap_or_default();
+                    let runtime_process = detail.state.as_ref().and_then(|state| {
+                        runtime_process_from_docker_state(
+                            state.running,
+                            state.pid,
+                            include_runtime_processes && runtime_processes_are_local,
+                        )
+                    });
 
-                    (resolved_log_path, env)
+                    (resolved_log_path, env, runtime_process)
                 }
                 Err(e) => {
                     warn!(container = %name, error = %e, "failed to inspect container");
-                    (String::new(), Vec::new())
+                    (String::new(), Vec::new(), None)
                 }
             }
         } else {
-            (String::new(), Vec::new())
+            (String::new(), Vec::new(), None)
         };
 
         // Priority 1: the literal LOGPACER_SERVICE_NAME env var — the only
@@ -148,13 +170,36 @@ pub async fn discover_containers() -> anyhow::Result<Vec<Container>> {
             workload_kind: String::new(),
             container_id: id.to_string(),
             container_name: String::new(),
+            runtime_process,
         });
     }
 
     Ok(result)
 }
 
+fn runtime_process_from_docker_state(
+    running: Option<bool>,
+    pid: Option<i64>,
+    runtime_processes_are_local: bool,
+) -> Option<RuntimeProcessIdentity> {
+    if !cfg!(all(target_os = "linux", feature = "ebpf"))
+        || !runtime_processes_are_local
+        || running != Some(true)
+    {
+        return None;
+    }
+
+    let pid = pid
+        .and_then(|pid| u32::try_from(pid).ok())
+        .filter(|pid| *pid != 0)?;
+    RuntimeProcessIdentity::capture(pid)
+}
+
 pub(crate) fn connect_docker() -> anyhow::Result<Option<Docker>> {
+    connect_docker_with_locality().map(|connection| connection.map(|connection| connection.client))
+}
+
+fn connect_docker_with_locality() -> anyhow::Result<Option<DockerConnection>> {
     let docker_host = std::env::var("DOCKER_HOST").ok();
     let container_host = std::env::var("CONTAINER_HOST").ok();
     let context_host = docker_config_dir().and_then(|dir| read_current_docker_context_host(&dir));
@@ -166,14 +211,46 @@ pub(crate) fn connect_docker() -> anyhow::Result<Option<Docker>> {
         default_host.as_deref(),
     );
 
+    let runtime_processes_are_local = match &target {
+        Some(DockerConnectionTarget::Environment("DOCKER_HOST")) => docker_host
+            .as_deref()
+            .is_some_and(is_local_linux_unix_endpoint),
+        Some(DockerConnectionTarget::Environment(_)) | None => false,
+        Some(DockerConnectionTarget::Host(host)) => is_local_linux_unix_endpoint(host),
+    };
+
     match target {
         Some(DockerConnectionTarget::Environment(var_name)) => Docker::connect_with_defaults()
-            .map(Some)
+            .map(|client| {
+                Some(DockerConnection {
+                    client,
+                    runtime_processes_are_local,
+                })
+            })
             .map_err(|e| anyhow::anyhow!("docker connect failed via {var_name}: {e}")),
         Some(DockerConnectionTarget::Host(host)) => connect_with_host(&host)
-            .map(Some)
+            .map(|client| {
+                Some(DockerConnection {
+                    client,
+                    runtime_processes_are_local,
+                })
+            })
             .map_err(|e| anyhow::anyhow!("docker connect failed via {host}: {e}")),
         None => Ok(None),
+    }
+}
+
+fn is_local_linux_unix_endpoint(host: &str) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        let host = host.trim();
+        host.starts_with("unix://") || host.starts_with('/')
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = host;
+        false
     }
 }
 
@@ -392,6 +469,66 @@ mod tests {
         // Compose labels alone are not consent
         let no_env: Vec<String> = vec!["LOGPACER_DEBUG=true".to_string()];
         assert_eq!(explicit_service_name_from_env(&no_env), None);
+    }
+
+    #[test]
+    fn docker_runtime_identity_requires_local_linux_process() {
+        let pid = i64::from(std::process::id());
+
+        assert_eq!(
+            runtime_process_from_docker_state(Some(true), Some(pid), false),
+            None
+        );
+        assert_eq!(
+            runtime_process_from_docker_state(Some(false), Some(pid), true),
+            None
+        );
+        assert_eq!(
+            runtime_process_from_docker_state(Some(true), Some(0), true),
+            None
+        );
+        assert_eq!(
+            runtime_process_from_docker_state(Some(true), Some(-1), true),
+            None
+        );
+        assert_eq!(
+            runtime_process_from_docker_state(Some(true), Some(i64::from(u32::MAX) + 1), true),
+            None
+        );
+        assert_eq!(
+            runtime_process_from_docker_state(Some(true), None, true),
+            None
+        );
+
+        #[cfg(all(target_os = "linux", feature = "ebpf"))]
+        assert!(runtime_process_from_docker_state(Some(true), Some(pid), true).is_some());
+        #[cfg(not(all(target_os = "linux", feature = "ebpf")))]
+        assert_eq!(
+            runtime_process_from_docker_state(Some(true), Some(pid), true),
+            None
+        );
+    }
+
+    #[test]
+    fn only_linux_unix_endpoints_can_supply_runtime_processes() {
+        assert!(!is_local_linux_unix_endpoint("tcp://127.0.0.1:2375"));
+        assert!(!is_local_linux_unix_endpoint("http://localhost:2375"));
+        assert!(!is_local_linux_unix_endpoint("https://docker.example"));
+        assert!(!is_local_linux_unix_endpoint("ssh://docker.example"));
+
+        #[cfg(target_os = "linux")]
+        {
+            assert!(is_local_linux_unix_endpoint("unix:///run/docker.sock"));
+            assert!(is_local_linux_unix_endpoint("/run/docker.sock"));
+            assert!(!is_local_linux_unix_endpoint(
+                "npipe:////./pipe/docker_engine"
+            ));
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            assert!(!is_local_linux_unix_endpoint("unix:///var/run/docker.sock"));
+            assert!(!is_local_linux_unix_endpoint("/var/run/docker.sock"));
+        }
     }
 
     #[test]

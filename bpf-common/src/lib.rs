@@ -28,7 +28,16 @@ pub struct ExecEvent {
 #[derive(Clone, Copy)]
 pub struct ListenerEvent {
     pub cgroup_id: u64,
+    /// `bpf_ktime_get_ns()` at successful `listen(2)` completion. Userspace
+    /// uses the monotonic timestamp to replay live deltas across a snapshot
+    /// cut without resurrecting listeners observed before that cut.
+    pub observed_at_ns: u64,
+    /// Per-CPU publication sequence. Userspace advances one contiguous
+    /// watermark per CPU so a snapshot fence cannot substitute another CPU's
+    /// event for one that has not reached the ring yet.
+    pub sequence: u64,
     pub tgid: u32,
+    pub cpu_id: u32,
     pub port: u16,
     pub family: u16,
 }

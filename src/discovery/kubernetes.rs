@@ -10,6 +10,8 @@ use kube::{
     Client,
     api::{Api, ListParams},
 };
+#[cfg(any(test, all(target_os = "linux", feature = "ebpf")))]
+use std::collections::HashSet;
 use std::collections::{BTreeMap, HashMap};
 use tracing::info;
 
@@ -122,10 +124,53 @@ pub fn process_pod(pod: &Pod, pod_logs_dir: &str) -> Vec<Container> {
             workload_kind: workload_kind.clone(),
             container_id: container_id.unwrap_or_default(),
             env: vec![],
+            runtime_process: None,
         });
     }
 
     containers
+}
+
+/// Enrich Kubernetes API records with the full host process identity
+/// discovered through CRI. Kubernetes prefixes runtime handles (for example
+/// `containerd://`), while `crictl` reports the bare container ID; normalize
+/// only for the join and leave both records' external identities untouched.
+#[cfg(any(test, all(target_os = "linux", feature = "ebpf")))]
+pub(crate) fn join_cri_runtime_processes(kubernetes: &mut [Container], cri: &[Container]) {
+    let mut cri_processes = HashMap::new();
+    let mut ambiguous_ids = HashSet::new();
+
+    for container in cri {
+        let id = normalized_runtime_id(&container.container_id);
+        let Some(process) = container.runtime_process.filter(|_| !id.is_empty()) else {
+            continue;
+        };
+        if ambiguous_ids.contains(id) {
+            continue;
+        }
+        if cri_processes
+            .get(id)
+            .is_some_and(|existing| *existing != process)
+        {
+            cri_processes.remove(id);
+            ambiguous_ids.insert(id);
+            continue;
+        }
+        cri_processes.insert(id, process);
+    }
+
+    for container in kubernetes {
+        let id = normalized_runtime_id(&container.container_id);
+        container.runtime_process = cri_processes.get(id).copied();
+    }
+}
+
+#[cfg(any(test, all(target_os = "linux", feature = "ebpf")))]
+fn normalized_runtime_id(container_id: &str) -> &str {
+    match container_id.split_once("://") {
+        Some((runtime, id)) if !runtime.is_empty() => id,
+        _ => container_id,
+    }
 }
 
 fn explicit_service_name_for_pod(pod: &Pod, spec: &PodSpec) -> Option<String> {
@@ -292,6 +337,7 @@ pub fn resolve_pod_logs_dir() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::discovery::RuntimeProcessIdentity;
     use k8s_openapi::api::core::v1::{EnvFromSource, EnvVar, EnvVarSource, Pod, PodSpec};
     use k8s_openapi::apimachinery::pkg::apis::meta::v1::{ObjectMeta, OwnerReference};
     use std::collections::BTreeMap;
@@ -458,6 +504,64 @@ mod tests {
         let containers = process_pod(&pod, "/var/log/pods");
 
         assert!(containers.is_empty());
+    }
+
+    #[test]
+    fn joins_cri_process_by_normalized_runtime_id_without_mutating_identity() {
+        let mut pod = make_pod_with_owner("ReplicaSet", "checkout-7b4f9c8d5");
+        set_service_annotation(&mut pod, "checkout");
+        let mut kubernetes = process_pod(&pod, "/var/log/pods");
+        kubernetes[0].container_id = "containerd://abc123".into();
+        let original_container_id = kubernetes[0].container_id.clone();
+        let original_stable_id = kubernetes[0].stable_id();
+
+        let mut cri = kubernetes[0].clone();
+        cri.runtime = "containerd".into();
+        cri.container_id = "abc123".into();
+        cri.runtime_process = Some(RuntimeProcessIdentity {
+            pid: 4242,
+            start_time_ticks: 1234,
+        });
+
+        join_cri_runtime_processes(&mut kubernetes, &[cri]);
+
+        assert_eq!(
+            kubernetes[0].runtime_process,
+            Some(RuntimeProcessIdentity {
+                pid: 4242,
+                start_time_ticks: 1234,
+            })
+        );
+        assert_eq!(kubernetes[0].container_id, original_container_id);
+        assert_eq!(kubernetes[0].stable_id(), original_stable_id);
+    }
+
+    #[test]
+    fn missing_or_ambiguous_cri_process_join_fails_closed() {
+        let mut pod = make_pod_with_owner("ReplicaSet", "checkout-7b4f9c8d5");
+        set_service_annotation(&mut pod, "checkout");
+        let mut kubernetes = process_pod(&pod, "/var/log/pods");
+        kubernetes[0].container_id = "cri-o://abc123".into();
+        kubernetes[0].runtime_process = Some(RuntimeProcessIdentity {
+            pid: 9999,
+            start_time_ticks: 1111,
+        });
+
+        let mut first = kubernetes[0].clone();
+        first.container_id = "abc123".into();
+        first.runtime_process = Some(RuntimeProcessIdentity {
+            pid: 4242,
+            start_time_ticks: 2222,
+        });
+        let mut second = first.clone();
+        second.runtime_process = Some(RuntimeProcessIdentity {
+            pid: 4242,
+            start_time_ticks: 3333,
+        });
+
+        join_cri_runtime_processes(&mut kubernetes, &[first, second]);
+
+        assert_eq!(kubernetes[0].runtime_process, None);
     }
 
     #[test]

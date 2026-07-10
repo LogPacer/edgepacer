@@ -168,6 +168,17 @@ pub struct DiscoveryCache {
     /// not only on config changes. Advanced under the same write lock as the
     /// entries, so an observed epoch always matches the cached contents.
     epoch: u64,
+    /// Container backends must all complete before their union can be used as
+    /// authorization evidence. `None` means the latest applied scan was
+    /// complete; `epoch == 0` still means no scan has completed at all.
+    container_inventory_error: Option<String>,
+}
+
+/// Complete container inventory pinned to the cache epoch it came from.
+#[derive(Debug, Clone)]
+pub struct CompleteContainerSnapshot {
+    pub epoch: u64,
+    pub containers: Vec<Container>,
 }
 
 impl DiscoveryCache {
@@ -186,6 +197,12 @@ impl DiscoveryCache {
         self.update_files(&census.log_files);
         self.update_systemd_services(&census.systemd_services);
         self.update_event_log_channels(&census.event_log_channels);
+        let failed_backends: Vec<_> = ["docker", "kubernetes", "cri"]
+            .into_iter()
+            .filter(|backend| census.errors.contains_key(*backend))
+            .collect();
+        self.container_inventory_error = (!failed_backends.is_empty())
+            .then(|| format!("container discovery failed: {}", failed_backends.join(", ")));
         self.epoch += 1;
     }
 
@@ -285,6 +302,37 @@ impl DiscoveryCache {
             .collect();
         containers.sort_by_cached_key(|c| (c.stable_instance_id(), c.id.clone()));
         containers
+    }
+
+    /// Owned, point-in-time container inventory suitable for security
+    /// decisions. Initial or backend-partial scans fail closed.
+    pub fn complete_container_snapshot(&self) -> Result<CompleteContainerSnapshot, String> {
+        if self.epoch == 0 {
+            return Err("container discovery has not completed an initial scan".to_string());
+        }
+        if let Some(error) = &self.container_inventory_error {
+            return Err(error.clone());
+        }
+        Ok(CompleteContainerSnapshot {
+            epoch: self.epoch,
+            containers: self.distinct_containers().into_iter().cloned().collect(),
+        })
+    }
+
+    /// Revalidate a snapshot immediately before it becomes authorization
+    /// evidence. The caller holds the cache read lock through application, so
+    /// a concurrent discovery update cannot slip between this check and commit.
+    pub fn verify_complete_container_epoch(&self, expected_epoch: u64) -> Result<(), String> {
+        if self.epoch != expected_epoch {
+            return Err(format!(
+                "container discovery changed during listener snapshot ({expected_epoch} -> {})",
+                self.epoch
+            ));
+        }
+        if let Some(error) = &self.container_inventory_error {
+            return Err(error.clone());
+        }
+        Ok(())
     }
 
     /// Resolve a collect directive (identifier + type hint) to a concrete
@@ -536,6 +584,7 @@ mod tests {
             workload_kind: String::new(),
             container_id: id.into(),
             container_name: String::new(),
+            runtime_process: None,
         }
     }
 
@@ -575,6 +624,35 @@ mod tests {
         assert_eq!(cache.epoch(), 2);
     }
 
+    #[test]
+    fn authorization_snapshot_requires_initialized_complete_container_discovery() {
+        let mut cache = DiscoveryCache::new();
+        assert!(cache.complete_container_snapshot().is_err());
+
+        let mut partial = Census::default();
+        partial
+            .errors
+            .insert("docker".to_string(), "daemon unavailable".to_string());
+        cache.update_all(&partial);
+        assert_eq!(
+            cache.complete_container_snapshot().unwrap_err(),
+            "container discovery failed: docker"
+        );
+
+        cache.update_all(&Census::default());
+        let snapshot = cache.complete_container_snapshot().unwrap();
+        assert_eq!(snapshot.epoch, 2);
+        assert!(snapshot.containers.is_empty());
+
+        cache.update_all(&Census::default());
+        assert_eq!(
+            cache
+                .verify_complete_container_epoch(snapshot.epoch)
+                .unwrap_err(),
+            "container discovery changed during listener snapshot (2 -> 3)"
+        );
+    }
+
     fn kubernetes_container(service_name_explicit: bool) -> Container {
         Container {
             id: "default/test-pod/app".into(),
@@ -596,6 +674,7 @@ mod tests {
             workload_kind: "deployment".into(),
             container_id: "containerd://abc123def456".into(),
             container_name: "app".into(),
+            runtime_process: None,
         }
     }
 

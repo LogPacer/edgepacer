@@ -11,25 +11,31 @@
 //! network flows are batched per tick and shipped best-effort (the ebpf arm) —
 //! durable flow buffering is a refinement.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use logpacer_wire::{NetworkFlow, RequestSignal};
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 use tracing::{debug, error, info, warn};
 
 use super::SharedEbpfStatus;
-use super::capture::{AyaCaptureProgram, CapturedFlow, CapturedLine, CapturedListener};
+use super::capture::{
+    AyaCaptureProgram, CapturedFlow, CapturedLine, CapturedListener, ListenerDrainHealth,
+};
 use super::l7::{
     CapturedSegment, ConnRegistry, RedAggregator, SpanContext, mint_id, to_request_signal,
 };
+use super::listener_snapshot;
+use super::listener_state::{DeltaOutcome, ListenerAssociation, ListenerSnapshot, ListenerState};
 use super::manager::EbpfManager;
 use super::pid_resolver::PidRouting;
 use super::socket_port;
 use crate::config::{self, EbpfTargetConfig, SharedConfig};
+use crate::discovery::SharedDiscoveryCache;
 use crate::discovery::ports::discover_ports;
 use crate::shipper::Shipper;
 use crate::streaming_actor::{StreamHandle, spawn_streaming_actor};
@@ -37,57 +43,23 @@ use crate::streaming_pipeline::{StreamingDeliveryPipeline, StreamingPipelineConf
 
 /// PID-filter refresh + delivery reconcile + flow-flush cadence.
 const RECONCILE_INTERVAL: Duration = Duration::from_secs(5);
-/// Temporary Phase 2 backstop until an authoritative listener snapshot + GC
-/// replaces the append-only live-delta cache.
+/// Upper bound for both authoritative and live listener ownership state.
 const MAX_PORT_CGROUP_ASSOCIATIONS: usize = 16_384;
+/// Live events accumulated while a blocking snapshot runs. Overflow makes the
+/// snapshot unusable and clears readiness rather than applying a partial replay.
+const MAX_BUFFERED_LISTENER_DELTAS: usize = 16_384;
+/// Overall wall-clock bound for one blocking listener snapshot. Late worker
+/// completion is discarded by generation after this timeout fails readiness.
+const LISTENER_SNAPSHOT_TIMEOUT: Duration = Duration::from_secs(20);
+/// A published-count fence should normally complete immediately; bound it so a
+/// dead or wedged drain fails readiness instead of blocking the runner.
+const LISTENER_DRAIN_FENCE_TIMEOUT: Duration = Duration::from_secs(5);
 /// Bound on in-flight captured records awaiting routing; backpressures the drain.
 const CAPTURE_CHANNEL_DEPTH: usize = 256;
 /// IPPROTO_TCP — connect(2) to an AF_INET endpoint (the capture's domain).
 const IPPROTO_TCP: u32 = 6;
 /// NetworkFlow.direction = egress (an outbound connect).
 const DIRECTION_EGRESS: u32 = 1;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ListenerAssociationInsert {
-    Inserted,
-    AlreadyPresent,
-    AtCapacity { should_warn: bool },
-}
-
-#[derive(Default)]
-struct ListenerDiscovery {
-    port_cgroups: HashMap<u16, HashSet<u64>>,
-    association_count: usize,
-    capacity_warning_emitted: bool,
-}
-
-impl ListenerDiscovery {
-    fn insert(&mut self, port: u16, cgroup_id: u64, limit: usize) -> ListenerAssociationInsert {
-        if self
-            .port_cgroups
-            .get(&port)
-            .is_some_and(|cgroups| cgroups.contains(&cgroup_id))
-        {
-            return ListenerAssociationInsert::AlreadyPresent;
-        }
-
-        if self.association_count >= limit {
-            let should_warn = !self.capacity_warning_emitted;
-            self.capacity_warning_emitted = true;
-            return ListenerAssociationInsert::AtCapacity { should_warn };
-        }
-
-        self.port_cgroups.entry(port).or_default().insert(cgroup_id);
-        self.association_count += 1;
-        ListenerAssociationInsert::Inserted
-    }
-
-    fn clear(&mut self) {
-        self.port_cgroups.clear();
-        self.association_count = 0;
-        self.capacity_warning_emitted = false;
-    }
-}
 
 /// Per-target delivery: the durable log pipeline actor and a shipper for the
 /// typed eBPF arm (network flows). Keyed by `log_source_id`.
@@ -106,6 +78,30 @@ struct TargetDelivery {
     subbox_endpoint: String,
 }
 
+struct ListenerSnapshotResult {
+    state_generation: u64,
+    discovery_epoch: u64,
+    capture_generation: u64,
+    result: Result<ListenerSnapshot, String>,
+}
+
+struct SnapshotWorkerReservation(Arc<AtomicBool>);
+
+impl Drop for SnapshotWorkerReservation {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
+}
+
+fn reserve_snapshot_worker(
+    worker_running: Arc<AtomicBool>,
+) -> Result<SnapshotWorkerReservation, String> {
+    worker_running
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .map_err(|_| "listener snapshot worker is still running".to_string())?;
+    Ok(SnapshotWorkerReservation(worker_running))
+}
+
 impl TargetDelivery {
     fn matches(&self, target: &EbpfTargetConfig) -> bool {
         self.archive_id == target.archive_id
@@ -120,6 +116,7 @@ impl TargetDelivery {
 
 pub async fn run(
     shared_config: SharedConfig,
+    discovery_cache: SharedDiscoveryCache,
     status: SharedEbpfStatus,
     data_dir: &Path,
     identity: &crate::identity::AgentIdentity,
@@ -129,11 +126,16 @@ pub async fn run(
     let (flow_tx, mut flow_rx) = mpsc::channel::<CapturedFlow>(CAPTURE_CHANNEL_DEPTH);
     let (l7_tx, mut l7_rx) = mpsc::channel::<CapturedSegment>(CAPTURE_CHANNEL_DEPTH);
     let (listener_tx, mut listener_rx) = mpsc::channel::<CapturedListener>(CAPTURE_CHANNEL_DEPTH);
+    let (listener_health_tx, mut listener_health_rx) =
+        watch::channel(ListenerDrainHealth::stopped());
+    let (snapshot_tx, mut snapshot_rx) = mpsc::channel::<ListenerSnapshotResult>(1);
+    let snapshot_worker_running = Arc::new(AtomicBool::new(false));
     let mut manager = EbpfManager::new(AyaCaptureProgram::new(
         captured_tx,
         flow_tx,
         l7_tx,
         listener_tx,
+        listener_health_tx,
     ));
     // Routing seeded on the last reconcile, reused to route drained records.
     let mut routing = PidRouting::default();
@@ -151,11 +153,11 @@ pub async fn run(
     // Per-(pid, fd) port→protocol hint, resolved once via /proc and cached so the
     // binary parsers bind by port instead of their weak byte signatures.
     let mut port_hints: HashMap<(u32, u32), Option<socket_port::ResolvedConn>> = HashMap::new();
-    // Event-driven port→cgroup discovery from successful TCP listener
-    // transitions, built from LISTENER_EVENTS.
-    // A future slice combines these live deltas with an authoritative snapshot
-    // + GC before resolving directive ports and seeding cgroup scoping.
-    let mut listener_discovery = ListenerDiscovery::default();
+    // Event deltas are usable only after an authoritative snapshot has supplied
+    // cold-start state. Periodic replacement snapshots garbage-collect closes.
+    let mut listener_state = ListenerState::default();
+    let mut listener_config_hash: Option<String> = None;
+    let mut active_listener_generation: Option<u64> = None;
     let mut reconcile_interval = tokio::time::interval_at(
         tokio::time::Instant::now() + RECONCILE_INTERVAL,
         RECONCILE_INTERVAL,
@@ -181,7 +183,9 @@ pub async fn run(
                     l7_red = RedAggregator::new();
                     l7_conns = ConnRegistry::new();
                     port_hints.clear();
-                    listener_discovery.clear();
+                    listener_state.reset();
+                    listener_config_hash = None;
+                    active_listener_generation = None;
                     let mut guard = status.write().await;
                     guard.running = false;
                     guard.last_error = None;
@@ -189,16 +193,81 @@ pub async fn run(
                     continue;
                 };
 
-                let census = match discover_ports().await {
-                    Ok(census) => census,
-                    Err(e) => {
-                        warn!(error = %e, "eBPF: port census failed; skipping refresh this tick");
-                        continue;
+                // Discovery failure must not preserve ownership authorized by
+                // a disabled or superseded configuration. The kernel allow-set
+                // slice consumes this state, so invalidate it before the
+                // fallible PID census rather than after a successful reconcile.
+                if !section.enabled
+                    || listener_config_hash
+                        .as_deref()
+                        .is_some_and(|hash| hash != section.config_hash)
+                {
+                    listener_state.reset();
+                    listener_config_hash = None;
+                }
+
+                let census = if section.enabled {
+                    match discover_ports().await {
+                        Ok(census) => census,
+                        Err(e) => {
+                            // A stale PID filter can capture a recycled process.
+                            // Reconcile with no targets so a transient census
+                            // failure loses coverage rather than scope.
+                            warn!(error = %e, "eBPF: port census failed; clearing PID targets this tick");
+                            Vec::new()
+                        }
                     }
+                } else {
+                    Vec::new()
                 };
 
-                let outcome = manager.reconcile(&section, &census);
+                let mut outcome = manager.reconcile(&section, &census);
                 routing = outcome.routing;
+
+                if outcome.running {
+                    match manager.listener_observation() {
+                        Ok(observation) => {
+                            active_listener_generation = Some(observation.generation);
+                        }
+                        Err(error) => {
+                            manager.shutdown();
+                            routing = PidRouting::default();
+                            outcome.running = false;
+                            outcome.last_error = Some(error);
+                            outcome.routing = PidRouting::default();
+                            active_listener_generation = None;
+                        }
+                    }
+                } else {
+                    active_listener_generation = None;
+                }
+
+                if outcome.running && section.enabled {
+                    if listener_config_hash.as_deref() != Some(section.config_hash.as_str()) {
+                        listener_state.reset();
+                        listener_config_hash = Some(section.config_hash.clone());
+                    }
+                    if !listener_state.snapshot_in_flight()
+                        && !snapshot_worker_running.load(Ordering::Acquire)
+                    {
+                        let start_result = start_listener_snapshot(
+                            &mut listener_state,
+                            &manager,
+                            discovery_cache.clone(),
+                            snapshot_tx.clone(),
+                            Arc::clone(&snapshot_worker_running),
+                        )
+                        .await;
+                        if let Err(error) = start_result {
+                            listener_state.reset();
+                            warn!(%error, "eBPF: listener snapshot could not start; ownership is not ready");
+                        }
+                    }
+                } else {
+                    listener_state.reset();
+                    listener_config_hash = None;
+                    active_listener_generation = None;
+                }
 
                 // Delivery pipelines track configured targets (independent of the
                 // kernel program's transient running state, so a hiccup never
@@ -243,38 +312,188 @@ pub async fn run(
             }
 
             Some(listener) = listener_rx.recv() => {
-                // Record which cgroup owns this listening port. Logged on first
-                // sighting so the discovered topology is observable; a later slice
-                // resolves directive ports → these cgroups to seed cgroup scoping.
-                if listener.cgroup_id == 0 {
-                    warn!(
-                        port = listener.port,
-                        tgid = listener.tgid,
-                        "eBPF: ignored listener with zero cgroup id"
-                    );
-                } else {
-                    match listener_discovery.insert(
-                        listener.port,
-                        listener.cgroup_id,
-                        MAX_PORT_CGROUP_ASSOCIATIONS,
-                    ) {
-                        ListenerAssociationInsert::Inserted => {
-                            debug!(
-                                port = listener.port,
-                                cgroup_id = listener.cgroup_id,
-                                tgid = listener.tgid,
-                                "eBPF: discovered listener (port→cgroup)"
-                            );
+                record_listener_delta(&mut listener_state, listener);
+            }
+
+            Some(snapshot_result) = snapshot_rx.recv() => {
+                let ListenerSnapshotResult {
+                    state_generation,
+                    discovery_epoch,
+                    capture_generation,
+                    result,
+                } = snapshot_result;
+                if !listener_state.snapshot_is_current(state_generation) {
+                    debug!(generation = state_generation, "eBPF: ignored stale listener snapshot result");
+                    continue;
+                }
+                match result {
+                    Ok(snapshot) => {
+                        let cache_verification = {
+                            let cache = discovery_cache.read().await;
+                            cache.verify_complete_container_epoch(discovery_epoch)
+                        };
+                        if let Err(error) = cache_verification {
+                            listener_state.fail_snapshot(state_generation);
+                            warn!(%error, "eBPF: container inventory changed during listener snapshot; ownership is not ready");
+                            continue;
                         }
-                        ListenerAssociationInsert::AtCapacity { should_warn: true } => {
+
+                        let observation = match manager.listener_observation() {
+                            Ok(observation) => observation,
+                            Err(error) => {
+                                fail_listener_capture(
+                                    &mut manager,
+                                    &mut routing,
+                                    &mut listener_state,
+                                    &mut listener_config_hash,
+                                    &mut active_listener_generation,
+                                    &status,
+                                    error,
+                                )
+                                .await;
+                                continue;
+                            }
+                        };
+                        if observation.generation != capture_generation {
+                            listener_state.fail_snapshot(state_generation);
+                            listener_config_hash = None;
                             warn!(
-                                limit = MAX_PORT_CGROUP_ASSOCIATIONS,
-                                "eBPF: listener discovery capacity reached; dropping new associations until reset"
+                                before = capture_generation,
+                                after = observation.generation,
+                                "eBPF: listener capture restarted during snapshot; ownership is not ready"
                             );
+                            continue;
                         }
-                        ListenerAssociationInsert::AlreadyPresent
-                        | ListenerAssociationInsert::AtCapacity { should_warn: false } => {}
+
+                        let fence = match manager.listener_fence(observation.published_counts) {
+                            Ok(fence) => fence,
+                            Err(error) => {
+                                fail_listener_capture(
+                                    &mut manager,
+                                    &mut routing,
+                                    &mut listener_state,
+                                    &mut listener_config_hash,
+                                    &mut active_listener_generation,
+                                    &status,
+                                    error,
+                                )
+                                .await;
+                                continue;
+                            }
+                        };
+                        let fence_result = tokio::time::timeout(
+                            LISTENER_DRAIN_FENCE_TIMEOUT,
+                            drain_listener_until_fence(
+                                fence,
+                                &mut listener_rx,
+                                &mut listener_state,
+                            ),
+                        )
+                        .await
+                        .map_err(|_| {
+                            format!(
+                                "listener drain fence timed out after {LISTENER_DRAIN_FENCE_TIMEOUT:?}"
+                            )
+                        })
+                        .and_then(|result| result);
+                        if let Err(error) = fence_result {
+                            fail_listener_capture(
+                                &mut manager,
+                                &mut routing,
+                                &mut listener_state,
+                                &mut listener_config_hash,
+                                &mut active_listener_generation,
+                                &status,
+                                error,
+                            )
+                            .await;
+                            continue;
+                        }
+
+                        let observation = match manager.listener_observation() {
+                            Ok(observation) => observation,
+                            Err(error) => {
+                                fail_listener_capture(
+                                    &mut manager,
+                                    &mut routing,
+                                    &mut listener_state,
+                                    &mut listener_config_hash,
+                                    &mut active_listener_generation,
+                                    &status,
+                                    error,
+                                )
+                                .await;
+                                continue;
+                            }
+                        };
+                        if observation.generation != capture_generation {
+                            listener_state.fail_snapshot(state_generation);
+                            listener_config_hash = None;
+                            warn!(
+                                before = capture_generation,
+                                after = observation.generation,
+                                "eBPF: listener capture restarted during drain fence; ownership is not ready"
+                            );
+                            continue;
+                        }
+
+                        // Hold the read lock through application so a discovery
+                        // writer cannot advance the revalidated epoch in the
+                        // final check→commit gap.
+                        let cache = discovery_cache.read().await;
+                        if let Err(error) = cache.verify_complete_container_epoch(discovery_epoch) {
+                            listener_state.fail_snapshot(state_generation);
+                            warn!(%error, "eBPF: container inventory changed during listener drain fence; ownership is not ready");
+                            continue;
+                        }
+                        match listener_state.apply_snapshot_with_loss(
+                            state_generation,
+                            snapshot,
+                            observation.drop_counts,
+                            MAX_PORT_CGROUP_ASSOCIATIONS,
+                        ) {
+                            Ok(true) => {
+                                debug_assert!(listener_state.is_ready());
+                                debug!(
+                                    associations = listener_state.association_count(),
+                                    "eBPF: listener ownership snapshot ready"
+                                );
+                            }
+                            Ok(false) => {
+                                debug!(generation = state_generation, "eBPF: ignored stale listener snapshot result");
+                            }
+                            Err(error) => {
+                                warn!(%error, "eBPF: listener snapshot replay failed; ownership is not ready");
+                            }
+                        }
                     }
+                    Err(error) => {
+                        if listener_state.fail_snapshot(state_generation) {
+                            warn!(%error, "eBPF: authoritative listener snapshot failed; ownership is not ready");
+                        } else {
+                            debug!(generation = state_generation, %error, "eBPF: ignored stale listener snapshot failure");
+                        }
+                    }
+                }
+            }
+
+            changed = listener_health_rx.changed() => {
+                let health = *listener_health_rx.borrow_and_update();
+                if changed.is_ok()
+                    && listener_health_failed(health, active_listener_generation)
+                    && listener_config_hash.is_some()
+                {
+                    let error = "mandatory listener drain stopped after capture start".to_string();
+                    manager.shutdown();
+                    routing = PidRouting::default();
+                    listener_state.reset();
+                    listener_config_hash = None;
+                    active_listener_generation = None;
+                    let mut guard = status.write().await;
+                    guard.running = false;
+                    guard.last_error = Some(error.clone());
+                    guard.pids_targeted = 0;
+                    warn!(%error, "eBPF: capture unloaded after listener drain failure");
                 }
             }
 
@@ -322,6 +541,204 @@ pub async fn run(
             }
         }
     }
+}
+
+fn record_listener_delta(state: &mut ListenerState, listener: CapturedListener) {
+    let association = ListenerAssociation {
+        family: listener.family,
+        port: listener.port,
+        cgroup_id: listener.cgroup_id,
+    };
+    match state.record_delta(
+        association,
+        listener.observed_at_ns,
+        MAX_PORT_CGROUP_ASSOCIATIONS,
+        MAX_BUFFERED_LISTENER_DELTAS,
+    ) {
+        DeltaOutcome::Inserted => {
+            debug!(
+                port = listener.port,
+                family = listener.family,
+                cgroup_id = listener.cgroup_id,
+                tgid = listener.tgid,
+                "eBPF: discovered listener (port→cgroup)"
+            );
+        }
+        DeltaOutcome::IgnoredInvalid => {
+            warn!(
+                port = listener.port,
+                family = listener.family,
+                cgroup_id = listener.cgroup_id,
+                tgid = listener.tgid,
+                "eBPF: ignored invalid listener ownership delta"
+            );
+        }
+        DeltaOutcome::AtCapacity { should_warn: true } => {
+            warn!(
+                limit = MAX_PORT_CGROUP_ASSOCIATIONS,
+                "eBPF: listener ownership capacity reached; dropping new associations until the next snapshot"
+            );
+        }
+        DeltaOutcome::BufferAtCapacity { should_warn: true } => {
+            warn!(
+                limit = MAX_BUFFERED_LISTENER_DELTAS,
+                "eBPF: listener snapshot replay capacity reached; snapshot will fail closed"
+            );
+        }
+        DeltaOutcome::AlreadyPresent
+        | DeltaOutcome::Buffered
+        | DeltaOutcome::IgnoredBeforeCut
+        | DeltaOutcome::AtCapacity { should_warn: false }
+        | DeltaOutcome::BufferAtCapacity { should_warn: false } => {}
+    }
+}
+
+async fn drain_listener_until_fence(
+    mut fence: oneshot::Receiver<Result<(), String>>,
+    listener_rx: &mut mpsc::Receiver<CapturedListener>,
+    state: &mut ListenerState,
+) -> Result<(), String> {
+    loop {
+        tokio::select! {
+            result = &mut fence => {
+                result
+                    .map_err(|_| "listener drain stopped before fence acknowledgement".to_string())??;
+                // The drain increments its consumed count only after sending
+                // into this FIFO. Once the fence is acknowledged, every record
+                // through the sampled publication count is therefore queued;
+                // consume that queue synchronously before readiness can commit.
+                let queued = listener_rx.len();
+                for _ in 0..queued {
+                    let Ok(listener) = listener_rx.try_recv() else {
+                        break;
+                    };
+                    record_listener_delta(state, listener);
+                }
+                return Ok(());
+            }
+            listener = listener_rx.recv() => {
+                let Some(listener) = listener else {
+                    return Err("listener event channel closed before fence acknowledgement".to_string());
+                };
+                record_listener_delta(state, listener);
+            }
+        }
+    }
+}
+
+async fn fail_listener_capture(
+    manager: &mut EbpfManager<AyaCaptureProgram>,
+    routing: &mut PidRouting,
+    listener_state: &mut ListenerState,
+    listener_config_hash: &mut Option<String>,
+    active_listener_generation: &mut Option<u64>,
+    status: &SharedEbpfStatus,
+    error: String,
+) {
+    manager.shutdown();
+    *routing = PidRouting::default();
+    listener_state.reset();
+    *listener_config_hash = None;
+    *active_listener_generation = None;
+    let mut guard = status.write().await;
+    guard.running = false;
+    guard.last_error = Some(error.clone());
+    guard.pids_targeted = 0;
+    warn!(%error, "eBPF: listener snapshot verification failed; capture unloaded");
+}
+
+async fn start_listener_snapshot(
+    state: &mut ListenerState,
+    manager: &EbpfManager<AyaCaptureProgram>,
+    discovery_cache: SharedDiscoveryCache,
+    tx: mpsc::Sender<ListenerSnapshotResult>,
+    worker_running: Arc<AtomicBool>,
+) -> Result<(), String> {
+    let reservation = reserve_snapshot_worker(worker_running)?;
+
+    let container_snapshot = {
+        let cache = discovery_cache.read().await;
+        cache.complete_container_snapshot()?
+    };
+    let observation = manager.listener_observation()?;
+    let capture_generation = observation.generation;
+    let cut_ns = monotonic_ns()?;
+    let state_generation = state
+        .begin_snapshot_with_loss(cut_ns, observation.drop_counts)
+        .ok_or_else(|| "listener snapshot already running".to_string())?;
+    let discovery_epoch = container_snapshot.epoch;
+    let containers = container_snapshot.containers;
+    let deadline = std::time::Instant::now() + LISTENER_SNAPSHOT_TIMEOUT;
+
+    tokio::spawn(async move {
+        let _reservation = reservation;
+        let mut worker = tokio::task::spawn_blocking(move || {
+            listener_snapshot::collect(&containers, deadline, MAX_PORT_CGROUP_ASSOCIATIONS)
+        });
+        let result = tokio::select! {
+            result = &mut worker => Some(match result {
+                Ok(result) => result.map_err(|error| error.to_string()),
+                Err(error) => Err(format!("listener snapshot worker failed: {error}")),
+            }),
+            _ = tokio::time::sleep(LISTENER_SNAPSHOT_TIMEOUT) => None,
+        };
+
+        if let Some(result) = result {
+            let _ = tx
+                .send(ListenerSnapshotResult {
+                    state_generation,
+                    discovery_epoch,
+                    capture_generation,
+                    result,
+                })
+                .await;
+        } else {
+            let _ = tx
+                .send(ListenerSnapshotResult {
+                    state_generation,
+                    discovery_epoch,
+                    capture_generation,
+                    result: Err(format!(
+                        "listener snapshot timed out after {LISTENER_SNAPSHOT_TIMEOUT:?}"
+                    )),
+                })
+                .await;
+            // `spawn_blocking` cannot be cancelled once started. The collector
+            // is deadline-aware, and this reservation deliberately stays held
+            // until it exits so a timeout can never accumulate overlapping
+            // workers.
+            let _ = worker.await;
+        }
+    });
+    Ok(())
+}
+
+fn listener_health_failed(health: ListenerDrainHealth, active_generation: Option<u64>) -> bool {
+    !health.running && active_generation == Some(health.generation)
+}
+
+fn monotonic_ns() -> Result<u64, String> {
+    let mut timestamp = std::mem::MaybeUninit::<libc::timespec>::uninit();
+    // SAFETY: `timestamp` points to writable storage for one `timespec`; the
+    // kernel initializes it fully on success and does not retain the pointer.
+    if unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, timestamp.as_mut_ptr()) } != 0 {
+        return Err(format!(
+            "read CLOCK_MONOTONIC: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    // SAFETY: the successful call above initialized the complete value.
+    let timestamp = unsafe { timestamp.assume_init() };
+    let seconds = u64::try_from(timestamp.tv_sec)
+        .map_err(|_| "CLOCK_MONOTONIC returned negative seconds".to_string())?;
+    let nanoseconds = u64::try_from(timestamp.tv_nsec)
+        .ok()
+        .filter(|value| *value < 1_000_000_000)
+        .ok_or_else(|| "CLOCK_MONOTONIC returned invalid nanoseconds".to_string())?;
+    seconds
+        .checked_mul(1_000_000_000)
+        .and_then(|value| value.checked_add(nanoseconds))
+        .ok_or_else(|| "CLOCK_MONOTONIC nanoseconds overflowed u64".to_string())
 }
 
 /// Map a captured connect into the wire `NetworkFlow`. The capture yields the
@@ -542,59 +959,66 @@ mod tests {
     use super::*;
 
     #[test]
-    fn listener_associations_are_bounded_without_counting_duplicates() {
-        let mut discovery = ListenerDiscovery::default();
-
-        assert_eq!(
-            discovery.insert(8080, 11, 2),
-            ListenerAssociationInsert::Inserted
-        );
-        assert_eq!(
-            discovery.insert(8080, 11, 2),
-            ListenerAssociationInsert::AlreadyPresent
-        );
-        assert_eq!(
-            discovery.insert(8080, 12, 2),
-            ListenerAssociationInsert::Inserted
-        );
-        assert_eq!(
-            discovery.insert(9090, 13, 2),
-            ListenerAssociationInsert::AtCapacity { should_warn: true }
-        );
-        assert_eq!(
-            discovery.insert(9090, 14, 2),
-            ListenerAssociationInsert::AtCapacity { should_warn: false }
-        );
-
-        assert_eq!(discovery.association_count, 2);
-        assert_eq!(discovery.port_cgroups.get(&8080).unwrap().len(), 2);
-        assert!(!discovery.port_cgroups.contains_key(&9090));
+    fn stale_listener_health_cannot_fail_a_replacement_generation() {
+        assert!(!listener_health_failed(
+            ListenerDrainHealth {
+                generation: 7,
+                running: false,
+            },
+            Some(8),
+        ));
+        assert!(listener_health_failed(
+            ListenerDrainHealth {
+                generation: 8,
+                running: false,
+            },
+            Some(8),
+        ));
     }
 
     #[test]
-    fn clearing_listener_associations_resets_capacity_warning() {
-        let mut discovery = ListenerDiscovery::default();
+    fn snapshot_worker_reservation_prevents_overlap_until_the_worker_exits() {
+        let running = Arc::new(AtomicBool::new(false));
+        let reservation = reserve_snapshot_worker(Arc::clone(&running)).unwrap();
+        assert!(reserve_snapshot_worker(Arc::clone(&running)).is_err());
+
+        drop(reservation);
+
+        assert!(reserve_snapshot_worker(running).is_ok());
+    }
+
+    #[tokio::test]
+    async fn fence_ack_consumes_already_queued_listener_before_readiness() {
+        let mut state = ListenerState::default();
+        let generation = state.begin_snapshot(100).unwrap();
+        let (listener_tx, mut listener_rx) = mpsc::channel(1);
+        listener_tx
+            .send(CapturedListener {
+                cgroup_id: 42,
+                observed_at_ns: 101,
+                tgid: 7,
+                port: 8080,
+                family: 2,
+            })
+            .await
+            .unwrap();
+        let (fence_tx, fence_rx) = oneshot::channel();
+        fence_tx.send(Ok(())).unwrap();
+
+        drain_listener_until_fence(fence_rx, &mut listener_rx, &mut state)
+            .await
+            .unwrap();
+        state
+            .apply_snapshot(
+                generation,
+                ListenerSnapshot::new(1, [], []).unwrap(),
+                MAX_PORT_CGROUP_ASSOCIATIONS,
+            )
+            .unwrap();
 
         assert_eq!(
-            discovery.insert(8080, 11, 1),
-            ListenerAssociationInsert::Inserted
-        );
-        assert_eq!(
-            discovery.insert(9090, 12, 1),
-            ListenerAssociationInsert::AtCapacity { should_warn: true }
-        );
-
-        discovery.clear();
-
-        assert_eq!(discovery.association_count, 0);
-        assert!(discovery.port_cgroups.is_empty());
-        assert_eq!(
-            discovery.insert(9090, 12, 1),
-            ListenerAssociationInsert::Inserted
-        );
-        assert_eq!(
-            discovery.insert(10_000, 13, 1),
-            ListenerAssociationInsert::AtCapacity { should_warn: true }
+            state.cgroups_for_port(8080),
+            std::collections::HashSet::from([42])
         );
     }
 }

@@ -55,6 +55,83 @@ pub struct Census {
     pub collected_at: String,
 }
 
+/// A local runtime process handle guarded against Linux PID reuse.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct RuntimeProcessIdentity {
+    pub(crate) pid: u32,
+    pub(crate) start_time_ticks: u64,
+}
+
+impl RuntimeProcessIdentity {
+    /// Capture a PID together with Linux's process-birth token. A PID alone is
+    /// unsafe to retain because the kernel can recycle it between discovery
+    /// and a later namespace snapshot.
+    pub(crate) fn capture(pid: u32) -> Option<Self> {
+        #[cfg(target_os = "linux")]
+        {
+            let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+            runtime_process_identity_from_stat(pid, &stat)
+        }
+
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = pid;
+            None
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[cfg_attr(not(feature = "ebpf"), allow(dead_code))]
+    pub(crate) const fn pid(self) -> u32 {
+        self.pid
+    }
+
+    /// Re-read `/proc/<pid>/stat` immediately before using the PID. Matching
+    /// start-time ticks prove that the process is still the one discovered by
+    /// the local runtime rather than a later PID-reuse occupant.
+    #[cfg(target_os = "linux")]
+    #[cfg_attr(not(feature = "ebpf"), allow(dead_code))]
+    pub(crate) fn is_current(self) -> bool {
+        Self::capture(self.pid) == Some(self)
+    }
+}
+
+#[cfg(any(test, target_os = "linux"))]
+fn runtime_process_identity_from_stat(
+    expected_pid: u32,
+    stat: &str,
+) -> Option<RuntimeProcessIdentity> {
+    if expected_pid == 0 {
+        return None;
+    }
+
+    // proc_pid_stat(5): field 2 (`comm`) is parenthesized and may itself
+    // contain whitespace or ')', so split only after its final closing ')'.
+    let comm_start = stat.find('(')?;
+    let comm_end = stat.rfind(')')?;
+    if comm_end <= comm_start {
+        return None;
+    }
+    let reported_pid = stat[..comm_start].trim().parse::<u32>().ok()?;
+    if reported_pid != expected_pid {
+        return None;
+    }
+
+    // The tail starts at field 3 (`state`); starttime is field 22, therefore
+    // tail index 19.
+    let start_time_ticks = stat[comm_end + 1..]
+        .split_whitespace()
+        .nth(19)?
+        .parse::<u64>()
+        .ok()
+        .filter(|ticks| *ticks != 0)?;
+
+    Some(RuntimeProcessIdentity {
+        pid: expected_pid,
+        start_time_ticks,
+    })
+}
+
 /// A discovered container (Docker, K8s, containerd).
 #[derive(Debug, Clone, Serialize)]
 pub struct Container {
@@ -90,6 +167,10 @@ pub struct Container {
     pub container_id: String,
     /// K8s container name from pod spec (empty for non-K8s).
     pub container_name: String,
+    /// Host identity of the container's init process. Runtime-only: used for
+    /// local namespace inspection and never included in census serialization.
+    #[serde(skip, default)]
+    pub runtime_process: Option<RuntimeProcessIdentity>,
 }
 
 impl Container {
@@ -463,6 +544,10 @@ impl EventLogChannel {
 
 /// Run a full discovery scan. Backends run in parallel; failures are best-effort.
 pub async fn discover() -> Census {
+    discover_with_runtime_processes(false).await
+}
+
+pub(crate) async fn discover_with_runtime_processes(include_runtime_processes: bool) -> Census {
     let mut census = Census {
         os: std::env::consts::OS.to_string(),
         architecture: std::env::consts::ARCH.to_string(),
@@ -486,16 +571,25 @@ pub async fn discover() -> Census {
         packages_result,
         event_log_result,
     ) = tokio::join!(
-        docker::discover_containers(),
+        docker::discover_containers_with_runtime_processes(include_runtime_processes),
         files::discover_log_files(scan_paths, files::DEFAULT_LOG_EXTENSIONS),
         systemd::discover_services(),
         kubernetes::discover_kubernetes_pods(),
-        cri::discover_cri_containers(),
+        cri::discover_cri_containers_with_runtime_processes(include_runtime_processes),
         processes::discover_processes(),
         ports::discover_ports(),
         packages::discover_packages(),
         event_log::discover_channels(),
     );
+
+    #[cfg(all(target_os = "linux", feature = "ebpf"))]
+    let mut k8s_result = k8s_result;
+    #[cfg(all(target_os = "linux", feature = "ebpf"))]
+    if include_runtime_processes
+        && let (Ok(kubernetes_containers), Ok(cri_containers)) = (&mut k8s_result, &cri_result)
+    {
+        kubernetes::join_cri_runtime_processes(kubernetes_containers, cri_containers);
+    }
 
     match docker_result {
         Ok(containers) => {
@@ -606,6 +700,14 @@ pub async fn discover() -> Census {
 
 /// Run discovery with custom scan paths and extension allowlist for log files.
 pub async fn discover_with_paths(scan_paths: &[&str], log_extensions: &[&str]) -> Census {
+    discover_with_paths_and_runtime_processes(scan_paths, log_extensions, false).await
+}
+
+pub(crate) async fn discover_with_paths_and_runtime_processes(
+    scan_paths: &[&str],
+    log_extensions: &[&str],
+    include_runtime_processes: bool,
+) -> Census {
     let mut census = Census {
         os: std::env::consts::OS.to_string(),
         architecture: std::env::consts::ARCH.to_string(),
@@ -624,16 +726,25 @@ pub async fn discover_with_paths(scan_paths: &[&str], log_extensions: &[&str]) -
         packages_result,
         event_log_result,
     ) = tokio::join!(
-        docker::discover_containers(),
+        docker::discover_containers_with_runtime_processes(include_runtime_processes),
         files::discover_log_files(scan_paths, log_extensions),
         systemd::discover_services(),
         kubernetes::discover_kubernetes_pods(),
-        cri::discover_cri_containers(),
+        cri::discover_cri_containers_with_runtime_processes(include_runtime_processes),
         processes::discover_processes(),
         ports::discover_ports(),
         packages::discover_packages(),
         event_log::discover_channels(),
     );
+
+    #[cfg(all(target_os = "linux", feature = "ebpf"))]
+    let mut k8s_result = k8s_result;
+    #[cfg(all(target_os = "linux", feature = "ebpf"))]
+    if include_runtime_processes
+        && let (Ok(kubernetes_containers), Ok(cri_containers)) = (&mut k8s_result, &cri_result)
+    {
+        kubernetes::join_cri_runtime_processes(kubernetes_containers, cri_containers);
+    }
 
     match docker_result {
         Ok(containers) => {
@@ -767,7 +878,67 @@ mod tests {
             workload_kind: String::new(),
             container_id: "abc123".into(),
             container_name: String::new(),
+            runtime_process: None,
         }
+    }
+
+    #[test]
+    fn runtime_process_identity_never_crosses_the_census_wire() {
+        let mut container = make_container("my-nginx");
+        container.runtime_process = Some(RuntimeProcessIdentity {
+            pid: 4242,
+            start_time_ticks: 1234,
+        });
+        let census = Census {
+            containers: vec![container],
+            ..Default::default()
+        };
+
+        let json = serde_json::to_value(census).unwrap();
+
+        assert_eq!(json["containers"][0]["name"], "my-nginx");
+        assert!(json["containers"][0].get("runtime_process").is_none());
+    }
+
+    #[test]
+    fn proc_stat_identity_uses_pid_and_start_time_ticks() {
+        let stat = "4242 (worker with ) parens) S 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 987654 20 21";
+
+        assert_eq!(
+            runtime_process_identity_from_stat(4242, stat),
+            Some(RuntimeProcessIdentity {
+                pid: 4242,
+                start_time_ticks: 987654,
+            })
+        );
+        assert_eq!(runtime_process_identity_from_stat(4243, stat), None);
+    }
+
+    #[test]
+    fn proc_stat_identity_rejects_incomplete_or_zero_birth_tokens() {
+        assert_eq!(
+            runtime_process_identity_from_stat(42, "42 (worker) S"),
+            None
+        );
+        let zero = "42 (worker) S 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 0";
+        assert_eq!(runtime_process_identity_from_stat(42, zero), None);
+        assert_eq!(runtime_process_identity_from_stat(0, zero), None);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn runtime_process_identity_verifies_the_same_process_birth() {
+        let identity = RuntimeProcessIdentity::capture(std::process::id())
+            .expect("the current Linux process has a readable proc stat");
+
+        assert!(identity.is_current());
+        assert!(
+            !RuntimeProcessIdentity {
+                start_time_ticks: identity.start_time_ticks.saturating_add(1),
+                ..identity
+            }
+            .is_current()
+        );
     }
 
     #[test]

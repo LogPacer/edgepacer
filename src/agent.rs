@@ -42,7 +42,13 @@ pub async fn run(
         let ext_refs: Vec<&str> = log_extensions.iter().map(|s| s.as_str()).collect();
 
         debug!(paths = ?scan_refs, extensions = ?ext_refs, "using scan paths");
-        let census = discovery::discover_with_paths(&scan_refs, &ext_refs).await;
+        let include_runtime_processes = runtime_process_discovery_enabled(&shared_config).await;
+        let census = discovery::discover_with_paths_and_runtime_processes(
+            &scan_refs,
+            &ext_refs,
+            include_runtime_processes,
+        )
+        .await;
         let report = tracker.update_from_scan(&census);
         let package_report = if census.errors.contains_key("packages") {
             None
@@ -95,6 +101,17 @@ pub async fn run(
             }
         }
     }
+}
+
+async fn runtime_process_discovery_enabled(shared_config: &SharedConfig) -> bool {
+    if !cfg!(all(target_os = "linux", feature = "ebpf")) {
+        return false;
+    }
+    let config = shared_config.read().await;
+    config
+        .as_ref()
+        .and_then(crate::config::ebpf_section)
+        .is_some_and(|section| section.enabled)
 }
 
 /// Service-lane census entry. Stable identity only — the volatile container_id
@@ -555,6 +572,27 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn runtime_process_discovery_requires_runtime_ebpf_enablement() {
+        let config = crate::config::shared_config();
+        assert!(!runtime_process_discovery_enabled(&config).await);
+
+        *config.write().await = Some(crate::config::UnifiedConfig::new(
+            serde_json::json!({ "ebpf": { "enabled": false } }),
+            "disabled".to_string(),
+        ));
+        assert!(!runtime_process_discovery_enabled(&config).await);
+
+        *config.write().await = Some(crate::config::UnifiedConfig::new(
+            serde_json::json!({ "ebpf": { "enabled": true } }),
+            "enabled".to_string(),
+        ));
+        assert_eq!(
+            runtime_process_discovery_enabled(&config).await,
+            cfg!(all(target_os = "linux", feature = "ebpf"))
+        );
+    }
+
+    #[tokio::test]
     async fn package_lane_success_commits_baseline() {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
@@ -630,6 +668,7 @@ mod tests {
             workload_kind: "statefulset".into(),
             container_id: "containerd://abc123".into(),
             container_name: "db".into(),
+            runtime_process: None,
         }
     }
 
@@ -637,6 +676,10 @@ mod tests {
     fn census_entries_carry_stable_identity_and_never_volatile_handles() {
         let mut c = k8s_statefulset_container();
         c.log_format = "ndjson".into();
+        c.runtime_process = Some(crate::discovery::RuntimeProcessIdentity {
+            pid: 4242,
+            start_time_ticks: 1234,
+        });
 
         // Both lanes: the stable per-instance id is present, and no volatile
         // runtime handle (container_id / pod_uid / pod_name) crosses the wire.
@@ -657,6 +700,10 @@ mod tests {
             assert!(
                 obj.get("pod_name").is_none(),
                 "pod_name must never be reported"
+            );
+            assert!(
+                obj.get("runtime_process").is_none(),
+                "runtime process identity must never be reported"
             );
             assert_eq!(obj.get("format").and_then(|v| v.as_str()), Some("ndjson"));
         }
@@ -713,6 +760,7 @@ mod tests {
             workload_kind: String::new(),
             container_id: id.into(),
             container_name: String::new(),
+            runtime_process: None,
         }
     }
 
@@ -891,6 +939,7 @@ mod tests {
             workload_kind: "deployment".into(),
             container_id: format!("containerd://{pod}"),
             container_name: "api".into(),
+            runtime_process: None,
         }
     }
 

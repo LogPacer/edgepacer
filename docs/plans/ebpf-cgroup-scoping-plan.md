@@ -1,6 +1,6 @@
 # eBPF cgroup-native capture implementation plan
 
-Branch: `feat/ebpf-cgroup-scoping`.
+Workstream branches are cut from `main` one reviewable slice at a time.
 
 ## Technical rationale
 
@@ -12,7 +12,7 @@ cross-process `/proc` reads. This design supports a final capability set of `CAP
 
 ## Current snapshot
 
-Phase 2 listener discovery is implemented:
+Phase 2 listener discovery is merged in #84:
 
 - `ListenerEvent` is shared by the kernel and userspace.
 - `capture_listen` stages host-wide TCP listener transitions in `LISTEN_CANDIDATES`, and
@@ -20,16 +20,32 @@ Phase 2 listener discovery is implemented:
   carries its port, address family, process id, and non-zero `cgroup_id`.
 - `CapturedListener`, `spawn_listener_drain`, and the always-on `CAPTURE_LISTEN` attachment drain
   discovery independently of the network-flow toggle.
-- The runner records live `port -> cgroup_id` deltas in a bounded observational cache and uses a
-  persistent reconciliation interval so event churn cannot starve configuration refreshes. The
-  cache is not authoritative; capture scoping still uses `TARGET_PIDS`.
+- The runner drains live `port -> cgroup_id` deltas and uses a persistent reconciliation interval
+  so event churn cannot starve configuration refreshes.
 - The canonical x86_64 `src/ebpf/programs/edgepacer.bpf.o` has been regenerated with the listener
   program and map.
 - Privileged integration coverage includes IPv4 discovery with network-flow capture disabled,
   IPv6 discovery, and negative bind-without-listen, failed-bind, and failed-listen cases.
 
-Canonical Linux x86_64 object verification, host tests, Linux eBPF linting, and the privileged
-capture matrix pass. The remaining Phase 2 gates are the pull-request CI and review checks.
+Canonical Linux x86_64 object verification, host tests, Linux eBPF linting, the privileged capture
+matrix, pull-request CI, and review all passed before merge.
+
+The first Phase 3 slice adds the prerequisite authoritative listener state: monotonic timestamps
+make snapshot/delta replay race-safe, `NETLINK_SOCK_DIAG` provides exact socket evidence in the
+current network namespace, isolated runtime namespaces use PID-reuse-guarded local runtime
+identities, and periodic replacement snapshots garbage-collect closed listeners. Foreign
+namespace listeners retain typed, port-local runtime-cgroup candidates; those candidates are not
+authorization until target resolution intersects them with explicit service identity. Likewise,
+socket cgroups remain socket facts rather than proof of which cgroup handles traffic (including
+systemd socket activation).
+
+The listener drain now has per-CPU publication sequences, a bounded contiguous-watermark fence,
+and per-CPU loss epochs. A snapshot becomes ready only after all publications sampled after its
+filesystem collection have reached userspace and the loss vector is unchanged. Loss between
+snapshots invalidates the previous ready state at the next observation. Private cgroup namespaces,
+remote runtime PIDs, incomplete identity, zero/root cgroups, partial socket dumps, bounded-state
+overflow, and dead drains all fail closed. Capture scoping still uses `TARGET_PIDS` until the
+additive allow-set slice is merged.
 
 ## Canonical object regeneration
 
@@ -50,21 +66,39 @@ Commit `src/ebpf/programs/edgepacer.bpf.o` in the same change as its kernel sour
 
 ### Step 1 — finish Phase 2 listener discovery
 
-Implementation and local verification are complete: the object is regenerated, host tests pass,
-Linux eBPF linting passes, and the positive and negative privileged fixtures pass. Open a pull
-request against `main`, then require the full CI and review suite to pass.
+Complete: merged in #84 after canonical-object verification, host and Linux checks, privileged
+positive/negative fixtures, full CI, and review passed.
 
-### Step 2 — Phase 3: cgroup allow-set scoping (additive first)
+### Step 2 — Phase 3a: authoritative listener snapshot prerequisite
+
+1. Preserve host-local, PID-reuse-guarded runtime identity for Docker and CRI/Kubernetes without
+   serializing it in census payloads. Reject remote endpoints and partial backend inventory.
+2. Build strict cgroup-v2 and `NETLINK_SOCK_DIAG` readers plus bounded, deadline-aware foreign
+   namespace inspection that does not require `CAP_SYS_PTRACE`.
+3. Reconcile replacement snapshots with timestamped live deltas, per-CPU loss epochs, and a drain
+   fence. Keep exact socket cgroups separate from foreign runtime candidates; neither is directly
+   an allow-set.
+4. Regenerate the x86_64 object, prove cross-UID collection with `CAP_SYS_PTRACE` removed, pass the
+   privileged capture matrix and host/Linux/cross-platform gates, then merge this prerequisite.
+
+The no-ptrace proof is self-checking and runs on the privileged Linux test host with:
+
+```bash
+sudo -E scripts/test-ebpf-no-ptrace.sh
+```
+
+### Step 3 — Phase 3b: cgroup allow-set scoping (additive first)
 
 1. Kernel (`bpf/src/main.rs`): add `ALLOWED_CGROUPS: HashMap<u64, u8>`. At each capture program's
    head, capture when `TARGET_PIDS.get(&tgid)` **or**
    `ALLOWED_CGROUPS.get(&cgroup_id)` matches. Keep the pid path during this additive rollout, then
    regenerate the object.
 2. Userspace: add `set_allowed_cgroups(&HashSet<u64>)` to `CaptureProgram`
-   (`src/ebpf/manager.rs`) and implement it in `AyaCaptureProgram` (`src/ebpf/capture.rs`). Before
-   using listener discovery for scoping, combine the live deltas with an authoritative snapshot
-   and garbage collection, reject zero cgroup ids, then resolve each configured open port to the
-   live owning cgroups and seed `ALLOWED_CGROUPS` during reconciliation.
+   (`src/ebpf/manager.rs`) and implement it in `AyaCaptureProgram` (`src/ebpf/capture.rs`). Resolve
+   a target's workload cgroup anchor from explicit runtime/systemd service identity, not from the
+   socket cgroup. Require authoritative port evidence; for foreign namespaces, require the target
+   anchor to be among that port's typed runtime candidates. Shared namespaces retain candidates
+   for target-aware intersection instead of authorizing every occupant.
 3. Attribution: add cgroup-to-`log_source_id` routing alongside `PidRouting` in
    `src/ebpf/pid_resolver.rs`. Route captured events by `cgroup_id` while retaining pid routing in
    parallel during the additive rollout.
@@ -73,7 +107,7 @@ request against `main`, then require the full CI and review suite to pass.
 5. Regenerate the object, add a privileged integration case that captures a configured workload
    through its cgroup, and pass the pull-request gates.
 
-### Step 3 — Phase 3b: remove the pid path and excess capabilities
+### Step 4 — Phase 3c: remove the pid path and excess capabilities
 
 1. Remove the `TARGET_PIDS` filter and `/proc` targeting, including the connection-to-port
    resolution and namespace sweep in `src/discovery/ports.rs`.

@@ -283,6 +283,7 @@ impl AgentTasks {
         #[cfg(all(target_os = "linux", feature = "ebpf"))]
         let ebpf = spawn_ebpf_manager(
             shared_config.clone(),
+            discovery_cache.clone(),
             ebpf_status,
             ebpf_data_dir,
             ebpf_identity,
@@ -494,13 +495,22 @@ fn spawn_trace_proxy_manager(
 #[cfg(all(target_os = "linux", feature = "ebpf"))]
 fn spawn_ebpf_manager(
     shared_config: config::SharedConfig,
+    discovery_cache: discovery::SharedDiscoveryCache,
     ebpf_status: ebpf::SharedEbpfStatus,
     data_dir: PathBuf,
     identity: identity::AgentIdentity,
     shutdown: watch::Receiver<bool>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
-        ebpf::run(shared_config, ebpf_status, &data_dir, &identity, shutdown).await;
+        ebpf::run(
+            shared_config,
+            discovery_cache,
+            ebpf_status,
+            &data_dir,
+            &identity,
+            shutdown,
+        )
+        .await;
     })
 }
 
