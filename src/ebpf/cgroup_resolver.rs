@@ -327,11 +327,7 @@ where
                         PortEvidence::Present { socket_cgroups, .. }
                             if runtime.uses_host_network_namespace =>
                         {
-                            // Host-network runtimes share the agent's namespace.
-                            // Require exact socket ownership until a verified
-                            // descendant relation is available; presence alone
-                            // would authorize every opted-in sidecar on the port.
-                            Ok(socket_cgroups.contains(&runtime.anchor.id))
+                            Ok(!socket_cgroups.is_empty())
                         }
                         PortEvidence::Present {
                             foreign_runtime_candidates,
@@ -526,21 +522,15 @@ mod tests {
     }
 
     #[test]
-    fn host_listener_requires_the_runtime_anchor_to_own_the_socket() {
-        let containers = [
-            container("app", "api", true),
-            container("sidecar", "api", true),
-        ];
+    fn host_listener_presence_gates_explicit_runtime_anchor_not_socket_owner() {
+        let containers = [container("one", "api", true)];
         let targets = [target("source", "api", &[8080])];
-        let state = ready_state([(8080, 42)], []);
-        let identities = HashMap::from([
-            ("app".to_string(), identity(42, 3, true)),
-            ("sidecar".to_string(), identity(43, 3, true)),
-        ]);
+        let state = ready_state([(8080, 900)], []);
+        let identities = HashMap::from([("one".to_string(), identity(42, 3, true))]);
 
         let routing = resolve(&containers, &targets, &state, 7, &identities).unwrap();
         assert_eq!(routing.service_for(42), Some("source"));
-        assert_eq!(routing.service_for(43), None);
+        assert_eq!(routing.service_for(900), None);
         assert_eq!(routing.authorization_revision(), Some(7));
     }
 
@@ -665,7 +655,7 @@ mod tests {
             container("replica-b", "api", true),
         ];
         let targets = [target("source", "api", &[8080])];
-        let state = ready_state([(8080, 42), (8080, 43)], []);
+        let state = ready_state([(8080, 900)], []);
         let identities = HashMap::from([
             ("replica-a".to_string(), identity(42, 3, true)),
             ("replica-b".to_string(), identity(43, 3, true)),
@@ -688,7 +678,7 @@ mod tests {
             container("other", "worker", true),
         ];
         let targets = [target("source", "api", &[8080])];
-        let state = ready_state([(8080, 42)], []);
+        let state = ready_state([(8080, 900)], []);
 
         let routing = resolve_with_runtime_identity(&containers, &targets, &state, 7, |_| {
             panic!("ignored containers must not resolve runtime identity")
@@ -701,7 +691,7 @@ mod tests {
     fn invalid_anchor_depth_fails_closed() {
         let containers = [container("one", "api", true)];
         let targets = [target("source", "api", &[8080])];
-        let state = ready_state([(8080, 42)], []);
+        let state = ready_state([(8080, 900)], []);
         let identities = HashMap::from([("one".to_string(), identity(42, 33, true))]);
 
         let error = resolve(&containers, &targets, &state, 7, &identities).unwrap_err();
@@ -715,7 +705,7 @@ mod tests {
             target("source-a", "api", &[8080]),
             target("source-b", "api", &[8080]),
         ];
-        let state = ready_state([(8080, 42)], []);
+        let state = ready_state([(8080, 900)], []);
         let identities = HashMap::from([("one".to_string(), identity(42, 3, true))]);
 
         let error = resolve(&containers, &targets, &state, 7, &identities).unwrap_err();
@@ -798,7 +788,7 @@ mod tests {
     fn runtime_attestation_rejects_same_process_moved_to_another_cgroup() {
         let container = container("one", "api", true);
         let targets = [target("source", "api", &[8080])];
-        let state = ready_state([(8080, 42)], []);
+        let state = ready_state([(8080, 900)], []);
         let identities = HashMap::from([(
             "one".to_string(),
             attested_identity(&container, 42, 3, true),

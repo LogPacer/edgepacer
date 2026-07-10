@@ -802,10 +802,16 @@ input()
 v4 = socket.socket()
 v4.bind(('0.0.0.0', 0))
 v4.listen()
-v6 = socket.socket(socket.AF_INET6)
-v6.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1)
-v6.bind(('::', 0))
-v6.listen()
+for _ in range(128):
+    v6 = socket.socket(socket.AF_INET6)
+    v6.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1)
+    v6.bind(('::', 0))
+    if v6.getsockname()[1] != v4.getsockname()[1]:
+        v6.listen()
+        break
+    v6.close()
+else:
+    raise RuntimeError('could not allocate distinct IPv4 and IPv6 listener ports')
 print(v4.getsockname()[1], v6.getsockname()[1], flush=True)
 time.sleep(30)
 "#;
@@ -846,6 +852,7 @@ time.sleep(30)
             .map(|port| port.parse().unwrap())
             .collect();
         assert_eq!(ports.len(), 2);
+        assert_ne!(ports[0], ports[1]);
         let process = RuntimeProcessIdentity::capture(pid).unwrap();
         let expected_cgroup = cgroup_v2::cgroup_id_for_pid(pid, RUNTIME_ID).unwrap();
         let expected_namespace = runtime_process_network_namespace(RUNTIME_ID, process)
