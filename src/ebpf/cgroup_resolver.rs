@@ -124,7 +124,7 @@ impl CgroupRouting {
     /// Re-read the exact runtime identities used to build this routing. The
     /// discovery revision cannot detect a same-process cgroup or namespace
     /// move, so publication must bind to a fresh runtime observation too.
-    #[cfg(target_os = "linux")]
+    #[cfg(all(target_os = "linux", feature = "ebpf"))]
     pub(crate) fn revalidate_runtime_identities(&self) -> Result<(), String> {
         self.revalidate_runtime_identities_with(|attestation| {
             observe_runtime_identity(&attestation.container_id, attestation.process)
@@ -218,7 +218,7 @@ struct ResolvedRuntimeIdentity {
     attestation: Option<RuntimeAttestation>,
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", feature = "ebpf"))]
 fn observe_runtime_identity(
     container_id: &str,
     process: RuntimeProcessIdentity,
@@ -247,7 +247,7 @@ fn observe_runtime_identity(
 
 /// Resolve cgroup authorization from explicit runtime identity and the current
 /// authoritative listener state.
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", feature = "ebpf"))]
 pub(crate) fn resolve_from_listener_state(
     containers: &[Container],
     targets: &[EbpfTargetConfig],

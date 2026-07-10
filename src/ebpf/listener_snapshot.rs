@@ -110,6 +110,7 @@ pub(crate) struct RuntimeNetworkNamespace {
 
 #[cfg(target_os = "linux")]
 impl RuntimeNetworkNamespace {
+    #[cfg(feature = "ebpf")]
     pub(crate) fn uses_host_namespace(self) -> bool {
         self.uses_host_namespace
     }
