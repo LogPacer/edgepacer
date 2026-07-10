@@ -183,6 +183,16 @@ mod tests {
     }
 
     #[test]
+    fn systemd_target_retains_additive_pid_fallback() {
+        let mut systemd_target = target("src-a", &[8080]);
+        systemd_target.systemd_unit = Some("nginx.service".to_string());
+        let routing = resolve_from_ports(&[listening(8080, 1234)], &[systemd_target]);
+
+        assert_eq!(routing.service_for(1234), Some("src-a"));
+        assert_eq!(routing.target_pids().collect::<Vec<_>>(), vec![1234]);
+    }
+
+    #[test]
     fn skips_unresolved_pid_zero() {
         let targets = [target("src-a", &[8080])];
         let routing = resolve_from_ports(&[listening(8080, 0)], &targets);

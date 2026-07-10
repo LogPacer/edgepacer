@@ -136,6 +136,17 @@ impl CgroupRouting {
         )
     }
 
+    /// Final map-publication bracket. Exact systemd state was already checked
+    /// by the blocking resolver; keep this runner-thread path to bounded procfs
+    /// and cgroup filesystem identity checks.
+    #[cfg(all(target_os = "linux", feature = "ebpf"))]
+    pub(crate) fn revalidate_publication_identities(&self) -> Result<(), String> {
+        self.revalidate_identities_with(
+            |attestation| observe_runtime_identity(&attestation.container_id, attestation.process),
+            systemd_resolver::revalidate_for_publication,
+        )
+    }
+
     #[cfg(test)]
     fn revalidate_runtime_identities_with<F>(&self, mut observe: F) -> Result<(), String>
     where
@@ -153,7 +164,7 @@ impl CgroupRouting {
     ) -> Result<(), String>
     where
         RuntimeObserve: FnMut(&RuntimeAttestation) -> Result<ResolvedRuntimeIdentity, String>,
-        SystemdObserve: FnMut(&SystemdAttestation) -> Result<(), String>,
+        SystemdObserve: FnMut(&[SystemdAttestation]) -> Result<(), String>,
     {
         if self.by_id.is_empty() {
             return Ok(());
@@ -194,8 +205,8 @@ impl CgroupRouting {
                 ));
             }
         }
-        for attestation in &self.systemd_attestations {
-            observe_systemd(attestation)?;
+        if !self.systemd_attestations.is_empty() {
+            observe_systemd(&self.systemd_attestations)?;
         }
         Ok(())
     }
@@ -940,6 +951,10 @@ mod tests {
                 control_group: "/system.slice/nginx.service".to_string(),
             },
             anchor,
+            main_process: RuntimeProcessIdentity {
+                pid: 1234,
+                start_time_ticks: 5678,
+            },
         };
         let mut routing = CgroupRouting::default();
         routing

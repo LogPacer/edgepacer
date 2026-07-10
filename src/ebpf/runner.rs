@@ -904,7 +904,7 @@ pub async fn run(
                     // authorization skips both these reads and the Aya rewrite.
                     match publish_revalidated_cgroups(
                         &desired_cgroups,
-                        |routing| routing.revalidate_identities(),
+                        |routing| routing.revalidate_publication_identities(),
                         |routing| manager.set_allowed_cgroups(routing),
                     )
                     .map_err(CgroupPublicationError::into_recovery)
