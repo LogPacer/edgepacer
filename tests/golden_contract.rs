@@ -45,6 +45,7 @@ fn kamal_container(role: &str, destination: &str) -> Container {
         workload_kind: String::new(),
         container_id: "abc123def456".into(),
         container_name: String::new(),
+        runtime_process: None,
     }
 }
 

@@ -529,6 +529,7 @@ mod tests {
             workload_kind: String::new(),
             container_id: id.into(),
             container_name: String::new(),
+            runtime_process: None,
         }
     }
 

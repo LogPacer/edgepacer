@@ -4,37 +4,102 @@
 //! Uses `crictl ps -a -o json` for structured output (better than Go's table parsing).
 //! Falls back when Docker API is unavailable (typical on K8s nodes with containerd).
 
+#[cfg(all(target_os = "linux", feature = "ebpf"))]
+use futures_util::{StreamExt, stream};
 use serde::Deserialize;
+#[cfg(any(test, all(target_os = "linux", feature = "ebpf")))]
+use serde_json::Value;
 use std::collections::HashMap;
+#[cfg(any(test, all(target_os = "linux", feature = "ebpf")))]
+use std::collections::HashSet;
+use std::path::Path;
+#[cfg(all(target_os = "linux", feature = "ebpf"))]
+use std::time::Duration;
+#[cfg(all(target_os = "linux", feature = "ebpf"))]
+use tracing::warn;
+
+#[cfg(all(target_os = "linux", feature = "ebpf"))]
+use super::RuntimeProcessIdentity;
 
 const CRI_SOCKET_PATHS: &[&str] = &[
     "/run/containerd/containerd.sock",
     "/run/crio/crio.sock",
     "/var/run/cri-dockerd.sock",
 ];
+#[cfg(all(target_os = "linux", feature = "ebpf"))]
+const CRI_INSPECT_TIMEOUT: Duration = Duration::from_secs(10);
+#[cfg(all(target_os = "linux", feature = "ebpf"))]
+const CRI_INSPECT_FALLBACK_CONCURRENCY: usize = 8;
 
-/// Check if a CRI runtime is available (socket exists or CONTAINER_RUNTIME_ENDPOINT is set).
+/// Check if a local Unix CRI runtime is available. Remote endpoints cannot
+/// safely supply host PIDs for `/proc`-backed identity, so every invocation is
+/// pinned to the exact socket selected here.
 pub fn is_cri_available() -> bool {
-    if let Ok(endpoint) = std::env::var("CONTAINER_RUNTIME_ENDPOINT") {
-        let path = endpoint.strip_prefix("unix://").unwrap_or(&endpoint);
-        if std::path::Path::new(path).exists() {
-            return true;
-        }
+    local_cri_endpoint().is_some()
+}
+
+fn local_cri_endpoint() -> Option<String> {
+    let configured = std::env::var("CONTAINER_RUNTIME_ENDPOINT").ok();
+    resolve_local_cri_endpoint(configured.as_deref(), is_local_unix_socket)
+}
+
+fn resolve_local_cri_endpoint(
+    configured: Option<&str>,
+    is_socket: impl Fn(&Path) -> bool,
+) -> Option<String> {
+    if let Some(endpoint) = configured {
+        let endpoint = endpoint.trim();
+        let path = endpoint
+            .strip_prefix("unix://")
+            .or_else(|| endpoint.starts_with('/').then_some(endpoint))?;
+        let path = Path::new(path);
+        return (path.is_absolute() && is_socket(path))
+            .then(|| format!("unix://{}", path.display()));
     }
+
     CRI_SOCKET_PATHS
         .iter()
-        .any(|p| std::path::Path::new(p).exists())
+        .map(Path::new)
+        .find(|path| is_socket(path))
+        .map(|path| format!("unix://{}", path.display()))
+}
+
+#[cfg(unix)]
+fn is_local_unix_socket(path: &Path) -> bool {
+    use std::os::unix::fs::FileTypeExt;
+
+    std::fs::metadata(path).is_ok_and(|metadata| metadata.file_type().is_socket())
+}
+
+#[cfg(not(unix))]
+fn is_local_unix_socket(_path: &Path) -> bool {
+    false
+}
+
+fn crictl_command(endpoint: &str) -> tokio::process::Command {
+    let mut command = tokio::process::Command::new("crictl");
+    command.arg("--runtime-endpoint").arg(endpoint);
+    command
 }
 
 /// Discover containers via `crictl ps -a -o json`.
 ///
 /// Returns `Ok(vec![])` when no CRI runtime is detected — normal for Docker-only hosts.
 pub async fn discover_cri_containers() -> Result<Vec<crate::discovery::Container>, String> {
-    if !is_cri_available() {
-        return Ok(vec![]);
-    }
+    discover_cri_containers_with_runtime_processes(false).await
+}
 
-    let output = tokio::process::Command::new("crictl")
+pub(crate) async fn discover_cri_containers_with_runtime_processes(
+    include_runtime_processes: bool,
+) -> Result<Vec<crate::discovery::Container>, String> {
+    #[cfg(not(all(target_os = "linux", feature = "ebpf")))]
+    let _ = include_runtime_processes;
+
+    let Some(endpoint) = local_cri_endpoint() else {
+        return Ok(vec![]);
+    };
+
+    let output = crictl_command(&endpoint)
         .args(["ps", "-a", "-o", "json"])
         .output()
         .await
@@ -48,13 +113,35 @@ pub async fn discover_cri_containers() -> Result<Vec<crate::discovery::Container
     let crictl_output: CrictlOutput = serde_json::from_slice(&output.stdout)
         .map_err(|e| format!("failed to parse crictl output: {e}"))?;
 
-    let sandboxes = discover_pod_sandboxes().await.unwrap_or_default();
+    let raw_containers = crictl_output.containers.unwrap_or_default();
+    #[cfg(all(target_os = "linux", feature = "ebpf"))]
+    let runtime_processes = if include_runtime_processes {
+        let running_ids: Vec<String> = raw_containers
+            .iter()
+            .filter(|container| {
+                container
+                    .state
+                    .as_deref()
+                    .is_some_and(|state| map_cri_state(state) == "running")
+            })
+            .filter_map(|container| container.id.clone().filter(|id| !id.is_empty()))
+            .collect();
+        match inspect_running_container_processes(&endpoint, &running_ids).await {
+            Ok(processes) => processes,
+            Err(error) => {
+                warn!(%error, "failed to inspect running CRI container processes");
+                HashMap::new()
+            }
+        }
+    } else {
+        HashMap::new()
+    };
+
+    let sandboxes = discover_pod_sandboxes(&endpoint).await.unwrap_or_default();
     let sandbox_map: HashMap<String, PodSandboxInfo> =
         sandboxes.into_iter().map(|s| (s.id.clone(), s)).collect();
 
-    let containers = crictl_output
-        .containers
-        .unwrap_or_default()
+    let containers = raw_containers
         .into_iter()
         .map(|c| {
             let sandbox = c
@@ -83,6 +170,13 @@ pub async fn discover_cri_containers() -> Result<Vec<crate::discovery::Container
                 .unwrap_or_else(|| name.clone());
 
             let id = c.id.unwrap_or_default();
+            let state = map_cri_state(&c.state.unwrap_or_default());
+            #[cfg(all(target_os = "linux", feature = "ebpf"))]
+            let runtime_process = (state == "running")
+                .then(|| runtime_processes.get(&id).copied())
+                .flatten();
+            #[cfg(not(all(target_os = "linux", feature = "ebpf")))]
+            let runtime_process = None;
             let log_format = super::files::detect_container_log_format("containerd", &labels, "");
 
             crate::discovery::Container {
@@ -91,7 +185,7 @@ pub async fn discover_cri_containers() -> Result<Vec<crate::discovery::Container
                 service_name,
                 service_name_explicit,
                 image: c.image_ref.unwrap_or_default(),
-                state: map_cri_state(&c.state.unwrap_or_default()),
+                state,
                 labels,
                 env: vec![],
                 runtime: "containerd".into(),
@@ -105,6 +199,7 @@ pub async fn discover_cri_containers() -> Result<Vec<crate::discovery::Container
                 workload_kind: String::new(),
                 container_id: id,
                 container_name: name.clone(),
+                runtime_process,
             }
         })
         .collect();
@@ -112,9 +207,173 @@ pub async fn discover_cri_containers() -> Result<Vec<crate::discovery::Container
     Ok(containers)
 }
 
+/// Fetch verbose status for all currently-running containers. Modern crictl
+/// supports one multi-ID process; older releases and races with exited IDs are
+/// recovered by bounded per-ID inspection so one failure cannot erase every
+/// healthy runtime identity.
+#[cfg(all(target_os = "linux", feature = "ebpf"))]
+async fn inspect_running_container_processes(
+    endpoint: &str,
+    container_ids: &[String],
+) -> Result<HashMap<String, RuntimeProcessIdentity>, String> {
+    if container_ids.is_empty() {
+        return Ok(HashMap::new());
+    }
+
+    let batch = inspect_cri_pids(endpoint, container_ids).await;
+    let mut pids = batch.as_ref().cloned().unwrap_or_default();
+    let missing_ids: Vec<String> = container_ids
+        .iter()
+        .filter(|id| !pids.contains_key(id.as_str()))
+        .cloned()
+        .collect();
+
+    let fallback_results = stream::iter(missing_ids.into_iter().map(|id| async move {
+        let result = inspect_cri_pids(endpoint, std::slice::from_ref(&id)).await;
+        (id, result)
+    }))
+    .buffer_unordered(CRI_INSPECT_FALLBACK_CONCURRENCY)
+    .collect::<Vec<_>>()
+    .await;
+
+    let mut fallback_failures = 0usize;
+    for (id, result) in fallback_results {
+        match result {
+            Ok(mut inspected) => {
+                if let Some(pid) = inspected.remove(&id) {
+                    pids.insert(id, pid);
+                }
+            }
+            Err(_) => fallback_failures += 1,
+        }
+    }
+
+    let processes: HashMap<String, RuntimeProcessIdentity> = pids
+        .into_iter()
+        .filter_map(|(id, pid)| RuntimeProcessIdentity::capture(pid).map(|identity| (id, identity)))
+        .collect();
+
+    if fallback_failures == container_ids.len() && processes.is_empty() {
+        return Err(batch.err().unwrap_or_else(|| {
+            format!("crictl inspect failed for all {fallback_failures} container IDs")
+        }));
+    }
+
+    if fallback_failures != 0 {
+        warn!(
+            failed = fallback_failures,
+            total = container_ids.len(),
+            "some running CRI containers could not be inspected"
+        );
+    }
+
+    Ok(processes)
+}
+
+#[cfg(all(target_os = "linux", feature = "ebpf"))]
+async fn inspect_cri_pids(
+    endpoint: &str,
+    container_ids: &[String],
+) -> Result<HashMap<String, u32>, String> {
+    let mut command = crictl_command(endpoint);
+    command
+        .args(["inspect", "-o", "json"])
+        .args(container_ids)
+        .kill_on_drop(true);
+    let output = tokio::time::timeout(CRI_INSPECT_TIMEOUT, command.output())
+        .await
+        .map_err(|_| format!("crictl inspect timed out after {CRI_INSPECT_TIMEOUT:?}"))?
+        .map_err(|e| format!("crictl inspect failed: {e}"))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("crictl inspect failed: {stderr}"));
+    }
+
+    parse_cri_init_pids(&output.stdout)
+        .map_err(|e| format!("failed to parse crictl inspect output: {e}"))
+}
+
+#[cfg(any(test, all(target_os = "linux", feature = "ebpf")))]
+fn parse_cri_init_pids(output: &[u8]) -> serde_json::Result<HashMap<String, u32>> {
+    let mut records = Vec::new();
+    for root in serde_json::Deserializer::from_slice(output).into_iter::<Value>() {
+        match root? {
+            Value::Array(values) => records.extend(values),
+            value @ Value::Object(_) => records.push(value),
+            _ => {}
+        }
+    }
+
+    let mut pids = HashMap::new();
+    let mut ambiguous_ids = HashSet::new();
+
+    for record in &records {
+        let Some(id) = record
+            .pointer("/status/id")
+            .and_then(Value::as_str)
+            .filter(|id| !id.is_empty())
+        else {
+            continue;
+        };
+        let Some(state) = record.pointer("/status/state").and_then(Value::as_str) else {
+            continue;
+        };
+        if map_cri_state(state) != "running" {
+            continue;
+        }
+        let Some(pid) = init_pid_from_inspect_record(record) else {
+            continue;
+        };
+
+        if ambiguous_ids.contains(id) {
+            continue;
+        }
+        if pids.get(id).is_some_and(|existing| *existing != pid) {
+            pids.remove(id);
+            ambiguous_ids.insert(id.to_string());
+            continue;
+        }
+
+        pids.insert(id.to_string(), pid);
+    }
+
+    Ok(pids)
+}
+
+#[cfg(any(test, all(target_os = "linux", feature = "ebpf")))]
+fn init_pid_from_inspect_record(record: &Value) -> Option<u32> {
+    let values = [record.pointer("/info/pid"), record.get("pid")];
+    let mut pid = None;
+
+    for value in values
+        .into_iter()
+        .flatten()
+        .filter(|value| !value.is_null())
+    {
+        let candidate = parse_pid_value(value)?;
+        if pid.is_some_and(|existing| existing != candidate) {
+            return None;
+        }
+        pid = Some(candidate);
+    }
+
+    pid
+}
+
+#[cfg(any(test, all(target_os = "linux", feature = "ebpf")))]
+fn parse_pid_value(value: &Value) -> Option<u32> {
+    match value {
+        Value::Number(number) => u32::try_from(number.as_u64()?).ok(),
+        Value::String(pid) => pid.trim().parse::<u32>().ok(),
+        _ => None,
+    }
+    .filter(|pid| *pid != 0)
+}
+
 /// Discover pod sandboxes for metadata enrichment.
-async fn discover_pod_sandboxes() -> Result<Vec<PodSandboxInfo>, String> {
-    let output = tokio::process::Command::new("crictl")
+async fn discover_pod_sandboxes(endpoint: &str) -> Result<Vec<PodSandboxInfo>, String> {
+    let output = crictl_command(endpoint)
         .args(["pods", "-o", "json"])
         .output()
         .await
@@ -207,6 +466,78 @@ mod tests {
     use super::*;
 
     #[test]
+    fn configured_local_endpoint_is_pinned_and_remote_configuration_never_falls_back() {
+        let is_socket = |path: &Path| {
+            path == Path::new("/custom/runtime.sock") || path == Path::new(CRI_SOCKET_PATHS[0])
+        };
+
+        assert_eq!(
+            resolve_local_cri_endpoint(Some("unix:///custom/runtime.sock"), is_socket).as_deref(),
+            Some("unix:///custom/runtime.sock")
+        );
+        for endpoint in [
+            "tcp://runtime.example:1234",
+            "npipe:////./pipe/containerd",
+            "relative/runtime.sock",
+            "unix:///missing/runtime.sock",
+        ] {
+            assert_eq!(
+                resolve_local_cri_endpoint(Some(endpoint), is_socket),
+                None,
+                "configured endpoint {endpoint:?} must not fall back"
+            );
+        }
+    }
+
+    #[test]
+    fn default_endpoint_selection_is_deterministic() {
+        let selected = Path::new(CRI_SOCKET_PATHS[1]);
+        assert_eq!(
+            resolve_local_cri_endpoint(None, |path| path == selected).as_deref(),
+            Some("unix:///run/crio/crio.sock")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn endpoint_requires_an_actual_unix_socket() {
+        use std::os::unix::net::UnixListener;
+
+        let dir = tempfile::tempdir().unwrap();
+        let socket_path = dir.path().join("runtime.sock");
+        let file_path = dir.path().join("regular-file");
+        let _listener = UnixListener::bind(&socket_path).unwrap();
+        std::fs::write(&file_path, b"not a socket").unwrap();
+
+        assert!(is_local_unix_socket(&socket_path));
+        assert!(!is_local_unix_socket(&file_path));
+        assert!(!is_local_unix_socket(&dir.path().join("missing")));
+    }
+
+    #[test]
+    fn crictl_runtime_endpoint_flag_precedes_the_subcommand() {
+        let mut command = crictl_command("unix:///run/containerd/containerd.sock");
+        command.args(["inspect", "-o", "json", "container-id"]);
+        let args: Vec<_> = command
+            .as_std()
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+
+        assert_eq!(
+            args,
+            [
+                "--runtime-endpoint",
+                "unix:///run/containerd/containerd.sock",
+                "inspect",
+                "-o",
+                "json",
+                "container-id"
+            ]
+        );
+    }
+
+    #[test]
     fn test_map_cri_state() {
         assert_eq!(map_cri_state("CONTAINER_RUNNING"), "running");
         assert_eq!(map_cri_state("RUNNING"), "running");
@@ -287,6 +618,92 @@ mod tests {
     }
 
     #[test]
+    fn parses_standard_and_legacy_cri_init_pid_shapes() {
+        let json = br#"[
+            {
+                "status": {"id": "containerd-id", "state": "CONTAINER_RUNNING"},
+                "info": {"pid": 4102}
+            },
+            {
+                "status": {"id": "crio-id", "state": "RUNNING"},
+                "pid": " 5103 "
+            }
+        ]"#;
+
+        let pids = parse_cri_init_pids(json).unwrap();
+
+        assert_eq!(pids.get("containerd-id"), Some(&4102));
+        assert_eq!(pids.get("crio-id"), Some(&5103));
+    }
+
+    #[test]
+    fn parses_single_cri_inspect_record() {
+        let json = br#"{
+            "status": {"id": "only-id", "state": "CONTAINER_RUNNING"},
+            "info": {"pid": "6123"}
+        }"#;
+
+        assert_eq!(
+            parse_cri_init_pids(json).unwrap().get("only-id"),
+            Some(&6123)
+        );
+    }
+
+    #[test]
+    fn parses_pre_v1_31_concatenated_cri_inspect_records() {
+        let json = br#"
+            {
+                "status": {"id": "first-id", "state": "CONTAINER_RUNNING"},
+                "info": {"pid": 7101}
+            }
+            {
+                "status": {"id": "second-id", "state": "CONTAINER_RUNNING"},
+                "info": {"pid": 7102}
+            }
+        "#;
+
+        let pids = parse_cri_init_pids(json).unwrap();
+
+        assert_eq!(pids.get("first-id"), Some(&7101));
+        assert_eq!(pids.get("second-id"), Some(&7102));
+    }
+
+    #[test]
+    fn one_conflicting_cri_record_does_not_erase_healthy_ids() {
+        let json = br#"[
+            {"status": {"id": "healthy", "state": "CONTAINER_RUNNING"}, "info": {"pid": 7201}},
+            {"status": {"id": "conflict", "state": "CONTAINER_RUNNING"}, "info": {"pid": 7202}},
+            {"status": {"id": "conflict", "state": "CONTAINER_RUNNING"}, "info": {"pid": 7203}}
+        ]"#;
+
+        let pids = parse_cri_init_pids(json).unwrap();
+
+        assert_eq!(pids.get("healthy"), Some(&7201));
+        assert!(!pids.contains_key("conflict"));
+    }
+
+    #[test]
+    fn malformed_or_ambiguous_cri_pids_fail_closed() {
+        let json = br#"[
+            {"status": {"id": "zero", "state": "CONTAINER_RUNNING"}, "info": {"pid": 0}},
+            {"status": {"id": "negative", "state": "CONTAINER_RUNNING"}, "info": {"pid": -1}},
+            {"status": {"id": "fraction", "state": "CONTAINER_RUNNING"}, "info": {"pid": 12.5}},
+            {"status": {"id": "text", "state": "CONTAINER_RUNNING"}, "info": {"pid": "twelve"}},
+            {"status": {"id": "missing", "state": "CONTAINER_RUNNING"}, "info": {}},
+            {"status": {"id": "exited", "state": "CONTAINER_EXITED"}, "info": {"pid": 99}},
+            {
+                "status": {"id": "conflicting-locations", "state": "CONTAINER_RUNNING"},
+                "info": {"pid": 100},
+                "pid": 101
+            },
+            {"status": {"id": "duplicate", "state": "CONTAINER_RUNNING"}, "info": {"pid": 200}},
+            {"status": {"id": "duplicate", "state": "CONTAINER_RUNNING"}, "info": {"pid": 201}}
+        ]"#;
+
+        assert!(parse_cri_init_pids(json).unwrap().is_empty());
+    }
+
+    #[test]
     fn test_not_available() {
         // On a dev machine without CRI sockets, is_cri_available should return false.
         // Clear env to ensure no stale CONTAINER_RUNTIME_ENDPOINT
@@ -295,7 +712,7 @@ mod tests {
         // Unless running on a K8s node, no CRI socket should exist
         if !CRI_SOCKET_PATHS
             .iter()
-            .any(|p| std::path::Path::new(p).exists())
+            .any(|p| is_local_unix_socket(Path::new(p)))
         {
             assert!(!is_cri_available());
         }
@@ -307,7 +724,7 @@ mod tests {
         unsafe { std::env::remove_var("CONTAINER_RUNTIME_ENDPOINT") };
         if !CRI_SOCKET_PATHS
             .iter()
-            .any(|p| std::path::Path::new(p).exists())
+            .any(|p| is_local_unix_socket(Path::new(p)))
         {
             let result = discover_cri_containers().await;
             assert!(result.is_ok());
