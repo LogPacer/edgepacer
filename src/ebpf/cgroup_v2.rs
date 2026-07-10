@@ -906,7 +906,8 @@ fn verify_cgroup2_filesystem(path: &Path) -> Result<(), CgroupV2Error> {
     use std::mem::MaybeUninit;
     use std::os::unix::ffi::OsStrExt;
 
-    const CGROUP2_SUPER_MAGIC: libc::c_long = 0x6367_7270;
+    // `statfs.f_type` is `i64` on glibc but `u64` on musl; compare in `u64`.
+    const CGROUP2_SUPER_MAGIC: u64 = 0x6367_7270;
 
     let c_path =
         CString::new(path.as_os_str().as_bytes()).map_err(|_| CgroupV2Error::UnsafePath {
@@ -927,7 +928,7 @@ fn verify_cgroup2_filesystem(path: &Path) -> Result<(), CgroupV2Error> {
 
     // SAFETY: a successful `statfs` call initialized the result.
     let stat = unsafe { stat.assume_init() };
-    if stat.f_type != CGROUP2_SUPER_MAGIC {
+    if stat.f_type as u64 != CGROUP2_SUPER_MAGIC {
         return Err(CgroupV2Error::NotCgroup2(path.to_path_buf()));
     }
     Ok(())

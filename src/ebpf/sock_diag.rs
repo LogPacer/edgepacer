@@ -36,7 +36,7 @@ const TCPF_LISTEN: u32 = 1 << TCP_LISTEN;
 const NLA_TYPE_MASK: u16 = 0x3fff;
 const RECEIVE_BUFFER_LEN: usize = 64 * 1024;
 #[cfg(target_os = "linux")]
-const RECEIVE_TIMEOUT_SECS: libc::time_t = 5;
+const RECEIVE_TIMEOUT_SECS: u64 = 5;
 
 /// A TCP listening socket visible in the caller's current network namespace.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -116,15 +116,17 @@ pub(crate) fn snapshot_tcp_listeners(
 
 #[cfg(target_os = "linux")]
 fn set_receive_timeout(fd: std::os::fd::RawFd, remaining: Duration) -> Result<(), SnapshotError> {
-    let timeout = remaining.min(Duration::from_secs(RECEIVE_TIMEOUT_SECS as u64));
-    let seconds = timeout.as_secs() as libc::time_t;
-    let mut microseconds = libc::suseconds_t::from(timeout.subsec_micros());
+    let timeout = remaining.min(Duration::from_secs(RECEIVE_TIMEOUT_SECS));
+    let seconds = timeout.as_secs();
+    let mut microseconds = u64::from(timeout.subsec_micros());
     if seconds == 0 && microseconds == 0 {
         microseconds = 1;
     }
+    // `as _` infers `time_t`/`suseconds_t` without naming the aliases, which
+    // musl targets deprecate (their width changes in musl 1.2).
     let timeout = libc::timeval {
-        tv_sec: seconds,
-        tv_usec: microseconds,
+        tv_sec: seconds as _,
+        tv_usec: microseconds as _,
     };
     // SAFETY: `timeout` is a fully initialized timeval and its pointer is valid
     // for the supplied length. The kernel copies it during this call.
