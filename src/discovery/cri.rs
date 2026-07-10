@@ -99,11 +99,20 @@ pub(crate) async fn discover_cri_containers_with_runtime_processes(
         return Ok(vec![]);
     };
 
-    let output = crictl_command(&endpoint)
+    let output = match crictl_command(&endpoint)
         .args(["ps", "-a", "-o", "json"])
         .output()
         .await
-        .map_err(|e| format!("crictl not available: {e}"))?;
+    {
+        Ok(output) => output,
+        // Docker's embedded containerd exposes /run/containerd/containerd.sock
+        // on every Docker host, but without crictl installed there is no CRI
+        // runtime to speak to. That's CRI-absent (like the k8s lane), not a
+        // failed backend — a "cri" census error fail-closes the eBPF ownership
+        // gate for the whole host.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(vec![]),
+        Err(e) => return Err(format!("crictl not available: {e}")),
+    };
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
