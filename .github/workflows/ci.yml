@@ -90,6 +90,9 @@ jobs:
       - name: Clippy eBPF feature
         run: cargo clippy --features ebpf --all-targets -- -D warnings
 
+      - name: Test eBPF feature
+        run: cargo test --features ebpf
+
   bpf-object:
     name: BPF Object
     runs-on: ubuntu-24.04
@@ -142,6 +145,9 @@ jobs:
 
       - name: Render chart
         run: scripts/kubernetes/validate-kind.sh --render-only
+
+      - name: Test eBPF chart profile
+        run: scripts/kubernetes/test-ebpf-chart.sh
 
   supply-chain:
     name: Supply Chain

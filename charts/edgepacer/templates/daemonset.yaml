@@ -149,6 +149,10 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: metadata.namespace
+            {{- if .Values.ebpf.enabled }}
+            - name: EDGEPACER_HOST_CGROUP_ROOT
+              value: /host/sys/fs/cgroup
+            {{- end }}
             {{- with .Values.agent.resourceId }}
             - name: EDGEPACER_RESOURCE_ID
               value: {{ . | quote }}
@@ -197,6 +201,11 @@ spec:
               mountPath: /var/lib/edgepacer
             - name: tmp
               mountPath: /tmp
+            {{- if .Values.ebpf.enabled }}
+            - name: host-cgroup-root
+              mountPath: /host/sys/fs/cgroup
+              readOnly: true
+            {{- end }}
             {{- if .Values.hostLogs.varLog.enabled }}
             - name: host-var-log
               mountPath: {{ .Values.hostLogs.varLog.mountPath }}
@@ -254,6 +263,12 @@ spec:
           {{- end }}
         - name: tmp
           emptyDir: {}
+        {{- if .Values.ebpf.enabled }}
+        - name: host-cgroup-root
+          hostPath:
+            path: /sys/fs/cgroup
+            type: Directory
+        {{- end }}
         {{- if .Values.hostLogs.varLog.enabled }}
         - name: host-var-log
           hostPath:

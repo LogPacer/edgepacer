@@ -30,8 +30,8 @@ Phase 2 listener discovery is merged in #84:
 Canonical Linux x86_64 object verification, host tests, Linux eBPF linting, the privileged capture
 matrix, pull-request CI, and review all passed before merge.
 
-The first Phase 3 slice adds the prerequisite authoritative listener state: monotonic timestamps
-make snapshot/delta replay race-safe, `NETLINK_SOCK_DIAG` provides exact socket evidence in the
+The first Phase 3 slice added the prerequisite authoritative listener state in #85: monotonic timestamps
+fence snapshots against live changes, `NETLINK_SOCK_DIAG` provides exact socket evidence in the
 current network namespace, isolated runtime namespaces use PID-reuse-guarded local runtime
 identities, and periodic replacement snapshots garbage-collect closed listeners. Foreign
 namespace listeners retain typed, port-local runtime-cgroup candidates; those candidates are not
@@ -41,11 +41,13 @@ systemd socket activation).
 
 The listener drain now has per-CPU publication sequences, a bounded contiguous-watermark fence,
 and per-CPU loss epochs. A snapshot becomes ready only after all publications sampled after its
-filesystem collection have reached userspace and the loss vector is unchanged. Loss between
+filesystem collection have reached userspace and the loss vector is unchanged. Because live
+events do not carry trustworthy network-namespace provenance, a live change invalidates ownership
+and is never merged into the host socket inventory; a fresh snapshot classifies it instead. Loss between
 snapshots invalidates the previous ready state at the next observation. Private cgroup namespaces,
 remote runtime PIDs, incomplete identity, zero/root cgroups, partial socket dumps, bounded-state
-overflow, and dead drains all fail closed. Capture scoping still uses `TARGET_PIDS` until the
-additive allow-set slice is merged.
+overflow, and dead drains all fail closed. Capture scoping still uses `TARGET_PIDS` while the
+additive allow-set slice is under review.
 
 ## Canonical object regeneration
 
@@ -71,6 +73,9 @@ positive/negative fixtures, full CI, and review passed.
 
 ### Step 2 — Phase 3a: authoritative listener snapshot prerequisite
 
+Complete: merged in #85 after canonical-object verification, the no-ptrace proof, privileged
+listener coverage, full CI, and review passed.
+
 1. Preserve host-local, PID-reuse-guarded runtime identity for Docker and CRI/Kubernetes without
    serializing it in census payloads. Reject remote endpoints and partial backend inventory.
 2. Build strict cgroup-v2 and `NETLINK_SOCK_DIAG` readers plus bounded, deadline-aware foreign
@@ -89,28 +94,42 @@ sudo -E scripts/test-ebpf-no-ptrace.sh
 
 ### Step 3 — Phase 3b: cgroup allow-set scoping (additive first)
 
-1. Kernel (`bpf/src/main.rs`): add `ALLOWED_CGROUPS: HashMap<u64, u8>`. At each capture program's
-   head, capture when `TARGET_PIDS.get(&tgid)` **or**
-   `ALLOWED_CGROUPS.get(&cgroup_id)` matches. Keep the pid path during this additive rollout, then
-   regenerate the object.
-2. Userspace: add `set_allowed_cgroups(&HashSet<u64>)` to `CaptureProgram`
+1. Kernel (`bpf/src/main.rs`): add double-buffered `ALLOWED_CGROUPS` membership maps with
+   per-entry policy generations, per-slot packed hierarchy-level metadata, and one atomic selector
+   packing the active slot with its generation. A capture program accepts the current cgroup or a
+   bounded ancestor and records the matched anchor as `scope_cgroup_id`. The selected monotonic
+   policy generation is stamped into every captured event; userspace drops records from stale
+   policy or program generations. Keep `TARGET_PIDS` as an additive fallback during this rollout,
+   then regenerate the object.
+2. Userspace: add `set_allowed_cgroups(&CgroupRouting)` to `CaptureProgram`
    (`src/ebpf/manager.rs`) and implement it in `AyaCaptureProgram` (`src/ebpf/capture.rs`). Resolve
-   a target's workload cgroup anchor from explicit runtime/systemd service identity, not from the
-   socket cgroup. Require authoritative port evidence; for foreign namespaces, require the target
-   anchor to be among that port's typed runtime candidates. Shared namespaces retain candidates
-   for target-aware intersection instead of authorizing every occupant.
-3. Attribution: add cgroup-to-`log_source_id` routing alongside `PidRouting` in
-   `src/ebpf/pid_resolver.rs`. Route captured events by `cgroup_id` while retaining pid routing in
-   parallel during the additive rollout.
+   container workload anchors from verified explicit runtime identity, not from the socket cgroup.
+   Require authoritative port evidence; for foreign namespaces, require the target anchor and
+   exact namespace token among that port's typed runtime candidates. Shared namespaces retain
+   candidates for target-aware intersection instead of authorizing every occupant. Keep host-native
+   systemd targets on the additive PID path until their unit cgroup resolver is verified before
+   PID-path removal.
+3. Attribution: add cgroup-to-`log_source_id` routing alongside `PidRouting`. Route captured events
+   by the matched `scope_cgroup_id` while retaining pid routing in parallel during the additive
+   rollout. When both identities exist they must agree; conflicts fail closed. Partition L7
+   reassembly and protocol hints by capture generation, policy generation, scope cgroup, actual
+   cgroup, pid, and fd so bytes cannot cross an authorization boundary.
 4. Capability detection (`src/ebpf/capability.rs`): require cgroup v2 unified mode for cgroup
-   scoping. If unavailable, report `cgroup v2 required` with `ebpf_running=false` and fail closed.
-5. Regenerate the object, add a privileged integration case that captures a configured workload
-   through its cgroup, and pass the pull-request gates.
+   scoping. Native execution requires the initial cgroup namespace. A private agent cgroup
+   namespace is accepted only when an explicit, read-only host hierarchy mount can be mapped
+   uniquely to the namespace-local root; every cached filesystem and namespace identity is
+   revalidated before use. Otherwise report the concrete capability error with
+   `ebpf_running=false` and fail closed.
+5. Regenerate the object, add privileged cases for concurrent policy replacement, in-flight
+   generation changes, and private-namespace host workload resolution, then pass the pull-request
+   gates. The private-namespace proof runs with `sudo -E scripts/test-ebpf-private-cgroupns.sh`.
+   The matching Rails heartbeat field, `ebpf_cgroups_targeted`, is merged in LogPacer #427.
 
 ### Step 4 — Phase 3c: remove the pid path and excess capabilities
 
-1. Remove the `TARGET_PIDS` filter and `/proc` targeting, including the connection-to-port
-   resolution and namespace sweep in `src/discovery/ports.rs`.
+1. Resolve configured host-native systemd targets from their verified unit cgroup, then remove the
+   `TARGET_PIDS` filter and `/proc` targeting, including the connection-to-port resolution and
+   namespace sweep in `src/discovery/ports.rs`.
 2. In `src/manager/supervisor.rs`, remove `CAP_SYS_PTRACE` and `CAP_DAC_READ_SEARCH`, leaving
    `CAP_BPF CAP_PERFMON`. The systemd unit is written at install time, so ensure upgrades rewrite
    the unit when the required capability set changes, or explicitly require reinstalling it.
@@ -120,8 +139,8 @@ sudo -E scripts/test-ebpf-no-ptrace.sh
 
 - Phase 1b: join `cgroup_id` to the container census by recording the cgroup directory inode from
   `/sys/fs/cgroup`, yielding `service_name` rather than `log_source_id` attribution.
-- Phase 4: key connections by `{cgroup, tgid, first-ktime, fd}` to eliminate `{pid, fd}` reuse in
-  `ConnRegistry` (`src/ebpf/l7/conn.rs`).
+- Phase 4: add kernel first-seen ktime to the existing cgroup- and generation-partitioned connection
+  key, eliminating same-identity fd reuse in `ConnRegistry` (`src/ebpf/l7/conn.rs`).
 - Phase 5: produce `SecurityEvent` records from the existing unfiltered `edgepacer_exec`
   tracepoint.
 

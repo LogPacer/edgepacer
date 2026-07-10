@@ -100,6 +100,19 @@ published ports the running agent cannot use.
 {{- if and .Values.runtimeSockets.containerd.enabled .Values.runtimeSockets.crio.enabled -}}
 {{- fail "runtimeSockets.containerd.enabled and runtimeSockets.crio.enabled cannot both be true because CONTAINER_RUNTIME_ENDPOINT can target only one CRI socket" -}}
 {{- end -}}
+{{- if and .Values.ebpf.enabled (not .Values.hostPID) -}}
+{{- fail "ebpf.enabled=true requires hostPID=true so listener discovery can inspect host processes" -}}
+{{- end -}}
+{{- if and .Values.ebpf.enabled (not (or .Values.runtimeSockets.containerd.enabled .Values.runtimeSockets.crio.enabled)) -}}
+{{- fail "ebpf.enabled=true requires exactly one local CRI runtime socket; enable runtimeSockets.containerd or runtimeSockets.crio so workload cgroup identity can be verified" -}}
+{{- end -}}
+{{- if .Values.ebpf.enabled -}}
+{{- range .Values.extraEnv -}}
+{{- if eq (default "" .name) "EDGEPACER_HOST_CGROUP_ROOT" -}}
+{{- fail "EDGEPACER_HOST_CGROUP_ROOT is reserved when ebpf.enabled=true; the chart supplies its verified host mount" -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
 {{- if and .Values.traces.otlpHttp.enabled (not .Values.traces.otlpHttp.listenerConfiguredByControlPlane) -}}
 {{- fail "traces.otlpHttp.enabled only publishes the OTLP port; set traces.otlpHttp.listenerConfiguredByControlPlane=true after LogPacer config enables a matching trace proxy listener" -}}
 {{- end -}}

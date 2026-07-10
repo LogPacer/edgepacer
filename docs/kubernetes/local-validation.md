@@ -85,4 +85,8 @@ scripts/kubernetes/validate-lima-k3s.sh \
 ```
 
 Add `--enable-ebpf` when validating the eBPF capability profile on a node that
-supports it.
+supports it. The rendered DaemonSet supplies the read-only host cgroup-v2 view
+used to map the agent's private cgroup namespace to workload cgroups on the
+node. DaemonSet readiness alone does not prove that eBPF capture is active;
+confirm the agent's reported eBPF capability and capture status when running a
+strict node validation.

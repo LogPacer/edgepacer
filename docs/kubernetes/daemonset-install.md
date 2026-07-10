@@ -75,10 +75,28 @@ eBPF capture is disabled by default. Enable it only on clusters where the node
 kernel and security policy allow the required capabilities:
 
 ```bash
---set ebpf.enabled=true
+--set ebpf.enabled=true \
+--set runtimeSockets.containerd.enabled=true
 ```
 
-This adds `BPF`, `PERFMON`, and `SYS_RESOURCE` to the container capability set.
+This adds `BPF`, `PERFMON`, and `SYS_RESOURCE` to the container capability set
+and requires `hostPID=true`. Select exactly one local CRI runtime socket so the
+agent can verify container init-process identity; use
+`runtimeSockets.crio.enabled=true` instead on CRI-O nodes, and override the
+selected socket path when the distribution uses a nonstandard location. The
+chart also mounts the node's `/sys/fs/cgroup` at
+`/host/sys/fs/cgroup` read-only and sets `EDGEPACER_HOST_CGROUP_ROOT` to that
+path. The normal container-local `/sys/fs/cgroup` mount remains unchanged, and
+the host mount does not use mount propagation.
+
+The separate host view lets EdgePacer map a private container cgroup namespace
+back to the node's unified hierarchy before authorizing workload cgroup IDs.
+The agent fails closed if the explicit host view is missing, writable, not a
+cgroup-v2 hierarchy root, on a different filesystem, or cannot be matched
+uniquely to the namespace-local root. The read-only mount exposes cgroup names
+and hierarchy metadata to the agent container; enable eBPF only for operators
+who accept that node-level visibility together with the existing host PID and
+BPF access.
 
 ## Validation
 

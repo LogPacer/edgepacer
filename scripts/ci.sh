@@ -13,3 +13,4 @@ if [[ "$(uname -s)" == "Linux" ]]; then
 fi
 
 scripts/kubernetes/validate-kind.sh --render-only
+scripts/kubernetes/test-ebpf-chart.sh
