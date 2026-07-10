@@ -170,7 +170,9 @@ jobs:
 
       - uses: taiki-e/install-action@v2
         with:
-          tool: cargo-deny
+          # Pinned: newer cargo-deny moved `-c`/`check`-level flags and breaks
+          # the invocations below when installed unpinned.
+          tool: cargo-deny@0.19.9
 
       - uses: taiki-e/install-action@v2
         with:
