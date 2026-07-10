@@ -149,6 +149,7 @@ mod tests {
         EbpfTargetConfig {
             log_source_id: log_source_id.to_string(),
             service_name: "service".to_string(),
+            systemd_unit: None,
             open_ports: ports.to_vec(),
             archive_id: "archive".to_string(),
             repo_id: "repo".to_string(),

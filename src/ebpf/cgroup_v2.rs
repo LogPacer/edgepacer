@@ -671,13 +671,32 @@ fn cgroup_anchor_for_namespaced_path(
     environment: &CgroupEnvironment,
     cgroup_path: &str,
 ) -> Result<CgroupAnchor, CgroupV2Error> {
-    use std::os::unix::fs::MetadataExt;
-
     let joined = join_namespaced_cgroup_path(
         &environment.host_root,
         &environment.namespace_root,
         cgroup_path,
     )?;
+    cgroup_anchor_for_joined_path(environment, joined)
+}
+
+/// Resolve an absolute host-hierarchy ControlGroup path, such as the exact
+/// value reported by `systemctl show`, to the kernel cgroup identity.
+#[cfg(target_os = "linux")]
+pub(crate) fn cgroup_anchor_for_host_path(
+    cgroup_path: &str,
+) -> Result<CgroupAnchor, CgroupV2Error> {
+    let environment = cgroup_environment()?;
+    let joined = join_cgroup_mount(&environment.host_root, cgroup_path)?;
+    cgroup_anchor_for_joined_path(environment, joined)
+}
+
+#[cfg(target_os = "linux")]
+fn cgroup_anchor_for_joined_path(
+    environment: &CgroupEnvironment,
+    joined: PathBuf,
+) -> Result<CgroupAnchor, CgroupV2Error> {
+    use std::os::unix::fs::MetadataExt;
+
     let canonical_path = std::fs::canonicalize(&joined).map_err(|source| CgroupV2Error::Io {
         operation: "resolve",
         path: joined,

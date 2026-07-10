@@ -15,6 +15,9 @@ use super::listener_state::ForeignListenerCandidate;
 use super::listener_state::{
     ForeignRuntimeIdentity, ListenerState, NetworkNamespaceToken, PortEvidence,
 };
+#[cfg(all(target_os = "linux", feature = "ebpf"))]
+use super::systemd_resolver;
+use super::systemd_resolver::{ResolvedSystemdTarget, SystemdAttestation};
 use crate::config::EbpfTargetConfig;
 use crate::discovery::{Container, RuntimeProcessIdentity};
 
@@ -41,6 +44,7 @@ struct RuntimeAttestation {
 pub(crate) struct CgroupRouting {
     by_id: BTreeMap<u64, CgroupRoute>,
     runtime_attestations: Vec<RuntimeAttestation>,
+    systemd_attestations: Vec<SystemdAttestation>,
     authorization_revision: Option<u64>,
     policy_generation: Option<u64>,
 }
@@ -121,41 +125,66 @@ impl CgroupRouting {
         self.by_id.is_empty()
     }
 
-    /// Re-read the exact runtime identities used to build this routing. The
-    /// discovery revision cannot detect a same-process cgroup or namespace
-    /// move, so publication must bind to a fresh runtime observation too.
+    /// Re-read every exact workload identity used to build this routing. The
+    /// discovery revision cannot detect a same-process container move or a
+    /// systemd restart, so publication binds to fresh observations too.
     #[cfg(all(target_os = "linux", feature = "ebpf"))]
-    pub(crate) fn revalidate_runtime_identities(&self) -> Result<(), String> {
-        self.revalidate_runtime_identities_with(|attestation| {
-            observe_runtime_identity(&attestation.container_id, attestation.process)
-        })
+    pub(crate) fn revalidate_identities(&self) -> Result<(), String> {
+        self.revalidate_identities_with(
+            |attestation| observe_runtime_identity(&attestation.container_id, attestation.process),
+            systemd_resolver::revalidate,
+        )
     }
 
+    #[cfg(test)]
     fn revalidate_runtime_identities_with<F>(&self, mut observe: F) -> Result<(), String>
     where
         F: FnMut(&RuntimeAttestation) -> Result<ResolvedRuntimeIdentity, String>,
     {
+        self.revalidate_identities_with(&mut observe, |_| {
+            Err("unexpected systemd attestation in runtime-only validation".to_string())
+        })
+    }
+
+    fn revalidate_identities_with<RuntimeObserve, SystemdObserve>(
+        &self,
+        mut observe_runtime: RuntimeObserve,
+        mut observe_systemd: SystemdObserve,
+    ) -> Result<(), String>
+    where
+        RuntimeObserve: FnMut(&RuntimeAttestation) -> Result<ResolvedRuntimeIdentity, String>,
+        SystemdObserve: FnMut(&SystemdAttestation) -> Result<(), String>,
+    {
         if self.by_id.is_empty() {
             return Ok(());
         }
-        if self.runtime_attestations.len() > MAX_ALLOWED_CGROUPS as usize {
+        let attestation_count = self
+            .runtime_attestations
+            .len()
+            .saturating_add(self.systemd_attestations.len());
+        if attestation_count > MAX_ALLOWED_CGROUPS as usize {
             return Err(format!(
-                "cgroup routing exceeds runtime attestation capacity of {MAX_ALLOWED_CGROUPS}"
+                "cgroup routing exceeds workload attestation capacity of {MAX_ALLOWED_CGROUPS}"
             ));
         }
-        if self.runtime_attestations.is_empty()
+        if attestation_count == 0
             || self.by_id.values().any(|route| {
-                !self
+                let runtime_attests = self
                     .runtime_attestations
                     .iter()
-                    .any(|attestation| attestation.anchor == route.anchor)
+                    .any(|attestation| attestation.anchor == route.anchor);
+                let systemd_attests = self
+                    .systemd_attestations
+                    .iter()
+                    .any(|attestation| attestation.anchor == route.anchor);
+                !runtime_attests && !systemd_attests
             })
         {
-            return Err("nonempty cgroup routing has no complete runtime attestation".to_string());
+            return Err("nonempty cgroup routing has no complete workload attestation".to_string());
         }
 
         for attestation in &self.runtime_attestations {
-            let current = observe(attestation)?;
+            let current = observe_runtime(attestation)?;
             if current.anchor != attestation.anchor
                 || current.network_namespace != attestation.network_namespace
             {
@@ -165,6 +194,38 @@ impl CgroupRouting {
                 ));
             }
         }
+        for attestation in &self.systemd_attestations {
+            observe_systemd(attestation)?;
+        }
+        Ok(())
+    }
+
+    fn merge_systemd_targets(
+        &mut self,
+        authorization_revision: u64,
+        targets: Vec<ResolvedSystemdTarget>,
+    ) -> Result<(), String> {
+        for target in targets {
+            self.insert(target.anchor, target.log_source_id)?;
+            self.systemd_attestations.push(target.attestation);
+        }
+        self.systemd_attestations.sort_unstable();
+        self.systemd_attestations.dedup();
+
+        if self.by_id.is_empty() {
+            return Ok(());
+        }
+        if authorization_revision == 0 {
+            return Err("cgroup routing authorization revision is zero".to_string());
+        }
+        if self
+            .authorization_revision
+            .is_some_and(|revision| revision != authorization_revision)
+        {
+            return Err("cgroup routing authorization revision changed while merging".to_string());
+        }
+        self.authorization_revision = Some(authorization_revision);
+        self.policy_generation = Some(authorization_revision);
         Ok(())
     }
 
@@ -254,7 +315,7 @@ pub(crate) fn resolve_from_listener_state(
     state: &ListenerState,
     authorization_revision: u64,
 ) -> Result<CgroupRouting, String> {
-    resolve_with_runtime_identity(
+    let mut routing = resolve_with_runtime_identity(
         containers,
         targets,
         state,
@@ -282,7 +343,10 @@ pub(crate) fn resolve_from_listener_state(
             });
             Ok(identity)
         },
-    )
+    )?;
+    let systemd_targets = systemd_resolver::resolve_from_listener_state(targets, state)?;
+    routing.merge_systemd_targets(authorization_revision, systemd_targets)?;
+    Ok(routing)
 }
 
 fn resolve_with_runtime_identity<F>(
@@ -307,6 +371,7 @@ where
     {
         let matching_targets: Vec<_> = targets
             .iter()
+            .filter(|target| target.systemd_unit.is_none())
             .filter(|target| target.service_name == container.service_name)
             .filter(|target| {
                 target.open_ports.iter().any(|port| {
@@ -380,6 +445,7 @@ fn foreign_listener_matches_runtime(
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
     use std::collections::{HashMap, HashSet};
 
     use super::*;
@@ -418,6 +484,7 @@ mod tests {
         EbpfTargetConfig {
             log_source_id: log_source_id.to_string(),
             service_name: service_name.to_string(),
+            systemd_unit: None,
             open_ports: ports.to_vec(),
             archive_id: "archive".to_string(),
             repo_id: "repo".to_string(),
@@ -688,6 +755,22 @@ mod tests {
     }
 
     #[test]
+    fn exact_systemd_targets_never_authorize_container_runtime_identity() {
+        let containers = [container("one", "nginx", true)];
+        let mut systemd_target = target("source", "nginx", &[8080]);
+        systemd_target.systemd_unit = Some("nginx.service".to_string());
+        let state = ready_state([(8080, 42)], []);
+
+        let routing =
+            resolve_with_runtime_identity(&containers, &[systemd_target], &state, 7, |_| {
+                panic!("systemd target must not consult container runtime identity")
+            })
+            .unwrap();
+
+        assert!(routing.is_empty());
+    }
+
+    #[test]
     fn invalid_anchor_depth_fails_closed() {
         let containers = [container("one", "api", true)];
         let targets = [target("source", "api", &[8080])];
@@ -780,7 +863,9 @@ mod tests {
 
         assert_eq!(
             error,
-            format!("cgroup routing exceeds runtime attestation capacity of {MAX_ALLOWED_CGROUPS}")
+            format!(
+                "cgroup routing exceeds workload attestation capacity of {MAX_ALLOWED_CGROUPS}"
+            )
         );
     }
 
@@ -835,7 +920,61 @@ mod tests {
             .revalidate_runtime_identities_with(|_| panic!("missing attestation must fail first"))
             .unwrap_err();
 
-        assert!(error.contains("no complete runtime attestation"), "{error}");
+        assert!(
+            error.contains("no complete workload attestation"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn systemd_route_requires_and_revalidates_exact_unit_attestation() {
+        use crate::ebpf::systemd_resolver::{
+            ResolvedSystemdTarget, SystemdAttestation, SystemdUnitIdentity,
+        };
+
+        let anchor = CgroupAnchor { id: 42, level: 2 };
+        let attestation = SystemdAttestation {
+            identity: SystemdUnitIdentity {
+                unit: "nginx.service".to_string(),
+                main_pid: 1234,
+                control_group: "/system.slice/nginx.service".to_string(),
+            },
+            anchor,
+        };
+        let mut routing = CgroupRouting::default();
+        routing
+            .merge_systemd_targets(
+                11,
+                vec![ResolvedSystemdTarget {
+                    anchor,
+                    log_source_id: "source".to_string(),
+                    attestation,
+                }],
+            )
+            .unwrap();
+
+        let checks = Cell::new(0usize);
+        routing
+            .revalidate_identities_with(
+                |_| panic!("systemd-only routing must not consult container runtime identity"),
+                |_| {
+                    checks.set(checks.get() + 1);
+                    Ok(())
+                },
+            )
+            .unwrap();
+
+        assert_eq!(routing.service_for(42), Some("source"));
+        assert_eq!(routing.authorization_revision(), Some(11));
+        assert_eq!(checks.get(), 1);
+
+        let error = routing
+            .revalidate_identities_with(
+                |_| panic!("systemd-only routing must not consult container runtime identity"),
+                |_| Err("unit moved".to_string()),
+            )
+            .unwrap_err();
+        assert_eq!(error, "unit moved");
     }
 
     #[test]

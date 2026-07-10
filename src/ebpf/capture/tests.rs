@@ -23,6 +23,7 @@ fn routing_for(pid: u32) -> PidRouting {
     let target = EbpfTargetConfig {
         log_source_id: "capture-test".to_string(),
         service_name: "capture-test".to_string(),
+        systemd_unit: None,
         open_ports: vec![65000],
         archive_id: String::new(),
         repo_id: String::new(),
