@@ -11,7 +11,7 @@
 //! network flows are batched per tick and shipped best-effort (the ebpf arm) —
 //! durable flow buffering is a refinement.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -22,7 +22,7 @@ use tokio::task::JoinHandle;
 use tracing::{debug, error, info, warn};
 
 use super::SharedEbpfStatus;
-use super::capture::{AyaCaptureProgram, CapturedFlow, CapturedLine};
+use super::capture::{AyaCaptureProgram, CapturedFlow, CapturedLine, CapturedListener};
 use super::l7::{
     CapturedSegment, ConnRegistry, RedAggregator, SpanContext, mint_id, to_request_signal,
 };
@@ -37,12 +37,57 @@ use crate::streaming_pipeline::{StreamingDeliveryPipeline, StreamingPipelineConf
 
 /// PID-filter refresh + delivery reconcile + flow-flush cadence.
 const RECONCILE_INTERVAL: Duration = Duration::from_secs(5);
+/// Temporary Phase 2 backstop until an authoritative listener snapshot + GC
+/// replaces the append-only live-delta cache.
+const MAX_PORT_CGROUP_ASSOCIATIONS: usize = 16_384;
 /// Bound on in-flight captured records awaiting routing; backpressures the drain.
 const CAPTURE_CHANNEL_DEPTH: usize = 256;
 /// IPPROTO_TCP — connect(2) to an AF_INET endpoint (the capture's domain).
 const IPPROTO_TCP: u32 = 6;
 /// NetworkFlow.direction = egress (an outbound connect).
 const DIRECTION_EGRESS: u32 = 1;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ListenerAssociationInsert {
+    Inserted,
+    AlreadyPresent,
+    AtCapacity { should_warn: bool },
+}
+
+#[derive(Default)]
+struct ListenerDiscovery {
+    port_cgroups: HashMap<u16, HashSet<u64>>,
+    association_count: usize,
+    capacity_warning_emitted: bool,
+}
+
+impl ListenerDiscovery {
+    fn insert(&mut self, port: u16, cgroup_id: u64, limit: usize) -> ListenerAssociationInsert {
+        if self
+            .port_cgroups
+            .get(&port)
+            .is_some_and(|cgroups| cgroups.contains(&cgroup_id))
+        {
+            return ListenerAssociationInsert::AlreadyPresent;
+        }
+
+        if self.association_count >= limit {
+            let should_warn = !self.capacity_warning_emitted;
+            self.capacity_warning_emitted = true;
+            return ListenerAssociationInsert::AtCapacity { should_warn };
+        }
+
+        self.port_cgroups.entry(port).or_default().insert(cgroup_id);
+        self.association_count += 1;
+        ListenerAssociationInsert::Inserted
+    }
+
+    fn clear(&mut self) {
+        self.port_cgroups.clear();
+        self.association_count = 0;
+        self.capacity_warning_emitted = false;
+    }
+}
 
 /// Per-target delivery: the durable log pipeline actor and a shipper for the
 /// typed eBPF arm (network flows). Keyed by `log_source_id`.
@@ -83,7 +128,13 @@ pub async fn run(
     let (captured_tx, mut captured_rx) = mpsc::channel::<CapturedLine>(CAPTURE_CHANNEL_DEPTH);
     let (flow_tx, mut flow_rx) = mpsc::channel::<CapturedFlow>(CAPTURE_CHANNEL_DEPTH);
     let (l7_tx, mut l7_rx) = mpsc::channel::<CapturedSegment>(CAPTURE_CHANNEL_DEPTH);
-    let mut manager = EbpfManager::new(AyaCaptureProgram::new(captured_tx, flow_tx, l7_tx));
+    let (listener_tx, mut listener_rx) = mpsc::channel::<CapturedListener>(CAPTURE_CHANNEL_DEPTH);
+    let mut manager = EbpfManager::new(AyaCaptureProgram::new(
+        captured_tx,
+        flow_tx,
+        l7_tx,
+        listener_tx,
+    ));
     // Routing seeded on the last reconcile, reused to route drained records.
     let mut routing = PidRouting::default();
     let mut deliveries: HashMap<String, TargetDelivery> = HashMap::new();
@@ -100,11 +151,21 @@ pub async fn run(
     // Per-(pid, fd) port→protocol hint, resolved once via /proc and cached so the
     // binary parsers bind by port instead of their weak byte signatures.
     let mut port_hints: HashMap<(u32, u32), Option<socket_port::ResolvedConn>> = HashMap::new();
+    // Event-driven port→cgroup discovery from successful TCP listener
+    // transitions, built from LISTENER_EVENTS.
+    // A future slice combines these live deltas with an authoritative snapshot
+    // + GC before resolving directive ports and seeding cgroup scoping.
+    let mut listener_discovery = ListenerDiscovery::default();
+    let mut reconcile_interval = tokio::time::interval_at(
+        tokio::time::Instant::now() + RECONCILE_INTERVAL,
+        RECONCILE_INTERVAL,
+    );
+    reconcile_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     info!("eBPF manager started");
 
     loop {
         tokio::select! {
-            _ = tokio::time::sleep(RECONCILE_INTERVAL) => {
+            _ = reconcile_interval.tick() => {
                 let section = {
                     let cfg = shared_config.read().await;
                     cfg.as_ref().and_then(config::ebpf_section)
@@ -120,6 +181,7 @@ pub async fn run(
                     l7_red = RedAggregator::new();
                     l7_conns = ConnRegistry::new();
                     port_hints.clear();
+                    listener_discovery.clear();
                     let mut guard = status.write().await;
                     guard.running = false;
                     guard.last_error = None;
@@ -177,6 +239,42 @@ pub async fn run(
                         .entry(service.to_string())
                         .or_default()
                         .push(to_network_flow(&flow));
+                }
+            }
+
+            Some(listener) = listener_rx.recv() => {
+                // Record which cgroup owns this listening port. Logged on first
+                // sighting so the discovered topology is observable; a later slice
+                // resolves directive ports → these cgroups to seed cgroup scoping.
+                if listener.cgroup_id == 0 {
+                    warn!(
+                        port = listener.port,
+                        tgid = listener.tgid,
+                        "eBPF: ignored listener with zero cgroup id"
+                    );
+                } else {
+                    match listener_discovery.insert(
+                        listener.port,
+                        listener.cgroup_id,
+                        MAX_PORT_CGROUP_ASSOCIATIONS,
+                    ) {
+                        ListenerAssociationInsert::Inserted => {
+                            debug!(
+                                port = listener.port,
+                                cgroup_id = listener.cgroup_id,
+                                tgid = listener.tgid,
+                                "eBPF: discovered listener (port→cgroup)"
+                            );
+                        }
+                        ListenerAssociationInsert::AtCapacity { should_warn: true } => {
+                            warn!(
+                                limit = MAX_PORT_CGROUP_ASSOCIATIONS,
+                                "eBPF: listener discovery capacity reached; dropping new associations until reset"
+                            );
+                        }
+                        ListenerAssociationInsert::AlreadyPresent
+                        | ListenerAssociationInsert::AtCapacity { should_warn: false } => {}
+                    }
                 }
             }
 
@@ -437,4 +535,66 @@ fn now_ns() -> i64 {
 
 fn sanitize_id(id: &str) -> String {
     id.replace(['/', '\\', ':', '.', ' '], "_")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn listener_associations_are_bounded_without_counting_duplicates() {
+        let mut discovery = ListenerDiscovery::default();
+
+        assert_eq!(
+            discovery.insert(8080, 11, 2),
+            ListenerAssociationInsert::Inserted
+        );
+        assert_eq!(
+            discovery.insert(8080, 11, 2),
+            ListenerAssociationInsert::AlreadyPresent
+        );
+        assert_eq!(
+            discovery.insert(8080, 12, 2),
+            ListenerAssociationInsert::Inserted
+        );
+        assert_eq!(
+            discovery.insert(9090, 13, 2),
+            ListenerAssociationInsert::AtCapacity { should_warn: true }
+        );
+        assert_eq!(
+            discovery.insert(9090, 14, 2),
+            ListenerAssociationInsert::AtCapacity { should_warn: false }
+        );
+
+        assert_eq!(discovery.association_count, 2);
+        assert_eq!(discovery.port_cgroups.get(&8080).unwrap().len(), 2);
+        assert!(!discovery.port_cgroups.contains_key(&9090));
+    }
+
+    #[test]
+    fn clearing_listener_associations_resets_capacity_warning() {
+        let mut discovery = ListenerDiscovery::default();
+
+        assert_eq!(
+            discovery.insert(8080, 11, 1),
+            ListenerAssociationInsert::Inserted
+        );
+        assert_eq!(
+            discovery.insert(9090, 12, 1),
+            ListenerAssociationInsert::AtCapacity { should_warn: true }
+        );
+
+        discovery.clear();
+
+        assert_eq!(discovery.association_count, 0);
+        assert!(discovery.port_cgroups.is_empty());
+        assert_eq!(
+            discovery.insert(9090, 12, 1),
+            ListenerAssociationInsert::Inserted
+        );
+        assert_eq!(
+            discovery.insert(10_000, 13, 1),
+            ListenerAssociationInsert::AtCapacity { should_warn: true }
+        );
+    }
 }

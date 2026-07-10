@@ -19,6 +19,20 @@ pub struct ExecEvent {
     pub comm: [u8; COMM_LEN],
 }
 
+/// One successful TCP listener transition — the event-driven port→cgroup
+/// discovery signal. Pairing the listening port with the task's cgroup id lets
+/// userspace resolve "watch port P" → the owning cgroup(s) with no
+/// `/proc/<pid>/fd` readlink (and so no `CAP_SYS_PTRACE`). cgroup id is the
+/// container dimension, so two containers on the same port stay distinct.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct ListenerEvent {
+    pub cgroup_id: u64,
+    pub tgid: u32,
+    pub port: u16,
+    pub family: u16,
+}
+
 /// Max captured bytes per write(2) — small enough for a BPF stack-free copy
 /// through the ring buffer, large enough to carry a typical log line prefix.
 pub const CHUNK_LEN: usize = 128;
