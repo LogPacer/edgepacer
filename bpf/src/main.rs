@@ -10,11 +10,11 @@
 use aya_ebpf::{
     bindings::BPF_TCP_LISTEN,
     helpers::{
-        bpf_get_current_cgroup_id, bpf_get_current_pid_tgid, bpf_probe_read_user,
-        bpf_probe_read_user_buf,
+        bpf_get_current_cgroup_id, bpf_get_current_pid_tgid, bpf_ktime_get_ns,
+        bpf_get_smp_processor_id, bpf_probe_read_user, bpf_probe_read_user_buf,
     },
     macros::{map, tracepoint, uprobe, uretprobe},
-    maps::{HashMap, RingBuf},
+    maps::{HashMap, PerCpuArray, RingBuf},
     programs::{ProbeContext, RetProbeContext, TracePointContext},
     EbpfContext,
 };
@@ -45,6 +45,17 @@ static CONNECT_EVENTS: RingBuf = RingBuf::with_byte_size(64 * 1024, 0);
 // transitions are rare, so the volume is negligible.
 #[map]
 static LISTENER_EVENTS: RingBuf = RingBuf::with_byte_size(64 * 1024, 0);
+
+// Per-CPU count of listener discovery events that could not be staged or
+// published. Userspace compares the complete vector across a snapshot.
+#[map]
+static LISTENER_DROPS: PerCpuArray<u64> = PerCpuArray::with_max_entries(1, 0);
+
+// Per-CPU successful-listen publication sequence. Each event carries its CPU
+// and sequence, so userspace fences a vector of contiguous per-CPU watermarks
+// without relying on newer BPF_FETCH atomics or BTF spin-lock map values.
+#[map]
+static LISTENER_PUBLISHED: PerCpuArray<u64> = PerCpuArray::with_max_entries(1, 0);
 
 // inet_sock_set_state announces TCP_LISTEN before listen(2) has completed.
 // Stage the candidate per calling thread; sys_exit_listen emits it only when
@@ -311,14 +322,18 @@ fn try_listen(ctx: &TracePointContext) -> Result<(), i64> {
 
     let event = ListenerEvent {
         cgroup_id,
+        observed_at_ns: 0,
+        sequence: 0,
         tgid: ctx.tgid(),
+        cpu_id: 0,
         port,
         family,
     };
     let key = bpf_get_current_pid_tgid();
-    LISTEN_CANDIDATES
-        .insert(&key, &event, 0)
-        .map_err(|_| 1_i64)?;
+    if LISTEN_CANDIDATES.insert(&key, &event, 0).is_err() {
+        record_listener_drop();
+        return Err(1);
+    }
     Ok(())
 }
 
@@ -334,7 +349,7 @@ pub fn capture_listen_exit(ctx: TracePointContext) -> u32 {
 
 fn try_listen_exit(ctx: &TracePointContext) -> Result<(), i64> {
     let key = bpf_get_current_pid_tgid();
-    let event = match unsafe { LISTEN_CANDIDATES.get(&key) } {
+    let mut event = match unsafe { LISTEN_CANDIDATES.get(&key) } {
         Some(event) => *event,
         None => return Ok(()),
     };
@@ -346,12 +361,42 @@ fn try_listen_exit(ctx: &TracePointContext) -> Result<(), i64> {
         return Ok(());
     }
 
+    // Publication begins with this CPU's sequence counter. A userspace fence
+    // that samples the new vector must wait for this record; if reserve fails,
+    // the corresponding drop epoch also changes and capture is reloaded.
+    let Some(sequence) = increment_listener_counter(&LISTENER_PUBLISHED) else {
+        record_listener_drop();
+        return Err(0);
+    };
+
+    event.observed_at_ns = unsafe { bpf_ktime_get_ns() };
+    event.sequence = sequence;
+    event.cpu_id = unsafe { bpf_get_smp_processor_id() };
+
     let Some(mut entry) = LISTENER_EVENTS.reserve::<ListenerEvent>(0) else {
+        record_listener_drop();
         return Err(0);
     };
     entry.write(event);
     entry.submit(0);
     Ok(())
+}
+
+#[inline(always)]
+fn record_listener_drop() {
+    let _ = increment_listener_counter(&LISTENER_DROPS);
+}
+
+#[inline(always)]
+fn increment_listener_counter(counter: &PerCpuArray<u64>) -> Option<u64> {
+    let Some(value) = counter.get_ptr_mut(0) else {
+        return None;
+    };
+    // SAFETY: each CPU has exclusive access to its own array cell.
+    unsafe {
+        *value = (*value).wrapping_add(1);
+        Some(*value)
+    }
 }
 
 // ── L7 socket capture (ADR-002 Level 3, the zero-code APM path) ──────────────

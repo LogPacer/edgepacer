@@ -47,8 +47,9 @@ fn program() -> (
     let (flow_tx, flow_rx) = mpsc::channel(256);
     let (l7_tx, l7_rx) = mpsc::channel(256);
     let (listener_tx, listener_rx) = mpsc::channel(256);
+    let (listener_health_tx, _listener_health_rx) = watch::channel(ListenerDrainHealth::stopped());
     (
-        AyaCaptureProgram::new(tx, flow_tx, l7_tx, listener_tx),
+        AyaCaptureProgram::new(tx, flow_tx, l7_tx, listener_tx, listener_health_tx),
         rx,
         flow_rx,
         l7_rx,
@@ -178,6 +179,10 @@ async fn assert_discovers_listener(family: SocketFamily, network_flows_enabled: 
         listener.cgroup_id, 0,
         "listener discovery must stamp the task's cgroup id in-kernel"
     );
+    assert_ne!(
+        listener.observed_at_ns, 0,
+        "listener discovery must stamp successful listen completion with monotonic time"
+    );
 
     stop_child(&mut child);
     program.stop();
@@ -186,14 +191,160 @@ async fn assert_discovers_listener(family: SocketFamily, network_flows_enabled: 
 #[test]
 fn listener_drain_exit_becomes_capture_error() {
     let running = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let (health_tx, health_rx) = watch::channel(ListenerDrainHealth {
+        generation: 7,
+        running: true,
+    });
     assert!(ensure_listener_drain_running(&running).is_ok());
 
-    drop(ListenerDrainGuard(std::sync::Arc::clone(&running)));
+    drop(ListenerDrainGuard {
+        running: std::sync::Arc::clone(&running),
+        health_tx,
+        generation: 7,
+    });
 
     assert_eq!(
         ensure_listener_drain_running(&running).unwrap_err(),
         "LISTENER_EVENTS drain stopped after capture start"
     );
+    assert_eq!(
+        *health_rx.borrow(),
+        ListenerDrainHealth {
+            generation: 7,
+            running: false,
+        }
+    );
+}
+
+#[test]
+fn stale_drain_exit_cannot_overwrite_replacement_health() {
+    let running = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let (health_tx, health_rx) = watch::channel(ListenerDrainHealth {
+        generation: 8,
+        running: true,
+    });
+
+    drop(ListenerDrainGuard {
+        running,
+        health_tx,
+        generation: 7,
+    });
+
+    assert_eq!(
+        *health_rx.borrow(),
+        ListenerDrainHealth {
+            generation: 8,
+            running: true,
+        }
+    );
+}
+
+#[test]
+fn stale_drain_exit_cannot_mask_replacement_failure() {
+    let running = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let (health_tx, health_rx) = watch::channel(ListenerDrainHealth {
+        generation: 8,
+        running: false,
+    });
+
+    drop(ListenerDrainGuard {
+        running,
+        health_tx,
+        generation: 7,
+    });
+
+    assert_eq!(
+        *health_rx.borrow(),
+        ListenerDrainHealth {
+            generation: 8,
+            running: false,
+        }
+    );
+}
+
+#[test]
+fn listener_fence_acknowledges_only_after_the_sampled_publication_count() {
+    let (ack, mut receiver) = oneshot::channel();
+    let mut pending = vec![ListenerFence {
+        published_counts: vec![2],
+        ack,
+    }];
+    let mut sequences = ListenerSequences::default();
+
+    advance_listener_sequence(&mut sequences, 0, 1).unwrap();
+    acknowledge_listener_fences(&mut pending, &sequences);
+    assert!(matches!(
+        receiver.try_recv(),
+        Err(oneshot::error::TryRecvError::Empty)
+    ));
+
+    advance_listener_sequence(&mut sequences, 0, 2).unwrap();
+    acknowledge_listener_fences(&mut pending, &sequences);
+    assert_eq!(receiver.try_recv().unwrap(), Ok(()));
+    assert!(pending.is_empty());
+}
+
+#[test]
+fn listener_fence_waits_for_a_contiguous_per_cpu_sequence() {
+    let mut sequences = ListenerSequences::default();
+    let (ack, mut receiver) = oneshot::channel();
+    let mut pending = vec![ListenerFence {
+        published_counts: vec![1],
+        ack,
+    }];
+
+    advance_listener_sequence(&mut sequences, 0, 2).unwrap();
+    acknowledge_listener_fences(&mut pending, &sequences);
+    assert_eq!(sequences.by_cpu[&0].contiguous, 0);
+    assert!(matches!(
+        receiver.try_recv(),
+        Err(oneshot::error::TryRecvError::Empty)
+    ));
+
+    advance_listener_sequence(&mut sequences, 0, 1).unwrap();
+    acknowledge_listener_fences(&mut pending, &sequences);
+    assert_eq!(sequences.by_cpu[&0].contiguous, 2);
+    assert_eq!(receiver.try_recv().unwrap(), Ok(()));
+}
+
+#[test]
+fn listener_fence_does_not_substitute_another_cpus_sequence() {
+    let mut sequences = ListenerSequences::default();
+    let (ack, mut receiver) = oneshot::channel();
+    let mut pending = vec![ListenerFence {
+        published_counts: vec![1, 0],
+        ack,
+    }];
+
+    advance_listener_sequence(&mut sequences, 1, 1).unwrap();
+    acknowledge_listener_fences(&mut pending, &sequences);
+    assert!(matches!(
+        receiver.try_recv(),
+        Err(oneshot::error::TryRecvError::Empty)
+    ));
+
+    advance_listener_sequence(&mut sequences, 0, 1).unwrap();
+    acknowledge_listener_fences(&mut pending, &sequences);
+    assert_eq!(receiver.try_recv().unwrap(), Ok(()));
+}
+
+#[test]
+fn listener_sequence_gap_budget_is_global_across_cpus() {
+    let mut sequences = ListenerSequences::default();
+    for index in 0..MAX_OUT_OF_ORDER_LISTENER_SEQUENCES {
+        let cpu_id = (index % MAX_LISTENER_SEQUENCE_CPUS) as u32;
+        let sequence = (index / MAX_LISTENER_SEQUENCE_CPUS + 2) as u64;
+        advance_listener_sequence(&mut sequences, cpu_id, sequence).unwrap();
+    }
+
+    let error = advance_listener_sequence(
+        &mut sequences,
+        0,
+        (MAX_OUT_OF_ORDER_LISTENER_SEQUENCES / MAX_LISTENER_SEQUENCE_CPUS + 2) as u64,
+    )
+    .unwrap_err();
+
+    assert!(error.contains("sequence gaps exceeded"));
 }
 
 /// A successful TCP listener transition is the authoritative live
@@ -291,6 +442,7 @@ async fn ignores_a_failed_listen() {
         .expect("successful listen must be discovered");
     assert_eq!(listener.family, libc::AF_INET as u16);
     assert_ne!(listener.cgroup_id, 0);
+    assert_ne!(listener.observed_at_ns, 0);
 
     let duplicate = receive_listener(&mut listener_rx, pid, port, Duration::from_secs(1)).await;
     assert!(

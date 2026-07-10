@@ -8,15 +8,15 @@
 //! Linux + `ebpf` only (it links aya). The reconcile orchestration that drives
 //! it lives in `manager.rs` and is tested on every platform via a fake.
 
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use aya::Ebpf;
-use aya::maps::{HashMap as AyaHashMap, MapData, RingBuf};
+use aya::maps::{HashMap as AyaHashMap, MapData, MapError, PerCpuArray, RingBuf};
 use aya::programs::{TracePoint, UProbe};
 use tokio::io::unix::AsyncFd;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 use tracing::warn;
 
@@ -26,7 +26,7 @@ use edgepacer_ebpf_common::{
 };
 
 use super::l7::{CapturedSegment, Direction};
-use super::manager::CaptureProgram;
+use super::manager::{CaptureProgram, ListenerObservation};
 use super::pid_resolver::PidRouting;
 use super::tls_libs;
 use crate::config::EbpfSectionConfig;
@@ -101,10 +101,29 @@ pub struct CapturedFlow {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CapturedListener {
     pub cgroup_id: u64,
+    pub observed_at_ns: u64,
     pub tgid: u32,
     pub port: u16,
     pub family: u16,
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ListenerDrainHealth {
+    pub generation: u64,
+    pub running: bool,
+}
+
+impl ListenerDrainHealth {
+    pub const fn stopped() -> Self {
+        Self {
+            generation: 0,
+            running: false,
+        }
+    }
+}
+
+const MAX_OUT_OF_ORDER_LISTENER_SEQUENCES: usize = 16_384;
+const MAX_LISTENER_SEQUENCE_CPUS: usize = 4_096;
 
 /// Live aya state held while capture is loaded.
 struct Loaded {
@@ -112,6 +131,10 @@ struct Loaded {
     #[allow(dead_code)]
     ebpf: Ebpf,
     target_pids: AyaHashMap<MapData, u32, u8>,
+    listener_drops: PerCpuArray<MapData, u64>,
+    listener_published: PerCpuArray<MapData, u64>,
+    listener_generation: u64,
+    listener_fence_tx: mpsc::Sender<ListenerFence>,
     /// PIDs currently written into the kernel filter, to diff on the next refresh.
     seeded: HashSet<u32>,
     /// Cleared if the mandatory listener drain exits after start-up.
@@ -120,11 +143,39 @@ struct Loaded {
     drains: Vec<JoinHandle<()>>,
 }
 
-struct ListenerDrainGuard(Arc<AtomicBool>);
+struct ListenerFence {
+    published_counts: Vec<u64>,
+    ack: oneshot::Sender<Result<(), String>>,
+}
+
+#[derive(Default)]
+struct PerCpuListenerSequence {
+    contiguous: u64,
+    out_of_order: BTreeSet<u64>,
+}
+
+#[derive(Default)]
+struct ListenerSequences {
+    by_cpu: HashMap<u32, PerCpuListenerSequence>,
+    outstanding: usize,
+}
+
+struct ListenerDrainGuard {
+    running: Arc<AtomicBool>,
+    health_tx: watch::Sender<ListenerDrainHealth>,
+    generation: u64,
+}
 
 impl Drop for ListenerDrainGuard {
     fn drop(&mut self) {
-        self.0.store(false, Ordering::Release);
+        self.running.store(false, Ordering::Release);
+        self.health_tx.send_if_modified(|health| {
+            if health.generation != self.generation {
+                return false;
+            }
+            health.running = false;
+            true
+        });
     }
 }
 
@@ -136,6 +187,8 @@ pub struct AyaCaptureProgram {
     flow_tx: mpsc::Sender<CapturedFlow>,
     l7_tx: mpsc::Sender<CapturedSegment>,
     listener_tx: mpsc::Sender<CapturedListener>,
+    listener_health_tx: watch::Sender<ListenerDrainHealth>,
+    next_listener_generation: u64,
     loaded: Option<Loaded>,
 }
 
@@ -145,12 +198,15 @@ impl AyaCaptureProgram {
         flow_tx: mpsc::Sender<CapturedFlow>,
         l7_tx: mpsc::Sender<CapturedSegment>,
         listener_tx: mpsc::Sender<CapturedListener>,
+        listener_health_tx: watch::Sender<ListenerDrainHealth>,
     ) -> Self {
         Self {
             captured_tx,
             flow_tx,
             l7_tx,
             listener_tx,
+            listener_health_tx,
+            next_listener_generation: 0,
             loaded: None,
         }
     }
@@ -172,13 +228,26 @@ impl CaptureProgram for AyaCaptureProgram {
         // Port→cgroup discovery: always on when capture is enabled — it feeds
         // target resolution (which cgroup owns a directive's port), so it must
         // run independently of the network-flows toggle.
-        attach_tracepoint(&mut ebpf, CAPTURE_LISTEN)?;
+        // Attach the exit side first. If a listen races the attach window, an
+        // exit without a staged candidate is harmless; the reverse order can
+        // strand a candidate forever and eventually fill the bounded map.
         attach_tracepoint(&mut ebpf, CAPTURE_LISTEN_EXIT)?;
+        attach_tracepoint(&mut ebpf, CAPTURE_LISTEN)?;
         let listener_events = ebpf
             .take_map("LISTENER_EVENTS")
             .ok_or("BPF map LISTENER_EVENTS not found")?;
         let listener_ring = RingBuf::try_from(listener_events)
             .map_err(|e| format!("open LISTENER_EVENTS ring: {e}"))?;
+        let listener_drops = ebpf
+            .take_map("LISTENER_DROPS")
+            .ok_or("BPF map LISTENER_DROPS not found")?;
+        let listener_drops = PerCpuArray::try_from(listener_drops)
+            .map_err(|e| format!("open LISTENER_DROPS map: {e}"))?;
+        let listener_published = ebpf
+            .take_map("LISTENER_PUBLISHED")
+            .ok_or("BPF map LISTENER_PUBLISHED not found")?;
+        let listener_published = PerCpuArray::try_from(listener_published)
+            .map_err(|e| format!("open LISTENER_PUBLISHED map: {e}"))?;
 
         // Network flows are an independent sub-toggle: attach + open only then.
         let flow_ring = if section.network_flows_enabled {
@@ -234,11 +303,17 @@ impl CaptureProgram for AyaCaptureProgram {
         // Start drains only after every required program and map is ready. If a
         // later attach/open fails, returning here must not leave orphan tasks
         // polling rings that `self.loaded` never took ownership of.
-        let listener_drain_running = Arc::new(AtomicBool::new(true));
+        let listener_drain_running = Arc::new(AtomicBool::new(false));
+        self.next_listener_generation = self.next_listener_generation.wrapping_add(1).max(1);
+        let listener_generation = self.next_listener_generation;
+        let (listener_fence_tx, listener_fence_rx) = mpsc::channel(4);
         let listener_drain = spawn_listener_drain(
             listener_ring,
             self.listener_tx.clone(),
             Arc::clone(&listener_drain_running),
+            self.listener_health_tx.clone(),
+            listener_generation,
+            listener_fence_rx,
         )?;
         let mut drains = Vec::with_capacity(5);
         drains.push(spawn_drain(ring, self.captured_tx.clone()));
@@ -254,6 +329,10 @@ impl CaptureProgram for AyaCaptureProgram {
         self.loaded = Some(Loaded {
             ebpf,
             target_pids,
+            listener_drops,
+            listener_published,
+            listener_generation,
+            listener_fence_tx,
             seeded: HashSet::new(),
             listener_drain_running,
             drains,
@@ -280,6 +359,15 @@ impl CaptureProgram for AyaCaptureProgram {
         let to_add: Vec<u32> = desired.difference(&loaded.seeded).copied().collect();
         let to_remove: Vec<u32> = loaded.seeded.difference(&desired).copied().collect();
 
+        // Remove stale scope before adding new scope. If either syscall fails,
+        // the manager unloads the whole program; ordering therefore minimizes
+        // the interval in which a superseded PID could still be captured.
+        for pid in to_remove {
+            match loaded.target_pids.remove(&pid) {
+                Ok(()) | Err(MapError::KeyNotFound) => {}
+                Err(error) => return Err(format!("remove pid {pid}: {error}")),
+            }
+        }
         for pid in to_add {
             loaded
                 .target_pids
@@ -292,12 +380,55 @@ impl CaptureProgram for AyaCaptureProgram {
                 attach_tls_to_lib(&mut loaded.ebpf, &lib, pid as i32);
             }
         }
-        for pid in to_remove {
-            // Best-effort: the PID may already have exited and been reaped.
-            let _ = loaded.target_pids.remove(&pid);
-        }
         loaded.seeded = desired;
         Ok(())
+    }
+
+    fn listener_observation(&self) -> Result<ListenerObservation, String> {
+        let loaded = self
+            .loaded
+            .as_ref()
+            .ok_or_else(|| "listener observation requested while capture is stopped".to_string())?;
+        ensure_listener_drain_running(&loaded.listener_drain_running)?;
+        let drop_counts = loaded
+            .listener_drops
+            .get(&0, 0)
+            .map_err(|error| format!("read LISTENER_DROPS: {error}"))?
+            .iter()
+            .copied()
+            .collect();
+        let published_counts = loaded
+            .listener_published
+            .get(&0, 0)
+            .map_err(|error| format!("read LISTENER_PUBLISHED: {error}"))?
+            .iter()
+            .copied()
+            .collect();
+        Ok(ListenerObservation {
+            generation: loaded.listener_generation,
+            drop_counts,
+            published_counts,
+        })
+    }
+
+    fn listener_fence(
+        &self,
+        published_counts: Vec<u64>,
+    ) -> Result<oneshot::Receiver<Result<(), String>>, String> {
+        let loaded = self
+            .loaded
+            .as_ref()
+            .ok_or_else(|| "listener fence requested while capture is stopped".to_string())?;
+        ensure_listener_drain_running(&loaded.listener_drain_running)?;
+        let (ack, receiver) = oneshot::channel();
+        loaded
+            .listener_fence_tx
+            .try_send(ListenerFence {
+                published_counts,
+                ack,
+            })
+            .map_err(|error| format!("request listener drain fence: {error}"))?;
+        Ok(receiver)
     }
 }
 
@@ -399,44 +530,148 @@ fn spawn_listener_drain(
     ring: RingBuf<MapData>,
     tx: mpsc::Sender<CapturedListener>,
     running: Arc<AtomicBool>,
+    health_tx: watch::Sender<ListenerDrainHealth>,
+    generation: u64,
+    mut fence_rx: mpsc::Receiver<ListenerFence>,
 ) -> Result<JoinHandle<()>, String> {
     let mut async_fd =
         AsyncFd::new(ring).map_err(|e| format!("cannot poll LISTENER_EVENTS ring: {e}"))?;
-    let health_guard = ListenerDrainGuard(running);
+    running.store(true, Ordering::Release);
+    health_tx.send_replace(ListenerDrainHealth {
+        generation,
+        running: true,
+    });
+    let health_guard = ListenerDrainGuard {
+        running,
+        health_tx,
+        generation,
+    };
 
     Ok(tokio::spawn(async move {
         let _health_guard = health_guard;
+        let mut sequences = ListenerSequences::default();
+        let mut pending_fences = Vec::new();
 
         loop {
-            let mut guard = match async_fd.readable_mut().await {
-                Ok(guard) => guard,
-                Err(e) => {
-                    warn!(error = %e, "eBPF: LISTENER_EVENTS poll failed");
-                    return;
+            tokio::select! {
+                command = fence_rx.recv() => {
+                    let Some(command) = command else {
+                        return;
+                    };
+                    pending_fences.push(command);
+                    acknowledge_listener_fences(&mut pending_fences, &sequences);
                 }
-            };
-            let ring = guard.get_inner_mut();
-            while let Some(item) = ring.next() {
-                let bytes: &[u8] = &item;
-                if bytes.len() < std::mem::size_of::<ListenerEvent>() {
-                    continue;
-                }
-                // SAFETY: ListenerEvent is repr(C) POD written by the kernel.
-                let ev =
-                    unsafe { std::ptr::read_unaligned(bytes.as_ptr() as *const ListenerEvent) };
-                let listener = CapturedListener {
-                    cgroup_id: ev.cgroup_id,
-                    tgid: ev.tgid,
-                    port: ev.port,
-                    family: ev.family,
-                };
-                if tx.send(listener).await.is_err() {
-                    return; // consumer gone
+                readiness = async_fd.readable_mut() => {
+                    let mut guard = match readiness {
+                        Ok(guard) => guard,
+                        Err(e) => {
+                            warn!(error = %e, "eBPF: LISTENER_EVENTS poll failed");
+                            return;
+                        }
+                    };
+                    let ring = guard.get_inner_mut();
+                    while let Some(item) = ring.next() {
+                        let bytes: &[u8] = &item;
+                        if bytes.len() < std::mem::size_of::<ListenerEvent>() {
+                            continue;
+                        }
+                        // SAFETY: ListenerEvent is repr(C) POD written by the kernel.
+                        let ev = unsafe {
+                            std::ptr::read_unaligned(bytes.as_ptr() as *const ListenerEvent)
+                        };
+                        let listener = CapturedListener {
+                            cgroup_id: ev.cgroup_id,
+                            observed_at_ns: ev.observed_at_ns,
+                            tgid: ev.tgid,
+                            port: ev.port,
+                            family: ev.family,
+                        };
+                        if tx.send(listener).await.is_err() {
+                            return; // consumer gone
+                        }
+                        if let Err(error) = advance_listener_sequence(
+                            &mut sequences,
+                            ev.cpu_id,
+                            ev.sequence,
+                        ) {
+                            warn!(%error, "eBPF: invalid LISTENER_EVENTS publication sequence");
+                            return;
+                        }
+                        acknowledge_listener_fences(&mut pending_fences, &sequences);
+                    }
+                    guard.clear_ready();
                 }
             }
-            guard.clear_ready();
         }
     }))
+}
+
+fn acknowledge_listener_fences(pending: &mut Vec<ListenerFence>, sequences: &ListenerSequences) {
+    let mut index = 0;
+    while index < pending.len() {
+        let ready = pending[index]
+            .published_counts
+            .iter()
+            .enumerate()
+            .all(|(cpu_id, target)| {
+                sequences
+                    .by_cpu
+                    .get(&(cpu_id as u32))
+                    .map_or(0, |state| state.contiguous)
+                    >= *target
+            });
+        if ready {
+            let fence = pending.swap_remove(index);
+            let _ = fence.ack.send(Ok(()));
+        } else {
+            index += 1;
+        }
+    }
+}
+
+fn advance_listener_sequence(
+    sequences: &mut ListenerSequences,
+    cpu_id: u32,
+    sequence: u64,
+) -> Result<(), String> {
+    if !sequences.by_cpu.contains_key(&cpu_id)
+        && sequences.by_cpu.len() >= MAX_LISTENER_SEQUENCE_CPUS
+    {
+        return Err(format!(
+            "listener publication sequence referenced more than {MAX_LISTENER_SEQUENCE_CPUS} CPUs"
+        ));
+    }
+    let state = sequences.by_cpu.entry(cpu_id).or_default();
+    let next = state
+        .contiguous
+        .checked_add(1)
+        .ok_or_else(|| "listener publication sequence overflowed".to_string())?;
+    if sequence < next || !state.out_of_order.insert(sequence) {
+        return Err(format!(
+            "listener publication sequence {sequence} repeated on CPU {cpu_id} after {}",
+            state.contiguous
+        ));
+    }
+    sequences.outstanding = sequences
+        .outstanding
+        .checked_add(1)
+        .ok_or_else(|| "listener publication gap count overflowed".to_string())?;
+    while let Some(next) = state.contiguous.checked_add(1) {
+        if !state.out_of_order.remove(&next) {
+            break;
+        }
+        sequences.outstanding = sequences
+            .outstanding
+            .checked_sub(1)
+            .ok_or_else(|| "listener publication gap count underflowed".to_string())?;
+        state.contiguous = next;
+    }
+    if sequences.outstanding > MAX_OUT_OF_ORDER_LISTENER_SEQUENCES {
+        return Err(format!(
+            "listener publication sequence gaps exceeded {MAX_OUT_OF_ORDER_LISTENER_SEQUENCES} records"
+        ));
+    }
+    Ok(())
 }
 
 fn ensure_listener_drain_running(running: &AtomicBool) -> Result<(), String> {

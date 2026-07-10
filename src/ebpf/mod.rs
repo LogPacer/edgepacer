@@ -8,9 +8,18 @@
 //! network flows).
 
 mod capability;
+// Cgroup-v2 process identity. Parsing is host-tested; the filesystem lookup is
+// Linux + ebpf only.
+#[cfg(any(test, all(target_os = "linux", feature = "ebpf")))]
+#[allow(dead_code)]
+mod cgroup_v2;
 // Pure control-plane logic, used by the (Linux-only) manager and exercised by
 // `cargo test` on every platform — so it compiles where it is used or tested,
 // not under a bare `target_os = "linux"` gate that macOS would never build.
+#[cfg(any(test, all(target_os = "linux", feature = "ebpf")))]
+mod listener_snapshot;
+#[cfg(any(test, all(target_os = "linux", feature = "ebpf")))]
+mod listener_state;
 #[cfg(any(test, all(target_os = "linux", feature = "ebpf")))]
 mod manager;
 #[cfg(any(test, all(target_os = "linux", feature = "ebpf")))]
@@ -26,6 +35,11 @@ mod l7;
 #[cfg(any(test, all(target_os = "linux", feature = "ebpf")))]
 #[allow(dead_code)]
 mod socket_port;
+// Authoritative TCP LISTEN snapshot for the caller's network namespace via
+// NETLINK_SOCK_DIAG. The binary parser is host-tested; the live query is Linux-only.
+#[cfg(any(test, all(target_os = "linux", feature = "ebpf")))]
+#[allow(dead_code)]
+mod sock_diag;
 // /proc/<pid>/maps scan for a target's loaded TLS libs (Node static OpenSSL, Java
 // Conscrypt/netty-tcnative BoringSSL) — uprobe targets the system libssl misses,
 // so we cover native-backed Java + Node TLS zero-config. Pure scan host-tested.

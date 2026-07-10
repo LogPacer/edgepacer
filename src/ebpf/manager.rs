@@ -13,11 +13,22 @@
 //! implementation is the single Linux+`ebpf` boundary filled once the BPF object
 //! is embedded.
 
+use tokio::sync::oneshot;
 use tracing::{debug, info};
 
 use super::pid_resolver::{PidRouting, resolve_from_ports};
 use crate::config::EbpfSectionConfig;
 use crate::discovery::ports::ListeningPort;
+
+/// Identity and loss epoch of the currently-running mandatory listener drain.
+/// A capture restart changes `generation`, so stale health from an aborted
+/// predecessor cannot validate or tear down its replacement.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ListenerObservation {
+    pub generation: u64,
+    pub drop_counts: Vec<u64>,
+    pub published_counts: Vec<u64>,
+}
 
 /// The kernel-program side of eBPF capture — the single boundary the manager
 /// drives. The real implementation loads/attaches aya programs and writes the
@@ -33,6 +44,19 @@ pub trait CaptureProgram {
     /// Make the kernel `TARGET_PIDS` filter reflect exactly `routing`. Called
     /// each tick while running so newly-started and exited PIDs track the census.
     fn set_target_pids(&mut self, routing: &PidRouting) -> Result<(), String>;
+
+    /// Current listener-drain generation and per-CPU monotonic counts of events
+    /// published or lost. This fails if the mandatory drain died.
+    #[cfg_attr(not(all(target_os = "linux", feature = "ebpf")), allow(dead_code))]
+    fn listener_observation(&self) -> Result<ListenerObservation, String>;
+
+    /// Request an acknowledgement after the mandatory drain has forwarded all
+    /// listener records through every sampled per-CPU publication count.
+    #[cfg_attr(not(all(target_os = "linux", feature = "ebpf")), allow(dead_code))]
+    fn listener_fence(
+        &self,
+        published_counts: Vec<u64>,
+    ) -> Result<oneshot::Receiver<Result<(), String>>, String>;
 }
 
 /// Whether the capture program is loaded, and under which section `config_hash`.
@@ -77,8 +101,9 @@ fn decide(current: &ManagerState, desired: &EbpfSectionConfig) -> ReconcileActio
 ///
 /// `running` is a **runtime truth** (decision 2): it is true only when the
 /// program is loaded *and* this tick completed cleanly. A load/attach or
-/// PID-seed failure reports `running: false` with the error, even though the
-/// program may remain loaded for the next tick to retry the seed.
+/// PID-seed failure reports `running: false` with the error. Seed failure also
+/// unloads the program so a stale kernel filter cannot keep capturing while
+/// userspace reports the subsystem stopped.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReconcileOutcome {
     pub running: bool,
@@ -130,6 +155,9 @@ impl<P: CaptureProgram> EbpfManager<P> {
         if error.is_none() && matches!(self.state, ManagerState::Running { .. }) {
             routing = resolve_from_ports(census, &section.targets);
             if let Err(e) = self.program.set_target_pids(&routing) {
+                self.program.stop();
+                self.state = ManagerState::Stopped;
+                routing = PidRouting::default();
                 error = Some(e);
             } else {
                 debug!(pids = routing.len(), "refreshed eBPF target PIDs");
@@ -150,6 +178,25 @@ impl<P: CaptureProgram> EbpfManager<P> {
             self.state = ManagerState::Stopped;
             info!("eBPF capture shut down");
         }
+    }
+
+    #[cfg_attr(not(all(target_os = "linux", feature = "ebpf")), allow(dead_code))]
+    pub fn listener_observation(&self) -> Result<ListenerObservation, String> {
+        if !matches!(self.state, ManagerState::Running { .. }) {
+            return Err("listener observation requested while capture is stopped".to_string());
+        }
+        self.program.listener_observation()
+    }
+
+    #[cfg_attr(not(all(target_os = "linux", feature = "ebpf")), allow(dead_code))]
+    pub fn listener_fence(
+        &self,
+        published_counts: Vec<u64>,
+    ) -> Result<oneshot::Receiver<Result<(), String>>, String> {
+        if !matches!(self.state, ManagerState::Running { .. }) {
+            return Err("listener fence requested while capture is stopped".to_string());
+        }
+        self.program.listener_fence(published_counts)
     }
 
     /// Load + attach, advancing to `Running` only on success — so `running`
@@ -198,6 +245,23 @@ mod tests {
             }
             self.seeded.push(routing.clone());
             Ok(())
+        }
+
+        fn listener_observation(&self) -> Result<ListenerObservation, String> {
+            Ok(ListenerObservation {
+                generation: 1,
+                drop_counts: vec![0],
+                published_counts: vec![0],
+            })
+        }
+
+        fn listener_fence(
+            &self,
+            _published_counts: Vec<u64>,
+        ) -> Result<oneshot::Receiver<Result<(), String>>, String> {
+            let (tx, rx) = oneshot::channel();
+            let _ = tx.send(Ok(()));
+            Ok(rx)
         }
     }
 
@@ -319,7 +383,7 @@ mod tests {
     }
 
     #[test]
-    fn pid_seed_failure_reports_not_running_but_stays_loaded() {
+    fn pid_seed_failure_unloads_and_restarts_cleanly_on_retry() {
         let program = FakeProgram {
             fail_seed: true,
             ..FakeProgram::default()
@@ -328,13 +392,14 @@ mod tests {
         let outcome = manager.reconcile(&section(true, "h1", vec![]), &[]);
         assert!(!outcome.running);
         assert_eq!(outcome.last_error.as_deref(), Some("seed failed"));
-        // The program stays loaded so the next tick retries the seed without reload.
-        assert_eq!(
-            manager.state,
-            ManagerState::Running {
-                config_hash: "h1".to_string()
-            }
-        );
+        assert!(outcome.routing.is_empty());
+        assert_eq!(manager.state, ManagerState::Stopped);
+        assert_eq!(manager.program.stopped, 1);
+
+        manager.program.fail_seed = false;
+        let retry = manager.reconcile(&section(true, "h1", vec![]), &[]);
+        assert!(retry.running);
+        assert_eq!(manager.program.started, 2);
     }
 
     #[test]
