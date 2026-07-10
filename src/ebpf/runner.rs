@@ -906,9 +906,11 @@ pub async fn run(
                         &desired_cgroups,
                         |routing| routing.revalidate_runtime_identities(),
                         |routing| manager.set_allowed_cgroups(routing),
-                    ) {
+                    )
+                    .map_err(CgroupPublicationError::into_recovery)
+                    {
                         Ok(()) => {}
-                        Err(CgroupPublicationError::BeforeMap(error)) => {
+                        Err(CgroupPublicationRecovery::ClearCgroupsKeepPid(error)) => {
                             listener_state.reset();
                             drop(cache);
                             if let Err(clear_error) = clear_cgroup_authorization_and_l7(
@@ -932,7 +934,7 @@ pub async fn run(
                             }
                             continue;
                         }
-                        Err(CgroupPublicationError::MapMayBeMutated(error)) => {
+                        Err(CgroupPublicationRecovery::UnloadCapture(error)) => {
                             drop(cache);
                             fail_listener_capture(
                                 &mut manager,
@@ -1257,6 +1259,21 @@ fn clear_cgroup_authorization_and_l7(
 enum CgroupPublicationError {
     BeforeMap(String),
     MapMayBeMutated(String),
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum CgroupPublicationRecovery {
+    ClearCgroupsKeepPid(String),
+    UnloadCapture(String),
+}
+
+impl CgroupPublicationError {
+    fn into_recovery(self) -> CgroupPublicationRecovery {
+        match self {
+            Self::BeforeMap(error) => CgroupPublicationRecovery::ClearCgroupsKeepPid(error),
+            Self::MapMayBeMutated(error) => CgroupPublicationRecovery::UnloadCapture(error),
+        }
+    }
 }
 
 fn publish_revalidated_cgroups<Validate, Publish>(
@@ -1965,8 +1982,10 @@ mod tests {
 
         assert!(!published);
         assert_eq!(
-            error,
-            CgroupPublicationError::BeforeMap("runtime moved before publication".to_string())
+            error.into_recovery(),
+            CgroupPublicationRecovery::ClearCgroupsKeepPid(
+                "runtime moved before publication".to_string()
+            )
         );
     }
 
@@ -1996,8 +2015,8 @@ mod tests {
         assert!(published);
         assert_eq!(validations, 2);
         assert_eq!(
-            error,
-            CgroupPublicationError::MapMayBeMutated("runtime moved after publication".to_string())
+            error.into_recovery(),
+            CgroupPublicationRecovery::UnloadCapture("runtime moved after publication".to_string())
         );
     }
 
@@ -2018,8 +2037,8 @@ mod tests {
 
         assert_eq!(validations, 1);
         assert_eq!(
-            error,
-            CgroupPublicationError::MapMayBeMutated("map update failed".to_string())
+            error.into_recovery(),
+            CgroupPublicationRecovery::UnloadCapture("map update failed".to_string())
         );
     }
 
