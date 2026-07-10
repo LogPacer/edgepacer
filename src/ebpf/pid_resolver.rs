@@ -149,6 +149,7 @@ mod tests {
         EbpfTargetConfig {
             log_source_id: log_source_id.to_string(),
             service_name: "service".to_string(),
+            systemd_unit: None,
             open_ports: ports.to_vec(),
             archive_id: "archive".to_string(),
             repo_id: "repo".to_string(),
@@ -179,6 +180,16 @@ mod tests {
         let routing = resolve_from_ports(&[listening(8080, 1234)], &targets);
         assert_eq!(routing.service_for(1234), Some("src-a"));
         assert_eq!(routing.len(), 1);
+    }
+
+    #[test]
+    fn systemd_target_retains_additive_pid_fallback() {
+        let mut systemd_target = target("src-a", &[8080]);
+        systemd_target.systemd_unit = Some("nginx.service".to_string());
+        let routing = resolve_from_ports(&[listening(8080, 1234)], &[systemd_target]);
+
+        assert_eq!(routing.service_for(1234), Some("src-a"));
+        assert_eq!(routing.target_pids().collect::<Vec<_>>(), vec![1234]);
     }
 
     #[test]

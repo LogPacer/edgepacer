@@ -26,6 +26,8 @@ mod listener_state;
 mod manager;
 #[cfg(any(test, all(target_os = "linux", feature = "ebpf")))]
 mod pid_resolver;
+#[cfg(any(test, all(target_os = "linux", feature = "ebpf")))]
+mod systemd_resolver;
 // L7 protocol parsing (the zero-code APM wedge, GAP 2). Pure userspace parser
 // core, exercised by `cargo test` on every platform. Wired into capture/runner in
 // the read-side-capture slice, so its API is dead in the non-test build until then.

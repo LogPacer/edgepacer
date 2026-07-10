@@ -1,6 +1,6 @@
 use super::fields::{
     ArchiveId, FieldContext, LogSourceId, Port, RepoId, ServiceName, WireEndpoint, port_list_field,
-    required_config_key, required_config_string, string_array_field,
+    required_config_key, required_config_string, required_string_field, string_array_field,
 };
 use super::{UnifiedConfig, compute_checksum};
 
@@ -12,6 +12,7 @@ use super::{UnifiedConfig, compute_checksum};
 pub struct EbpfTargetConfig {
     pub log_source_id: String,
     pub service_name: String,
+    pub systemd_unit: Option<String>,
     pub open_ports: Vec<u16>,
     pub archive_id: String,
     pub repo_id: String,
@@ -90,10 +91,15 @@ fn parse_ebpf_targets(targets: Option<&serde_json::Value>) -> Vec<EbpfTargetConf
             let repo_id = required_config_string::<RepoId>(target, "repo_id", ctx)?;
             let subbox_endpoint =
                 required_config_string::<WireEndpoint>(target, "subbox_endpoint", ctx)?;
+            let systemd_unit = match target.get("systemd_unit") {
+                Some(_) => Some(required_string_field(target, "systemd_unit", ctx)?),
+                None => None,
+            };
 
             Some(EbpfTargetConfig {
                 log_source_id: log_source_id.0,
                 service_name: service_name.0,
+                systemd_unit,
                 open_ports: parse_port_list(target.get("open_ports"), ctx),
                 archive_id: archive_id.0,
                 repo_id: repo_id.0,
@@ -226,6 +232,51 @@ mod tests {
                     "missing-routing": {
                         "service_name": "api-gateway",
                         "open_ports": "8080"
+                    }
+                }
+            }
+        }));
+
+        assert!(ebpf_section(&cfg).unwrap().targets.is_empty());
+    }
+
+    #[test]
+    fn target_preserves_optional_exact_systemd_unit_identity() {
+        let cfg = unified(json!({
+            "ebpf": {
+                "enabled": true,
+                "targets": {
+                    "loggable_42": {
+                        "service_name": "nginx",
+                        "systemd_unit": "nginx.service",
+                        "open_ports": "80,443",
+                        "archive_id": "arc_1",
+                        "repo_id": "repo_1",
+                        "protocols": ["http"],
+                        "subbox_endpoint": "https://subbox.example/wire"
+                    }
+                }
+            }
+        }));
+
+        let target = &ebpf_section(&cfg).unwrap().targets[0];
+        assert_eq!(target.systemd_unit.as_deref(), Some("nginx.service"));
+    }
+
+    #[test]
+    fn malformed_present_systemd_unit_cannot_downgrade_to_container_identity() {
+        let cfg = unified(json!({
+            "ebpf": {
+                "enabled": true,
+                "targets": {
+                    "loggable_42": {
+                        "service_name": "nginx",
+                        "systemd_unit": false,
+                        "open_ports": "80",
+                        "archive_id": "arc_1",
+                        "repo_id": "repo_1",
+                        "protocols": ["http"],
+                        "subbox_endpoint": "https://subbox.example/wire"
                     }
                 }
             }

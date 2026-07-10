@@ -434,6 +434,15 @@ pub(crate) fn validate_environment() -> Result<(), CgroupV2Error> {
     cgroup_environment().map(|_| ())
 }
 
+/// Whether the caller sees the host's initial cgroup namespace directly.
+/// Host-native systemd identity is only meaningful in this namespace; the
+/// private-namespace path intentionally remains available for container
+/// runtime identities through the explicit host hierarchy mount.
+#[cfg(target_os = "linux")]
+pub(crate) fn uses_initial_cgroup_namespace() -> Result<bool, CgroupV2Error> {
+    cgroup_environment().map(|environment| !environment.private_namespace)
+}
+
 #[cfg(target_os = "linux")]
 fn cgroup_environment() -> Result<&'static CgroupEnvironment, CgroupV2Error> {
     static ENVIRONMENT: std::sync::OnceLock<CgroupEnvironment> = std::sync::OnceLock::new();
@@ -671,13 +680,32 @@ fn cgroup_anchor_for_namespaced_path(
     environment: &CgroupEnvironment,
     cgroup_path: &str,
 ) -> Result<CgroupAnchor, CgroupV2Error> {
-    use std::os::unix::fs::MetadataExt;
-
     let joined = join_namespaced_cgroup_path(
         &environment.host_root,
         &environment.namespace_root,
         cgroup_path,
     )?;
+    cgroup_anchor_for_joined_path(environment, joined)
+}
+
+/// Resolve an absolute host-hierarchy ControlGroup path, such as the exact
+/// value reported by `systemctl show`, to the kernel cgroup identity.
+#[cfg(target_os = "linux")]
+pub(crate) fn cgroup_anchor_for_host_path(
+    cgroup_path: &str,
+) -> Result<CgroupAnchor, CgroupV2Error> {
+    let environment = cgroup_environment()?;
+    let joined = join_cgroup_mount(&environment.host_root, cgroup_path)?;
+    cgroup_anchor_for_joined_path(environment, joined)
+}
+
+#[cfg(target_os = "linux")]
+fn cgroup_anchor_for_joined_path(
+    environment: &CgroupEnvironment,
+    joined: PathBuf,
+) -> Result<CgroupAnchor, CgroupV2Error> {
+    use std::os::unix::fs::MetadataExt;
+
     let canonical_path = std::fs::canonicalize(&joined).map_err(|source| CgroupV2Error::Io {
         operation: "resolve",
         path: joined,

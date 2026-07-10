@@ -900,11 +900,11 @@ pub async fn run(
                     // freshness pass. A changed kernel policy still needs a
                     // strict pre/post TOCTOU bracket around the active-slot
                     // flip. This bounded critical section re-reads at most
-                    // MAX_ALLOWED_CGROUPS (1024) runtime attestations. Stable
+                    // MAX_ALLOWED_CGROUPS (1024) workload attestations. Stable
                     // authorization skips both these reads and the Aya rewrite.
                     match publish_revalidated_cgroups(
                         &desired_cgroups,
-                        |routing| routing.revalidate_runtime_identities(),
+                        |routing| routing.revalidate_publication_identities(),
                         |routing| manager.set_allowed_cgroups(routing),
                     )
                     .map_err(CgroupPublicationError::into_recovery)
@@ -1406,7 +1406,7 @@ fn start_cgroup_resolution(
             // Refresh the complete attestation set at the end of the blocking
             // work. The common unchanged-policy path can then keep the active
             // map without doing filesystem I/O on the runner loop.
-            routing.revalidate_runtime_identities()?;
+            routing.revalidate_identities()?;
             Ok(routing)
         });
         let result = tokio::select! {
