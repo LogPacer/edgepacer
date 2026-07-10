@@ -250,8 +250,6 @@ run_chart_validation() {
 
   if [[ "${enable_ebpf}" -eq 1 ]]; then
     args+=("--helm-set" "ebpf.enabled=true")
-    args+=("--helm-set" "runtimeSockets.containerd.enabled=true")
-    args+=("--helm-set" "runtimeSockets.containerd.path=/run/k3s/containerd/containerd.sock")
   fi
 
   args+=("${validate_args[@]}")

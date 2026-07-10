@@ -902,20 +902,49 @@ pub async fn run(
                     // flip. This bounded critical section re-reads at most
                     // MAX_ALLOWED_CGROUPS (1024) runtime attestations. Stable
                     // authorization skips both these reads and the Aya rewrite.
-                    if let Err(error) = publish_revalidated_cgroups(
+                    match publish_revalidated_cgroups(
                         &desired_cgroups,
                         |routing| routing.revalidate_runtime_identities(),
                         |routing| manager.set_allowed_cgroups(routing),
-                    ) {
-                        drop(cache);
-                        fail_listener_capture(
-                            &mut manager,
-                            authorization_refs!(),
-                            &status,
-                            error,
-                        )
-                        .await;
-                        continue;
+                    )
+                    .map_err(CgroupPublicationError::into_recovery)
+                    {
+                        Ok(()) => {}
+                        Err(CgroupPublicationRecovery::ClearCgroupsKeepPid(error)) => {
+                            listener_state.reset();
+                            drop(cache);
+                            if let Err(clear_error) = clear_cgroup_authorization_and_l7(
+                                &mut manager,
+                                &mut cgroup_routing,
+                                &mut l7_conns,
+                                &mut port_hints,
+                            ) {
+                                fail_listener_capture(
+                                    &mut manager,
+                                    authorization_refs!(),
+                                    &status,
+                                    clear_error,
+                                )
+                                .await;
+                            } else {
+                                let mut guard = status.write().await;
+                                guard.last_error = Some(error.clone());
+                                guard.cgroups_targeted = 0;
+                                warn!(%error, "eBPF: runtime identity changed before cgroup policy publication; PID fallback remains active");
+                            }
+                            continue;
+                        }
+                        Err(CgroupPublicationRecovery::UnloadCapture(error)) => {
+                            drop(cache);
+                            fail_listener_capture(
+                                &mut manager,
+                                authorization_refs!(),
+                                &status,
+                                error,
+                            )
+                            .await;
+                            continue;
+                        }
                     }
                 }
                 drop(cache);
@@ -1226,18 +1255,39 @@ fn clear_cgroup_authorization_and_l7(
     result
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum CgroupPublicationError {
+    BeforeMap(String),
+    MapMayBeMutated(String),
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum CgroupPublicationRecovery {
+    ClearCgroupsKeepPid(String),
+    UnloadCapture(String),
+}
+
+impl CgroupPublicationError {
+    fn into_recovery(self) -> CgroupPublicationRecovery {
+        match self {
+            Self::BeforeMap(error) => CgroupPublicationRecovery::ClearCgroupsKeepPid(error),
+            Self::MapMayBeMutated(error) => CgroupPublicationRecovery::UnloadCapture(error),
+        }
+    }
+}
+
 fn publish_revalidated_cgroups<Validate, Publish>(
     routing: &CgroupRouting,
     mut revalidate: Validate,
     publish: Publish,
-) -> Result<(), String>
+) -> Result<(), CgroupPublicationError>
 where
     Validate: FnMut(&CgroupRouting) -> Result<(), String>,
     Publish: FnOnce(&CgroupRouting) -> Result<(), String>,
 {
-    revalidate(routing)?;
-    publish(routing)?;
-    revalidate(routing)
+    revalidate(routing).map_err(CgroupPublicationError::BeforeMap)?;
+    publish(routing).map_err(CgroupPublicationError::MapMayBeMutated)?;
+    revalidate(routing).map_err(CgroupPublicationError::MapMayBeMutated)
 }
 
 fn cgroup_publication_is_required(active: &CgroupRouting, desired: &CgroupRouting) -> bool {
@@ -1916,6 +1966,30 @@ mod tests {
     }
 
     #[test]
+    fn cgroup_publication_rejects_runtime_move_before_map_write() {
+        let routing = cgroup_routing("source");
+        let mut published = false;
+
+        let error = publish_revalidated_cgroups(
+            &routing,
+            |_| Err("runtime moved before publication".to_string()),
+            |_| {
+                published = true;
+                Ok(())
+            },
+        )
+        .unwrap_err();
+
+        assert!(!published);
+        assert_eq!(
+            error.into_recovery(),
+            CgroupPublicationRecovery::ClearCgroupsKeepPid(
+                "runtime moved before publication".to_string()
+            )
+        );
+    }
+
+    #[test]
     fn cgroup_publication_rejects_runtime_move_after_map_write() {
         let routing = cgroup_routing("source");
         let mut validations = 0;
@@ -1940,7 +2014,32 @@ mod tests {
 
         assert!(published);
         assert_eq!(validations, 2);
-        assert_eq!(error, "runtime moved after publication");
+        assert_eq!(
+            error.into_recovery(),
+            CgroupPublicationRecovery::UnloadCapture("runtime moved after publication".to_string())
+        );
+    }
+
+    #[test]
+    fn cgroup_publication_treats_map_errors_as_potential_mutation() {
+        let routing = cgroup_routing("source");
+        let mut validations = 0;
+
+        let error = publish_revalidated_cgroups(
+            &routing,
+            |_| {
+                validations += 1;
+                Ok(())
+            },
+            |_| Err("map update failed".to_string()),
+        )
+        .unwrap_err();
+
+        assert_eq!(validations, 1);
+        assert_eq!(
+            error.into_recovery(),
+            CgroupPublicationRecovery::UnloadCapture("map update failed".to_string())
+        );
     }
 
     #[test]
