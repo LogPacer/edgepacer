@@ -361,10 +361,16 @@ fn try_listen_exit(ctx: &TracePointContext) -> Result<(), i64> {
         return Ok(());
     }
 
-    // Publication begins with this CPU's sequence counter. A userspace fence
-    // that samples the new vector must wait for this record; if reserve fails,
-    // the corresponding drop epoch also changes and capture is reloaded.
+    // Reserve before advancing this CPU's publication sequence so every
+    // sampled sequence has a ring-buffer record that the drain can consume.
+    // Any failure changes only the drop epoch and invalidates the snapshot.
+    let Some(mut entry) = LISTENER_EVENTS.reserve::<ListenerEvent>(0) else {
+        record_listener_drop();
+        return Err(0);
+    };
+
     let Some(sequence) = increment_listener_counter(&LISTENER_PUBLISHED) else {
+        entry.discard(0);
         record_listener_drop();
         return Err(0);
     };
@@ -373,10 +379,6 @@ fn try_listen_exit(ctx: &TracePointContext) -> Result<(), i64> {
     event.sequence = sequence;
     event.cpu_id = unsafe { bpf_get_smp_processor_id() };
 
-    let Some(mut entry) = LISTENER_EVENTS.reserve::<ListenerEvent>(0) else {
-        record_listener_drop();
-        return Err(0);
-    };
     entry.write(event);
     entry.submit(0);
     Ok(())
