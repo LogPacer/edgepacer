@@ -172,12 +172,35 @@ pub struct DiscoveryCache {
     /// authorization evidence. `None` means the latest applied scan was
     /// complete; `epoch == 0` still means no scan has completed at all.
     container_inventory_error: Option<String>,
+    /// Exact authorization-relevant container state from the latest scan.
+    /// `None` distinguishes an uninitialized cache from a complete empty scan.
+    container_authorization_fingerprint: Option<ContainerAuthorizationFingerprint>,
+    /// Monotonic revision of the authorization fingerprint. Unlike `epoch`, an
+    /// identical scan leaves this stable so a validated cgroup policy need not
+    /// be torn down and rebuilt.
+    container_authorization_revision: u64,
 }
 
-/// Complete container inventory pinned to the cache epoch it came from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ContainerAuthorizationFingerprint {
+    inventory_error: Option<String>,
+    containers: Vec<ContainerAuthorizationIdentity>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct ContainerAuthorizationIdentity {
+    id: String,
+    container_id: String,
+    explicit_service_name: Option<String>,
+    runtime_process: Option<super::RuntimeProcessIdentity>,
+}
+
+/// Complete container inventory pinned to both the scan epoch and the exact
+/// authorization revision it came from.
 #[derive(Debug, Clone)]
 pub struct CompleteContainerSnapshot {
     pub epoch: u64,
+    pub authorization_revision: u64,
     pub containers: Vec<Container>,
 }
 
@@ -189,6 +212,13 @@ impl DiscoveryCache {
     /// The discovery epoch as of the last applied scan.
     pub fn epoch(&self) -> u64 {
         self.epoch
+    }
+
+    /// Revision of the complete container state used for authorization. This
+    /// changes on the first scan, on authorization-relevant inventory changes,
+    /// and on complete/partial transitions, but not on identical scans.
+    pub fn container_authorization_revision(&self) -> u64 {
+        self.container_authorization_revision
     }
 
     /// Replace all cache entries from a census scan.
@@ -203,7 +233,34 @@ impl DiscoveryCache {
             .collect();
         self.container_inventory_error = (!failed_backends.is_empty())
             .then(|| format!("container discovery failed: {}", failed_backends.join(", ")));
+        let authorization_fingerprint = self.container_authorization_fingerprint();
+        if self.container_authorization_fingerprint.as_ref() != Some(&authorization_fingerprint) {
+            self.container_authorization_revision =
+                self.container_authorization_revision.wrapping_add(1).max(1);
+            self.container_authorization_fingerprint = Some(authorization_fingerprint);
+        }
         self.epoch += 1;
+    }
+
+    fn container_authorization_fingerprint(&self) -> ContainerAuthorizationFingerprint {
+        let mut containers: Vec<_> = self
+            .distinct_containers()
+            .into_iter()
+            .filter(|container| container.state == "running")
+            .map(|container| ContainerAuthorizationIdentity {
+                id: container.id.clone(),
+                container_id: container.container_id.clone(),
+                explicit_service_name: container
+                    .explicit_service()
+                    .then(|| container.service_name.clone()),
+                runtime_process: container.runtime_process,
+            })
+            .collect();
+        containers.sort_unstable();
+        ContainerAuthorizationFingerprint {
+            inventory_error: self.container_inventory_error.clone(),
+            containers,
+        }
     }
 
     // Kubernetes containers are cached whether or not they carry the explicit
@@ -315,18 +372,23 @@ impl DiscoveryCache {
         }
         Ok(CompleteContainerSnapshot {
             epoch: self.epoch,
+            authorization_revision: self.container_authorization_revision,
             containers: self.distinct_containers().into_iter().cloned().collect(),
         })
     }
 
-    /// Revalidate a snapshot immediately before it becomes authorization
-    /// evidence. The caller holds the cache read lock through application, so
-    /// a concurrent discovery update cannot slip between this check and commit.
-    pub fn verify_complete_container_epoch(&self, expected_epoch: u64) -> Result<(), String> {
-        if self.epoch != expected_epoch {
+    /// Revalidate authorization evidence immediately before it becomes active.
+    /// The caller holds the cache read lock through application, so a concurrent
+    /// authorization-relevant discovery update cannot slip between check and
+    /// commit. Identical scans deliberately keep the revision valid.
+    pub fn verify_complete_container_authorization_revision(
+        &self,
+        expected_revision: u64,
+    ) -> Result<(), String> {
+        if self.container_authorization_revision != expected_revision {
             return Err(format!(
-                "container discovery changed during listener snapshot ({expected_epoch} -> {})",
-                self.epoch
+                "container authorization changed during listener snapshot ({expected_revision} -> {})",
+                self.container_authorization_revision
             ));
         }
         if let Some(error) = &self.container_inventory_error {
@@ -613,15 +675,23 @@ mod tests {
     fn epoch_advances_on_every_applied_scan() {
         let mut cache = DiscoveryCache::new();
         assert_eq!(cache.epoch(), 0, "no scan applied yet");
+        assert_eq!(cache.container_authorization_revision(), 0);
 
         cache.update_all(&Census::default());
         assert_eq!(cache.epoch(), 1);
+        let authorization_revision = cache.container_authorization_revision();
+        assert_ne!(authorization_revision, 0);
 
         // Identical census content still advances the epoch: the epoch marks
         // "a scan was applied", and reconcile cost for an unchanged scan is a
         // cheap no-op re-resolve.
         cache.update_all(&Census::default());
         assert_eq!(cache.epoch(), 2);
+        assert_eq!(
+            cache.container_authorization_revision(),
+            authorization_revision,
+            "an identical complete scan must preserve active authorization"
+        );
     }
 
     #[test]
@@ -645,12 +715,80 @@ mod tests {
         assert!(snapshot.containers.is_empty());
 
         cache.update_all(&Census::default());
-        assert_eq!(
-            cache
-                .verify_complete_container_epoch(snapshot.epoch)
-                .unwrap_err(),
-            "container discovery changed during listener snapshot (2 -> 3)"
+        cache
+            .verify_complete_container_authorization_revision(snapshot.authorization_revision)
+            .unwrap();
+    }
+
+    #[test]
+    fn authorization_revision_tracks_complete_partial_transitions_and_identity_changes() {
+        let mut cache = DiscoveryCache::new();
+        let complete = Census {
+            containers: vec![container_with_id("one", "api", "")],
+            ..Default::default()
+        };
+        cache.update_all(&complete);
+        let initial = cache.container_authorization_revision();
+
+        cache.update_all(&complete);
+        assert_eq!(cache.container_authorization_revision(), initial);
+
+        let mut partial = Census {
+            containers: complete.containers.clone(),
+            ..Default::default()
+        };
+        partial
+            .errors
+            .insert("docker".to_string(), "daemon unavailable".to_string());
+        cache.update_all(&partial);
+        let partial_revision = cache.container_authorization_revision();
+        assert_ne!(partial_revision, initial);
+        assert!(cache.complete_container_snapshot().is_err());
+
+        cache.update_all(&partial);
+        assert_eq!(cache.container_authorization_revision(), partial_revision);
+
+        cache.update_all(&complete);
+        let recovered = cache.complete_container_snapshot().unwrap();
+        assert_ne!(recovered.authorization_revision, partial_revision);
+
+        let changed = Census {
+            containers: vec![container_with_id("two", "api", "")],
+            ..Default::default()
+        };
+        cache.update_all(&changed);
+        assert_ne!(
+            cache.container_authorization_revision(),
+            recovered.authorization_revision
         );
+    }
+
+    #[test]
+    fn authorization_revision_ignores_non_authorization_container_churn() {
+        let mut cache = DiscoveryCache::new();
+        let container = container_with_id("one", "api", "/var/log/one.log");
+        cache.update_all(&Census {
+            containers: vec![container.clone()],
+            ..Default::default()
+        });
+        let initial = cache.container_authorization_revision();
+
+        let mut cosmetic_change = container.clone();
+        cosmetic_change.image = "nginx:new-tag".to_string();
+        cosmetic_change.log_path = "/var/log/moved.log".to_string();
+        cache.update_all(&Census {
+            containers: vec![cosmetic_change],
+            ..Default::default()
+        });
+        assert_eq!(cache.container_authorization_revision(), initial);
+
+        let mut stopped = container;
+        stopped.state = "exited".to_string();
+        cache.update_all(&Census {
+            containers: vec![stopped],
+            ..Default::default()
+        });
+        assert_ne!(cache.container_authorization_revision(), initial);
     }
 
     fn kubernetes_container(service_name_explicit: bool) -> Container {

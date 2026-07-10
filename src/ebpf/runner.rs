@@ -26,12 +26,14 @@ use super::SharedEbpfStatus;
 use super::capture::{
     AyaCaptureProgram, CapturedFlow, CapturedLine, CapturedListener, ListenerDrainHealth,
 };
+use super::cgroup_resolver::{self, CgroupRouting};
 use super::l7::{
-    CapturedSegment, ConnRegistry, RedAggregator, SpanContext, mint_id, to_request_signal,
+    CapturedConnectionIdentity, CapturedSegment, ConnRegistry, RedAggregator, SpanContext, mint_id,
+    to_request_signal,
 };
 use super::listener_snapshot;
 use super::listener_state::{DeltaOutcome, ListenerAssociation, ListenerSnapshot, ListenerState};
-use super::manager::EbpfManager;
+use super::manager::{EbpfManager, ListenerObservation};
 use super::pid_resolver::PidRouting;
 use super::socket_port;
 use crate::config::{self, EbpfTargetConfig, SharedConfig};
@@ -45,15 +47,19 @@ use crate::streaming_pipeline::{StreamingDeliveryPipeline, StreamingPipelineConf
 const RECONCILE_INTERVAL: Duration = Duration::from_secs(5);
 /// Upper bound for both authoritative and live listener ownership state.
 const MAX_PORT_CGROUP_ASSOCIATIONS: usize = 16_384;
-/// Live events accumulated while a blocking snapshot runs. Overflow makes the
-/// snapshot unusable and clears readiness rather than applying a partial replay.
-const MAX_BUFFERED_LISTENER_DELTAS: usize = 16_384;
 /// Overall wall-clock bound for one blocking listener snapshot. Late worker
 /// completion is discarded by generation after this timeout fails readiness.
 const LISTENER_SNAPSHOT_TIMEOUT: Duration = Duration::from_secs(20);
+/// Cgroup filesystem identity resolution runs off-loop, but it must still
+/// produce a fail-closed result within a bounded interval.
+const CGROUP_RESOLUTION_TIMEOUT: Duration = Duration::from_secs(20);
 /// A published-count fence should normally complete immediately; bound it so a
 /// dead or wedged drain fails readiness instead of blocking the runner.
 const LISTENER_DRAIN_FENCE_TIMEOUT: Duration = Duration::from_secs(5);
+/// Re-sample and fence late publications a bounded number of times. A busy
+/// listener stream fails closed instead of letting snapshot commit starve the
+/// runner indefinitely.
+const MAX_LISTENER_FENCE_PASSES: usize = 8;
 /// Bound on in-flight captured records awaiting routing; backpressures the drain.
 const CAPTURE_CHANNEL_DEPTH: usize = 256;
 /// IPPROTO_TCP — connect(2) to an AF_INET endpoint (the capture's domain).
@@ -80,26 +86,42 @@ struct TargetDelivery {
 
 struct ListenerSnapshotResult {
     state_generation: u64,
-    discovery_epoch: u64,
+    authorization_revision: u64,
     capture_generation: u64,
     result: Result<ListenerSnapshot, String>,
 }
 
-struct SnapshotWorkerReservation(Arc<AtomicBool>);
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CgroupResolutionKey {
+    listener_generation: u64,
+    authorization_revision: u64,
+    capture_generation: u64,
+}
 
-impl Drop for SnapshotWorkerReservation {
+struct CgroupResolutionResult {
+    key: CgroupResolutionKey,
+    result: Result<CgroupRouting, String>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum StableListenerFenceError {
+    CaptureRestarted { before: u64, after: u64 },
+    Fatal(String),
+}
+
+struct WorkerReservation(Arc<AtomicBool>);
+
+impl Drop for WorkerReservation {
     fn drop(&mut self) {
         self.0.store(false, Ordering::Release);
     }
 }
 
-fn reserve_snapshot_worker(
-    worker_running: Arc<AtomicBool>,
-) -> Result<SnapshotWorkerReservation, String> {
+fn reserve_worker(worker_running: Arc<AtomicBool>) -> Result<WorkerReservation, String> {
     worker_running
         .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-        .map_err(|_| "listener snapshot worker is still running".to_string())?;
-    Ok(SnapshotWorkerReservation(worker_running))
+        .map_err(|_| "authorization worker is still running".to_string())?;
+    Ok(WorkerReservation(worker_running))
 }
 
 impl TargetDelivery {
@@ -130,6 +152,10 @@ pub async fn run(
         watch::channel(ListenerDrainHealth::stopped());
     let (snapshot_tx, mut snapshot_rx) = mpsc::channel::<ListenerSnapshotResult>(1);
     let snapshot_worker_running = Arc::new(AtomicBool::new(false));
+    let (cgroup_resolution_tx, mut cgroup_resolution_rx) =
+        mpsc::channel::<CgroupResolutionResult>(1);
+    let cgroup_resolution_worker_running = Arc::new(AtomicBool::new(false));
+    let mut pending_cgroup_resolution: Option<CgroupResolutionKey> = None;
     let mut manager = EbpfManager::new(AyaCaptureProgram::new(
         captured_tx,
         flow_tx,
@@ -138,7 +164,8 @@ pub async fn run(
         listener_health_tx,
     ));
     // Routing seeded on the last reconcile, reused to route drained records.
-    let mut routing = PidRouting::default();
+    let mut pid_routing = PidRouting::default();
+    let mut cgroup_routing = CgroupRouting::default();
     let mut deliveries: HashMap<String, TargetDelivery> = HashMap::new();
     // Flows accumulated since the last tick, keyed by service (log_source_id).
     let mut pending_flows: HashMap<String, Vec<NetworkFlow>> = HashMap::new();
@@ -152,16 +179,33 @@ pub async fn run(
     let mut span_seq: u64 = 0;
     // Per-(pid, fd) port→protocol hint, resolved once via /proc and cached so the
     // binary parsers bind by port instead of their weak byte signatures.
-    let mut port_hints: HashMap<(u32, u32), Option<socket_port::ResolvedConn>> = HashMap::new();
+    let mut port_hints: HashMap<CapturedConnectionIdentity, Option<socket_port::ResolvedConn>> =
+        HashMap::new();
     // Event deltas are usable only after an authoritative snapshot has supplied
     // cold-start state. Periodic replacement snapshots garbage-collect closes.
     let mut listener_state = ListenerState::default();
     let mut listener_config_hash: Option<String> = None;
+    let mut listener_targets: Vec<EbpfTargetConfig> = Vec::new();
     let mut active_listener_generation: Option<u64> = None;
+    let mut next_cgroup_policy_generation = 0u64;
     let mut reconcile_interval = tokio::time::interval_at(
         tokio::time::Instant::now() + RECONCILE_INTERVAL,
         RECONCILE_INTERVAL,
     );
+    macro_rules! authorization_refs {
+        () => {
+            CaptureAuthorizationRefs {
+                pid_routing: &mut pid_routing,
+                cgroup_routing: &mut cgroup_routing,
+                listener_state: &mut listener_state,
+                listener_config_hash: &mut listener_config_hash,
+                listener_targets: &mut listener_targets,
+                active_listener_generation: &mut active_listener_generation,
+                l7_conns: &mut l7_conns,
+                port_hints: &mut port_hints,
+            }
+        };
+    }
     reconcile_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     info!("eBPF manager started");
 
@@ -176,7 +220,8 @@ pub async fn run(
                 // An absent `ebpf` section (older server) means "disabled" — tear down.
                 let Some(section) = section else {
                     manager.shutdown();
-                    routing = PidRouting::default();
+                    pid_routing = PidRouting::default();
+                    cgroup_routing = CgroupRouting::default();
                     stop_all_deliveries(&mut deliveries);
                     pending_flows.clear();
                     pending_spans.clear();
@@ -185,25 +230,57 @@ pub async fn run(
                     port_hints.clear();
                     listener_state.reset();
                     listener_config_hash = None;
+                    listener_targets.clear();
                     active_listener_generation = None;
                     let mut guard = status.write().await;
                     guard.running = false;
                     guard.last_error = None;
                     guard.pids_targeted = 0;
+                    guard.cgroups_targeted = 0;
                     continue;
                 };
 
-                // Discovery failure must not preserve ownership authorized by
-                // a disabled or superseded configuration. The kernel allow-set
-                // slice consumes this state, so invalidate it before the
-                // fallible PID census rather than after a successful reconcile.
+                // Discovery/config churn must not preserve an allow-set built
+                // from older listener or runtime identity. Clear it before the
+                // fallible PID census so no await extends stale authorization.
+                let authorization_revision = discovery_cache
+                    .read()
+                    .await
+                    .container_authorization_revision();
+                let cgroup_authorization_changed = cgroup_routing
+                    .authorization_revision()
+                    .is_some_and(|revision| revision != authorization_revision);
                 if !section.enabled
+                    || cgroup_authorization_changed
                     || listener_config_hash
                         .as_deref()
                         .is_some_and(|hash| hash != section.config_hash)
                 {
+                    if let Err(error) = clear_cgroup_authorization_and_l7(
+                        &mut manager,
+                        &mut cgroup_routing,
+                        &mut l7_conns,
+                        &mut port_hints,
+                    )
+                    {
+                        manager.shutdown();
+                        pid_routing = PidRouting::default();
+                        listener_state.reset();
+                        listener_config_hash = None;
+                        listener_targets.clear();
+                        active_listener_generation = None;
+                        let mut guard = status.write().await;
+                        guard.running = false;
+                        guard.last_error = Some(error.clone());
+                        guard.pids_targeted = 0;
+                        guard.cgroups_targeted = 0;
+                        warn!(%error, "eBPF: capture unloaded after cgroup allow-set clear failed");
+                        continue;
+                    }
+                    status.write().await.cgroups_targeted = 0;
                     listener_state.reset();
                     listener_config_hash = None;
+                    listener_targets.clear();
                 }
 
                 let census = if section.enabled {
@@ -221,8 +298,13 @@ pub async fn run(
                     Vec::new()
                 };
 
+                let previous_capture_generation = active_listener_generation;
+                let previous_pid_policy_generation = pid_routing.policy_generation();
                 let mut outcome = manager.reconcile(&section, &census);
-                routing = outcome.routing;
+                pid_routing = outcome.routing;
+                if !outcome.running {
+                    cgroup_routing = CgroupRouting::default();
+                }
 
                 if outcome.running {
                     match manager.listener_observation() {
@@ -231,7 +313,8 @@ pub async fn run(
                         }
                         Err(error) => {
                             manager.shutdown();
-                            routing = PidRouting::default();
+                            pid_routing = PidRouting::default();
+                            cgroup_routing = CgroupRouting::default();
                             outcome.running = false;
                             outcome.last_error = Some(error);
                             outcome.routing = PidRouting::default();
@@ -241,14 +324,26 @@ pub async fn run(
                 } else {
                     active_listener_generation = None;
                 }
+                if authorization_generation_changed(
+                    previous_capture_generation,
+                    active_listener_generation,
+                    previous_pid_policy_generation,
+                    pid_routing.policy_generation(),
+                ) {
+                    l7_conns = ConnRegistry::new();
+                    port_hints.clear();
+                }
 
                 if outcome.running && section.enabled {
                     if listener_config_hash.as_deref() != Some(section.config_hash.as_str()) {
                         listener_state.reset();
                         listener_config_hash = Some(section.config_hash.clone());
+                        listener_targets = section.targets.clone();
                     }
                     if !listener_state.snapshot_in_flight()
                         && !snapshot_worker_running.load(Ordering::Acquire)
+                        && !cgroup_resolution_worker_running.load(Ordering::Acquire)
+                        && pending_cgroup_resolution.is_none()
                     {
                         let start_result = start_listener_snapshot(
                             &mut listener_state,
@@ -260,12 +355,44 @@ pub async fn run(
                         .await;
                         if let Err(error) = start_result {
                             listener_state.reset();
+                            if let Err(clear_error) = clear_cgroup_authorization_and_l7(
+                                &mut manager,
+                                &mut cgroup_routing,
+                                &mut l7_conns,
+                                &mut port_hints,
+                            )
+                            {
+                                manager.shutdown();
+                                pid_routing = PidRouting::default();
+                                outcome.running = false;
+                                outcome.last_error = Some(clear_error.clone());
+                                active_listener_generation = None;
+                                warn!(error = %clear_error, "eBPF: capture unloaded after cgroup allow-set clear failed");
+                            }
                             warn!(%error, "eBPF: listener snapshot could not start; ownership is not ready");
+                        } else if !listener_authorization_is_available(&listener_state)
+                            && let Err(error) = clear_cgroup_authorization_and_l7(
+                                &mut manager,
+                                &mut cgroup_routing,
+                                &mut l7_conns,
+                                &mut port_hints,
+                            )
+                        {
+                            manager.shutdown();
+                            pid_routing = PidRouting::default();
+                            listener_state.reset();
+                            listener_config_hash = None;
+                            listener_targets.clear();
+                            outcome.running = false;
+                            outcome.last_error = Some(error.clone());
+                            active_listener_generation = None;
+                            warn!(%error, "eBPF: capture unloaded after cgroup allow-set clear failed");
                         }
                     }
                 } else {
                     listener_state.reset();
                     listener_config_hash = None;
+                    listener_targets.clear();
                     active_listener_generation = None;
                 }
 
@@ -285,12 +412,22 @@ pub async fn run(
                 let mut guard = status.write().await;
                 guard.running = outcome.running;
                 guard.last_error = outcome.last_error;
-                guard.pids_targeted = routing.len();
+                guard.pids_targeted = pid_routing.len();
+                guard.cgroups_targeted = cgroup_routing.len();
             }
 
             Some(line) = captured_rx.recv() => {
-                let Some(service) = routing.service_for(line.pid) else {
-                    continue; // PID no longer targeted (raced with removal)
+                if !capture_generation_is_current(line.capture_generation, active_listener_generation) {
+                    continue;
+                }
+                let Some(service) = route_captured_event(
+                    &pid_routing,
+                    &cgroup_routing,
+                    line.pid,
+                    line.scope_cgroup_id,
+                    line.policy_generation,
+                ) else {
+                    continue; // scope no longer targeted (raced with replacement)
                 };
                 let Some(delivery) = deliveries.get(service) else {
                     continue; // no pipeline yet for this service
@@ -303,7 +440,16 @@ pub async fn run(
             }
 
             Some(flow) = flow_rx.recv() => {
-                if let Some(service) = routing.service_for(flow.pid) {
+                if !capture_generation_is_current(flow.capture_generation, active_listener_generation) {
+                    continue;
+                }
+                if let Some(service) = route_captured_event(
+                    &pid_routing,
+                    &cgroup_routing,
+                    flow.pid,
+                    flow.scope_cgroup_id,
+                    flow.policy_generation,
+                ) {
                     pending_flows
                         .entry(service.to_string())
                         .or_default()
@@ -312,13 +458,24 @@ pub async fn run(
             }
 
             Some(listener) = listener_rx.recv() => {
-                record_listener_delta(&mut listener_state, listener);
+                if record_listener_delta(&mut listener_state, listener) {
+                    reconcile_interval.reset_immediately();
+                }
+                if clear_unready_cgroup_authorization(
+                    &mut manager,
+                    authorization_refs!(),
+                    &status,
+                )
+                .await
+                {
+                    continue;
+                }
             }
 
             Some(snapshot_result) = snapshot_rx.recv() => {
                 let ListenerSnapshotResult {
                     state_generation,
-                    discovery_epoch,
+                    authorization_revision,
                     capture_generation,
                     result,
                 } = snapshot_result;
@@ -330,10 +487,18 @@ pub async fn run(
                     Ok(snapshot) => {
                         let cache_verification = {
                             let cache = discovery_cache.read().await;
-                            cache.verify_complete_container_epoch(discovery_epoch)
+                            cache.verify_complete_container_authorization_revision(
+                                authorization_revision,
+                            )
                         };
                         if let Err(error) = cache_verification {
                             listener_state.fail_snapshot(state_generation);
+                            clear_unready_cgroup_authorization(
+                                &mut manager,
+                                authorization_refs!(),
+                                &status,
+                            )
+                            .await;
                             warn!(%error, "eBPF: container inventory changed during listener snapshot; ownership is not ready");
                             continue;
                         }
@@ -343,10 +508,7 @@ pub async fn run(
                             Err(error) => {
                                 fail_listener_capture(
                                     &mut manager,
-                                    &mut routing,
-                                    &mut listener_state,
-                                    &mut listener_config_hash,
-                                    &mut active_listener_generation,
+                                    authorization_refs!(),
                                     &status,
                                     error,
                                 )
@@ -357,6 +519,13 @@ pub async fn run(
                         if observation.generation != capture_generation {
                             listener_state.fail_snapshot(state_generation);
                             listener_config_hash = None;
+                            listener_targets.clear();
+                            clear_unready_cgroup_authorization(
+                                &mut manager,
+                                authorization_refs!(),
+                                &status,
+                            )
+                            .await;
                             warn!(
                                 before = capture_generation,
                                 after = observation.generation,
@@ -365,116 +534,402 @@ pub async fn run(
                             continue;
                         }
 
-                        let fence = match manager.listener_fence(observation.published_counts) {
-                            Ok(fence) => fence,
-                            Err(error) => {
-                                fail_listener_capture(
-                                    &mut manager,
-                                    &mut routing,
-                                    &mut listener_state,
-                                    &mut listener_config_hash,
-                                    &mut active_listener_generation,
-                                    &status,
-                                    error,
-                                )
-                                .await;
-                                continue;
-                            }
-                        };
-                        let fence_result = tokio::time::timeout(
-                            LISTENER_DRAIN_FENCE_TIMEOUT,
-                            drain_listener_until_fence(
-                                fence,
-                                &mut listener_rx,
-                                &mut listener_state,
-                            ),
+                        let observation = match drain_listener_until_publication_stable(
+                            capture_generation,
+                            observation,
+                            || manager.listener_observation(),
+                            |published_counts| manager.listener_fence(published_counts),
+                            &mut listener_rx,
+                            &mut listener_state,
                         )
                         .await
-                        .map_err(|_| {
-                            format!(
-                                "listener drain fence timed out after {LISTENER_DRAIN_FENCE_TIMEOUT:?}"
-                            )
-                        })
-                        .and_then(|result| result);
-                        if let Err(error) = fence_result {
-                            fail_listener_capture(
-                                &mut manager,
-                                &mut routing,
-                                &mut listener_state,
-                                &mut listener_config_hash,
-                                &mut active_listener_generation,
-                                &status,
-                                error,
-                            )
-                            .await;
-                            continue;
-                        }
-
-                        let observation = match manager.listener_observation() {
+                        {
                             Ok(observation) => observation,
-                            Err(error) => {
+                            Err(StableListenerFenceError::Fatal(error)) => {
                                 fail_listener_capture(
                                     &mut manager,
-                                    &mut routing,
-                                    &mut listener_state,
-                                    &mut listener_config_hash,
-                                    &mut active_listener_generation,
+                                    authorization_refs!(),
                                     &status,
                                     error,
                                 )
                                 .await;
                                 continue;
                             }
+                            Err(StableListenerFenceError::CaptureRestarted { before, after }) => {
+                                listener_state.fail_snapshot(state_generation);
+                                listener_config_hash = None;
+                                listener_targets.clear();
+                                clear_unready_cgroup_authorization(
+                                    &mut manager,
+                                    authorization_refs!(),
+                                    &status,
+                                )
+                                .await;
+                                warn!(
+                                    before,
+                                    after,
+                                    "eBPF: listener capture restarted during drain fence; ownership is not ready"
+                                );
+                                continue;
+                            }
                         };
-                        if observation.generation != capture_generation {
-                            listener_state.fail_snapshot(state_generation);
-                            listener_config_hash = None;
-                            warn!(
-                                before = capture_generation,
-                                after = observation.generation,
-                                "eBPF: listener capture restarted during drain fence; ownership is not ready"
-                            );
-                            continue;
-                        }
 
-                        // Hold the read lock through application so a discovery
-                        // writer cannot advance the revalidated epoch in the
-                        // final check→commit gap.
-                        let cache = discovery_cache.read().await;
-                        if let Err(error) = cache.verify_complete_container_epoch(discovery_epoch) {
-                            listener_state.fail_snapshot(state_generation);
-                            warn!(%error, "eBPF: container inventory changed during listener drain fence; ownership is not ready");
-                            continue;
-                        }
-                        match listener_state.apply_snapshot_with_loss(
+                        let container_snapshot = {
+                            let cache = discovery_cache.read().await;
+                            if let Err(error) = cache
+                                .verify_complete_container_authorization_revision(
+                                    authorization_revision,
+                                )
+                            {
+                                listener_state.fail_snapshot(state_generation);
+                                drop(cache);
+                                clear_unready_cgroup_authorization(
+                                    &mut manager,
+                                    authorization_refs!(),
+                                    &status,
+                                )
+                                .await;
+                                warn!(%error, "eBPF: container inventory changed during listener drain fence; ownership is not ready");
+                                continue;
+                            }
+                            match cache.complete_container_snapshot() {
+                                Ok(snapshot) => snapshot,
+                                Err(error) => {
+                                    listener_state.fail_snapshot(state_generation);
+                                    drop(cache);
+                                    clear_unready_cgroup_authorization(
+                                        &mut manager,
+                                        authorization_refs!(),
+                                        &status,
+                                    )
+                                    .await;
+                                    warn!(%error, "eBPF: container inventory became incomplete during listener drain fence; ownership is not ready");
+                                    continue;
+                                }
+                            }
+                        };
+                        let previous_listener_authorization_revision =
+                            listener_state.authorization_revision();
+                        let applied = listener_state.apply_snapshot_with_loss(
                             state_generation,
                             snapshot,
                             observation.drop_counts,
                             MAX_PORT_CGROUP_ASSOCIATIONS,
-                        ) {
+                        );
+                        match applied {
                             Ok(true) => {
-                                debug_assert!(listener_state.is_ready());
+                                debug_assert_eq!(
+                                    listener_state.authorization_generation(),
+                                    Some(state_generation)
+                                );
+                                let listener_authorization_changed =
+                                    previous_listener_authorization_revision
+                                        != listener_state.authorization_revision();
+                                if listener_authorization_changed {
+                                    // A close is visible only in replacement
+                                    // snapshots. Clear a materially changed old
+                                    // policy before resolving its replacement;
+                                    // byte-identical evidence keeps the validated
+                                    // policy active through off-loop resolution.
+                                    if let Err(error) = clear_cgroup_authorization_and_l7(
+                                        &mut manager,
+                                        &mut cgroup_routing,
+                                        &mut l7_conns,
+                                        &mut port_hints,
+                                    ) {
+                                        fail_listener_capture(
+                                            &mut manager,
+                                            authorization_refs!(),
+                                            &status,
+                                            error,
+                                        )
+                                        .await;
+                                        continue;
+                                    }
+                                    status.write().await.cgroups_targeted = 0;
+                                }
+                                let key = CgroupResolutionKey {
+                                    listener_generation: state_generation,
+                                    authorization_revision,
+                                    capture_generation,
+                                };
+                                if let Err(error) = start_cgroup_resolution(
+                                    key,
+                                    container_snapshot.containers,
+                                    listener_targets.clone(),
+                                    listener_state.clone(),
+                                    cgroup_resolution_tx.clone(),
+                                    Arc::clone(&cgroup_resolution_worker_running),
+                                ) {
+                                    fail_listener_capture(
+                                        &mut manager,
+                                        authorization_refs!(),
+                                        &status,
+                                        error,
+                                    )
+                                    .await;
+                                    continue;
+                                }
+                                pending_cgroup_resolution = Some(key);
                                 debug!(
                                     associations = listener_state.association_count(),
-                                    "eBPF: listener ownership snapshot ready"
+                                    authorization_revision,
+                                    "eBPF: listener ownership snapshot ready; resolving cgroup policy"
                                 );
                             }
                             Ok(false) => {
                                 debug!(generation = state_generation, "eBPF: ignored stale listener snapshot result");
                             }
                             Err(error) => {
-                                warn!(%error, "eBPF: listener snapshot replay failed; ownership is not ready");
+                                clear_unready_cgroup_authorization(
+                                    &mut manager,
+                                    authorization_refs!(),
+                                    &status,
+                                )
+                                .await;
+                                warn!(%error, "eBPF: listener snapshot commit failed; ownership is not ready");
                             }
                         }
                     }
                     Err(error) => {
                         if listener_state.fail_snapshot(state_generation) {
+                            clear_unready_cgroup_authorization(
+                                &mut manager,
+                                authorization_refs!(),
+                                &status,
+                            )
+                            .await;
                             warn!(%error, "eBPF: authoritative listener snapshot failed; ownership is not ready");
                         } else {
                             debug!(generation = state_generation, %error, "eBPF: ignored stale listener snapshot failure");
                         }
                     }
                 }
+            }
+
+            Some(resolution) = cgroup_resolution_rx.recv() => {
+                let CgroupResolutionResult { key, result } = resolution;
+                if pending_cgroup_resolution == Some(key) {
+                    pending_cgroup_resolution = None;
+                }
+                let current_authorization_revision = discovery_cache
+                    .read()
+                    .await
+                    .container_authorization_revision();
+                if key.authorization_revision != current_authorization_revision {
+                    listener_state.reset();
+                    clear_unready_cgroup_authorization(
+                        &mut manager,
+                        authorization_refs!(),
+                        &status,
+                    )
+                    .await;
+                    debug!(
+                        worker_revision = key.authorization_revision,
+                        current_revision = current_authorization_revision,
+                        "eBPF: ignored cgroup resolution from stale container authorization"
+                    );
+                    continue;
+                }
+                if !cgroup_resolution_is_current(
+                    key,
+                    &listener_state,
+                    active_listener_generation,
+                    current_authorization_revision,
+                ) {
+                    debug!(?key, "eBPF: ignored stale cgroup resolution result");
+                    continue;
+                }
+
+                let mut desired_cgroups = match result {
+                    Ok(routing) => routing,
+                    Err(error) => {
+                        listener_state.reset();
+                        if let Err(clear_error) = clear_cgroup_authorization_and_l7(
+                            &mut manager,
+                            &mut cgroup_routing,
+                            &mut l7_conns,
+                            &mut port_hints,
+                        ) {
+                            fail_listener_capture(
+                                &mut manager,
+                                authorization_refs!(),
+                                &status,
+                                clear_error,
+                            )
+                            .await;
+                        } else {
+                            let mut guard = status.write().await;
+                            guard.last_error = Some(error.clone());
+                            guard.cgroups_targeted = 0;
+                            warn!(%error, "eBPF: cgroup resolution failed; PID fallback remains active");
+                        }
+                        continue;
+                    }
+                };
+
+                let observation = match manager.listener_observation() {
+                    Ok(observation) => observation,
+                    Err(error) => {
+                        fail_listener_capture(
+                            &mut manager,
+                            authorization_refs!(),
+                            &status,
+                            error,
+                        )
+                        .await;
+                        continue;
+                    }
+                };
+                if observation.generation != key.capture_generation {
+                    listener_state.reset();
+                    clear_unready_cgroup_authorization(
+                        &mut manager,
+                        authorization_refs!(),
+                        &status,
+                    )
+                    .await;
+                    warn!(
+                        before = key.capture_generation,
+                        after = observation.generation,
+                        "eBPF: listener capture restarted during cgroup resolution; policy was not published"
+                    );
+                    continue;
+                }
+
+                let observation = match drain_listener_until_publication_stable(
+                    key.capture_generation,
+                    observation,
+                    || manager.listener_observation(),
+                    |published_counts| manager.listener_fence(published_counts),
+                    &mut listener_rx,
+                    &mut listener_state,
+                )
+                .await
+                {
+                    Ok(observation) => observation,
+                    Err(StableListenerFenceError::Fatal(error)) => {
+                        fail_listener_capture(
+                            &mut manager,
+                            authorization_refs!(),
+                            &status,
+                            error,
+                        )
+                        .await;
+                        continue;
+                    }
+                    Err(StableListenerFenceError::CaptureRestarted { before, after }) => {
+                        listener_state.reset();
+                        clear_unready_cgroup_authorization(
+                            &mut manager,
+                            authorization_refs!(),
+                            &status,
+                        )
+                        .await;
+                        warn!(
+                            before,
+                            after,
+                            "eBPF: listener capture restarted during cgroup publication fence; policy was not published"
+                        );
+                        continue;
+                    }
+                };
+                if let Err(error) = listener_state.validate_authorization(
+                    key.listener_generation,
+                    &observation.drop_counts,
+                ) {
+                    clear_unready_cgroup_authorization(
+                        &mut manager,
+                        authorization_refs!(),
+                        &status,
+                    )
+                    .await;
+                    warn!(%error, "eBPF: listener authorization changed during cgroup resolution; policy was not published");
+                    continue;
+                }
+
+                // Hold the read lock across the final authorization revision
+                // check and active-slot publication. Filesystem resolution ran
+                // off-loop and without this lock.
+                let cache = discovery_cache.read().await;
+                if let Err(error) = cache.verify_complete_container_authorization_revision(
+                    key.authorization_revision,
+                ) {
+                    listener_state.reset();
+                    drop(cache);
+                    clear_unready_cgroup_authorization(
+                        &mut manager,
+                        authorization_refs!(),
+                        &status,
+                    )
+                    .await;
+                    warn!(%error, "eBPF: container authorization changed before cgroup policy publication");
+                    continue;
+                }
+
+                let cgroup_authorization_unchanged =
+                    !cgroup_publication_is_required(&cgroup_routing, &desired_cgroups);
+                if !desired_cgroups.is_empty() {
+                    let generation = if cgroup_authorization_unchanged {
+                        cgroup_routing.policy_generation().unwrap_or_else(|| {
+                            next_cgroup_policy_generation = next_cgroup_policy_generation
+                                .wrapping_add(1)
+                                .max(1);
+                            next_cgroup_policy_generation
+                        })
+                    } else {
+                        next_cgroup_policy_generation =
+                            next_cgroup_policy_generation.wrapping_add(1).max(1);
+                        next_cgroup_policy_generation
+                    };
+                    if let Err(error) = desired_cgroups.assign_policy_generation(generation) {
+                        drop(cache);
+                        fail_listener_capture(
+                            &mut manager,
+                            authorization_refs!(),
+                            &status,
+                            error,
+                        )
+                        .await;
+                        continue;
+                    }
+                }
+                if !cgroup_authorization_unchanged {
+                    // The blocking resolver already did the potentially
+                    // unbounded environment discovery and a whole-routing
+                    // freshness pass. A changed kernel policy still needs a
+                    // strict pre/post TOCTOU bracket around the active-slot
+                    // flip. This bounded critical section re-reads at most
+                    // MAX_ALLOWED_CGROUPS (1024) runtime attestations. Stable
+                    // authorization skips both these reads and the Aya rewrite.
+                    if let Err(error) = publish_revalidated_cgroups(
+                        &desired_cgroups,
+                        |routing| routing.revalidate_runtime_identities(),
+                        |routing| manager.set_allowed_cgroups(routing),
+                    ) {
+                        drop(cache);
+                        fail_listener_capture(
+                            &mut manager,
+                            authorization_refs!(),
+                            &status,
+                            error,
+                        )
+                        .await;
+                        continue;
+                    }
+                }
+                drop(cache);
+                if cgroup_routing.policy_generation() != desired_cgroups.policy_generation() {
+                    l7_conns = ConnRegistry::new();
+                    port_hints.clear();
+                }
+                cgroup_routing = desired_cgroups;
+                status.write().await.cgroups_targeted = cgroup_routing.len();
+                debug!(
+                    associations = listener_state.association_count(),
+                    cgroups = cgroup_routing.len(),
+                    "eBPF: cgroup policy published from current listener ownership"
+                );
             }
 
             changed = listener_health_rx.changed() => {
@@ -485,26 +940,43 @@ pub async fn run(
                 {
                     let error = "mandatory listener drain stopped after capture start".to_string();
                     manager.shutdown();
-                    routing = PidRouting::default();
+                    pid_routing = PidRouting::default();
+                    cgroup_routing = CgroupRouting::default();
                     listener_state.reset();
                     listener_config_hash = None;
+                    listener_targets.clear();
                     active_listener_generation = None;
+                    l7_conns = ConnRegistry::new();
+                    port_hints.clear();
                     let mut guard = status.write().await;
                     guard.running = false;
                     guard.last_error = Some(error.clone());
                     guard.pids_targeted = 0;
+                    guard.cgroups_targeted = 0;
                     warn!(%error, "eBPF: capture unloaded after listener drain failure");
                 }
             }
 
             Some(seg) = l7_rx.recv() => {
+                if !capture_generation_is_current(seg.capture_generation, active_listener_generation) {
+                    continue;
+                }
                 let pid = seg.pid;
                 let ts = seg.timestamp_nano;
+                let Some(service) = route_captured_event(
+                    &pid_routing,
+                    &cgroup_routing,
+                    pid,
+                    seg.scope_cgroup_id,
+                    seg.policy_generation,
+                ) else {
+                    continue;
+                };
                 // Resolve the connection's protocol from its port once (cached). TLS
                 // segments carry an SSL*-derived fd that won't resolve → None, so
                 // they fall back to byte detection (fine for HTTP-in-TLS).
                 let resolved = port_hints
-                    .entry((pid, seg.fd))
+                    .entry(seg.connection_identity())
                     .or_insert_with(|| socket_port::resolve(pid, seg.fd));
                 let (proto, flip) = match resolved.as_ref().and_then(|r| r.hint) {
                     Some(h) => (Some(h.protocol), h.client),
@@ -513,9 +985,6 @@ pub async fn run(
                 // The connection's peer endpoint — the service-map edge's other node.
                 let peer = resolved.as_ref().map(|r| r.peer.clone());
                 for record in l7_conns.on_segment_hinted(&seg, proto, flip) {
-                    let Some(service) = routing.service_for(pid) else {
-                        continue; // PID no longer targeted (raced with removal)
-                    };
                     l7_red.observe(service, &record);
                     span_seq = span_seq.wrapping_add(1);
                     let ctx = SpanContext {
@@ -543,25 +1012,30 @@ pub async fn run(
     }
 }
 
-fn record_listener_delta(state: &mut ListenerState, listener: CapturedListener) {
+fn record_listener_delta(state: &mut ListenerState, listener: CapturedListener) -> bool {
+    let was_ready = state.is_ready();
     let association = ListenerAssociation {
         family: listener.family,
         port: listener.port,
         cgroup_id: listener.cgroup_id,
     };
-    match state.record_delta(
-        association,
-        listener.observed_at_ns,
-        MAX_PORT_CGROUP_ASSOCIATIONS,
-        MAX_BUFFERED_LISTENER_DELTAS,
-    ) {
-        DeltaOutcome::Inserted => {
+    match state.record_delta(association, listener.observed_at_ns) {
+        DeltaOutcome::Invalidated => {
+            warn!(
+                port = listener.port,
+                family = listener.family,
+                cgroup_id = listener.cgroup_id,
+                tgid = listener.tgid,
+                "eBPF: unclassified listener change invalidated ownership until the next snapshot"
+            );
+        }
+        DeltaOutcome::Quarantined => {
             debug!(
                 port = listener.port,
                 family = listener.family,
                 cgroup_id = listener.cgroup_id,
                 tgid = listener.tgid,
-                "eBPF: discovered listener (port→cgroup)"
+                "eBPF: quarantined unclassified listener change pending an authoritative snapshot"
             );
         }
         DeltaOutcome::IgnoredInvalid => {
@@ -573,24 +1047,9 @@ fn record_listener_delta(state: &mut ListenerState, listener: CapturedListener) 
                 "eBPF: ignored invalid listener ownership delta"
             );
         }
-        DeltaOutcome::AtCapacity { should_warn: true } => {
-            warn!(
-                limit = MAX_PORT_CGROUP_ASSOCIATIONS,
-                "eBPF: listener ownership capacity reached; dropping new associations until the next snapshot"
-            );
-        }
-        DeltaOutcome::BufferAtCapacity { should_warn: true } => {
-            warn!(
-                limit = MAX_BUFFERED_LISTENER_DELTAS,
-                "eBPF: listener snapshot replay capacity reached; snapshot will fail closed"
-            );
-        }
-        DeltaOutcome::AlreadyPresent
-        | DeltaOutcome::Buffered
-        | DeltaOutcome::IgnoredBeforeCut
-        | DeltaOutcome::AtCapacity { should_warn: false }
-        | DeltaOutcome::BufferAtCapacity { should_warn: false } => {}
+        DeltaOutcome::IgnoredBeforeCut => {}
     }
+    was_ready && !state.is_ready()
 }
 
 async fn drain_listener_until_fence(
@@ -612,7 +1071,12 @@ async fn drain_listener_until_fence(
                     let Ok(listener) = listener_rx.try_recv() else {
                         break;
                     };
-                    record_listener_delta(state, listener);
+                    if record_listener_delta(state, listener) {
+                        return Err(
+                            "listener ownership invalidated while draining the publication fence"
+                                .to_string(),
+                        );
+                    }
                 }
                 return Ok(());
             }
@@ -620,31 +1084,189 @@ async fn drain_listener_until_fence(
                 let Some(listener) = listener else {
                     return Err("listener event channel closed before fence acknowledgement".to_string());
                 };
-                record_listener_delta(state, listener);
+                if record_listener_delta(state, listener) {
+                    return Err(
+                        "listener ownership invalidated while draining the publication fence"
+                            .to_string(),
+                    );
+                }
             }
         }
     }
 }
 
+async fn drain_listener_until_publication_stable<Observe, Fence>(
+    capture_generation: u64,
+    mut observation: ListenerObservation,
+    mut observe: Observe,
+    mut fence: Fence,
+    listener_rx: &mut mpsc::Receiver<CapturedListener>,
+    state: &mut ListenerState,
+) -> Result<ListenerObservation, StableListenerFenceError>
+where
+    Observe: FnMut() -> Result<ListenerObservation, String>,
+    Fence: FnMut(Vec<u64>) -> Result<oneshot::Receiver<Result<(), String>>, String>,
+{
+    for _ in 0..MAX_LISTENER_FENCE_PASSES {
+        let sampled_counts = observation.published_counts.clone();
+        let receiver = fence(sampled_counts.clone()).map_err(StableListenerFenceError::Fatal)?;
+        tokio::time::timeout(
+            LISTENER_DRAIN_FENCE_TIMEOUT,
+            drain_listener_until_fence(receiver, listener_rx, state),
+        )
+        .await
+        .map_err(|_| {
+            StableListenerFenceError::Fatal(format!(
+                "listener drain fence timed out after {LISTENER_DRAIN_FENCE_TIMEOUT:?}"
+            ))
+        })?
+        .map_err(StableListenerFenceError::Fatal)?;
+
+        let next = observe().map_err(StableListenerFenceError::Fatal)?;
+        if next.generation != capture_generation {
+            return Err(StableListenerFenceError::CaptureRestarted {
+                before: capture_generation,
+                after: next.generation,
+            });
+        }
+        if listener_publication_counts_are_stable(&sampled_counts, &next.published_counts)
+            .map_err(StableListenerFenceError::Fatal)?
+        {
+            return Ok(next);
+        }
+        observation = next;
+    }
+
+    Err(StableListenerFenceError::Fatal(format!(
+        "listener publications did not quiesce after {MAX_LISTENER_FENCE_PASSES} drain fences"
+    )))
+}
+
+fn listener_publication_counts_are_stable(
+    sampled: &[u64],
+    observed: &[u64],
+) -> Result<bool, String> {
+    if sampled.len() != observed.len() {
+        return Err(format!(
+            "listener publication CPU count changed from {} to {}",
+            sampled.len(),
+            observed.len()
+        ));
+    }
+    if let Some((cpu, (before, after))) = sampled
+        .iter()
+        .zip(observed)
+        .enumerate()
+        .find(|(_, (before, after))| after < before)
+    {
+        return Err(format!(
+            "listener publication count regressed on CPU {cpu} from {before} to {after}"
+        ));
+    }
+    Ok(sampled == observed)
+}
+
+struct CaptureAuthorizationRefs<'a> {
+    pid_routing: &'a mut PidRouting,
+    cgroup_routing: &'a mut CgroupRouting,
+    listener_state: &'a mut ListenerState,
+    listener_config_hash: &'a mut Option<String>,
+    listener_targets: &'a mut Vec<EbpfTargetConfig>,
+    active_listener_generation: &'a mut Option<u64>,
+    l7_conns: &'a mut ConnRegistry,
+    port_hints: &'a mut HashMap<CapturedConnectionIdentity, Option<socket_port::ResolvedConn>>,
+}
+
 async fn fail_listener_capture(
     manager: &mut EbpfManager<AyaCaptureProgram>,
-    routing: &mut PidRouting,
-    listener_state: &mut ListenerState,
-    listener_config_hash: &mut Option<String>,
-    active_listener_generation: &mut Option<u64>,
+    authorization: CaptureAuthorizationRefs<'_>,
     status: &SharedEbpfStatus,
     error: String,
 ) {
     manager.shutdown();
-    *routing = PidRouting::default();
-    listener_state.reset();
-    *listener_config_hash = None;
-    *active_listener_generation = None;
+    *authorization.pid_routing = PidRouting::default();
+    *authorization.cgroup_routing = CgroupRouting::default();
+    authorization.listener_state.reset();
+    *authorization.listener_config_hash = None;
+    authorization.listener_targets.clear();
+    *authorization.active_listener_generation = None;
+    *authorization.l7_conns = ConnRegistry::new();
+    authorization.port_hints.clear();
     let mut guard = status.write().await;
     guard.running = false;
     guard.last_error = Some(error.clone());
     guard.pids_targeted = 0;
+    guard.cgroups_targeted = 0;
     warn!(%error, "eBPF: listener snapshot verification failed; capture unloaded");
+}
+
+fn clear_cgroup_authorization(
+    manager: &mut EbpfManager<AyaCaptureProgram>,
+    routing: &mut CgroupRouting,
+) -> Result<(), String> {
+    if routing.is_empty() {
+        return Ok(());
+    }
+
+    let empty = CgroupRouting::default();
+    let result = manager.set_allowed_cgroups(&empty);
+    *routing = empty;
+    result
+}
+
+fn clear_cgroup_authorization_and_l7(
+    manager: &mut EbpfManager<AyaCaptureProgram>,
+    routing: &mut CgroupRouting,
+    l7_conns: &mut ConnRegistry,
+    port_hints: &mut HashMap<CapturedConnectionIdentity, Option<socket_port::ResolvedConn>>,
+) -> Result<(), String> {
+    let result = clear_cgroup_authorization(manager, routing);
+    *l7_conns = ConnRegistry::new();
+    port_hints.clear();
+    result
+}
+
+fn publish_revalidated_cgroups<Validate, Publish>(
+    routing: &CgroupRouting,
+    mut revalidate: Validate,
+    publish: Publish,
+) -> Result<(), String>
+where
+    Validate: FnMut(&CgroupRouting) -> Result<(), String>,
+    Publish: FnOnce(&CgroupRouting) -> Result<(), String>,
+{
+    revalidate(routing)?;
+    publish(routing)?;
+    revalidate(routing)
+}
+
+fn cgroup_publication_is_required(active: &CgroupRouting, desired: &CgroupRouting) -> bool {
+    !desired.same_authorization_as(active)
+}
+
+async fn clear_unready_cgroup_authorization(
+    manager: &mut EbpfManager<AyaCaptureProgram>,
+    authorization: CaptureAuthorizationRefs<'_>,
+    status: &SharedEbpfStatus,
+) -> bool {
+    if listener_authorization_is_available(authorization.listener_state)
+        || authorization.cgroup_routing.is_empty()
+    {
+        return false;
+    }
+
+    let result = clear_cgroup_authorization_and_l7(
+        manager,
+        &mut *authorization.cgroup_routing,
+        &mut *authorization.l7_conns,
+        &mut *authorization.port_hints,
+    );
+    let Err(error) = result else {
+        status.write().await.cgroups_targeted = 0;
+        return false;
+    };
+    fail_listener_capture(manager, authorization, status, error).await;
+    true
 }
 
 async fn start_listener_snapshot(
@@ -654,7 +1276,7 @@ async fn start_listener_snapshot(
     tx: mpsc::Sender<ListenerSnapshotResult>,
     worker_running: Arc<AtomicBool>,
 ) -> Result<(), String> {
-    let reservation = reserve_snapshot_worker(worker_running)?;
+    let reservation = reserve_worker(worker_running)?;
 
     let container_snapshot = {
         let cache = discovery_cache.read().await;
@@ -666,7 +1288,7 @@ async fn start_listener_snapshot(
     let state_generation = state
         .begin_snapshot_with_loss(cut_ns, observation.drop_counts)
         .ok_or_else(|| "listener snapshot already running".to_string())?;
-    let discovery_epoch = container_snapshot.epoch;
+    let authorization_revision = container_snapshot.authorization_revision;
     let containers = container_snapshot.containers;
     let deadline = std::time::Instant::now() + LISTENER_SNAPSHOT_TIMEOUT;
 
@@ -687,7 +1309,7 @@ async fn start_listener_snapshot(
             let _ = tx
                 .send(ListenerSnapshotResult {
                     state_generation,
-                    discovery_epoch,
+                    authorization_revision,
                     capture_generation,
                     result,
                 })
@@ -696,7 +1318,7 @@ async fn start_listener_snapshot(
             let _ = tx
                 .send(ListenerSnapshotResult {
                     state_generation,
-                    discovery_epoch,
+                    authorization_revision,
                     capture_generation,
                     result: Err(format!(
                         "listener snapshot timed out after {LISTENER_SNAPSHOT_TIMEOUT:?}"
@@ -711,6 +1333,74 @@ async fn start_listener_snapshot(
         }
     });
     Ok(())
+}
+
+fn start_cgroup_resolution(
+    key: CgroupResolutionKey,
+    containers: Vec<crate::discovery::Container>,
+    targets: Vec<EbpfTargetConfig>,
+    listener_state: ListenerState,
+    tx: mpsc::Sender<CgroupResolutionResult>,
+    worker_running: Arc<AtomicBool>,
+) -> Result<(), String> {
+    let reservation = reserve_worker(worker_running)?;
+    tokio::spawn(async move {
+        let _reservation = reservation;
+        let mut worker = tokio::task::spawn_blocking(move || {
+            let routing = cgroup_resolver::resolve_from_listener_state(
+                &containers,
+                &targets,
+                &listener_state,
+                key.authorization_revision,
+            )?;
+            // Refresh the complete attestation set at the end of the blocking
+            // work. The common unchanged-policy path can then keep the active
+            // map without doing filesystem I/O on the runner loop.
+            routing.revalidate_runtime_identities()?;
+            Ok(routing)
+        });
+        let result = tokio::select! {
+            result = &mut worker => Some(
+                result
+                    .map_err(|error| format!("cgroup resolution worker failed: {error}"))
+                    .and_then(|result| result),
+            ),
+            _ = tokio::time::sleep(CGROUP_RESOLUTION_TIMEOUT) => None,
+        };
+
+        if let Some(result) = result {
+            let _ = tx.send(CgroupResolutionResult { key, result }).await;
+        } else {
+            let _ = tx
+                .send(CgroupResolutionResult {
+                    key,
+                    result: Err(format!(
+                        "cgroup resolution timed out after {CGROUP_RESOLUTION_TIMEOUT:?}"
+                    )),
+                })
+                .await;
+            // `spawn_blocking` cannot cancel a running filesystem walk. Keep
+            // the reservation until it exits so timeouts cannot accumulate
+            // overlapping authorization workers.
+            let _ = worker.await;
+        }
+    });
+    Ok(())
+}
+
+fn listener_authorization_is_available(state: &ListenerState) -> bool {
+    state.authorization_generation().is_some()
+}
+
+fn cgroup_resolution_is_current(
+    key: CgroupResolutionKey,
+    listener_state: &ListenerState,
+    active_capture_generation: Option<u64>,
+    current_authorization_revision: u64,
+) -> bool {
+    key.authorization_revision == current_authorization_revision
+        && active_capture_generation == Some(key.capture_generation)
+        && listener_state.publishable_authorization_generation() == Some(key.listener_generation)
 }
 
 fn listener_health_failed(health: ListenerDrainHealth, active_generation: Option<u64>) -> bool {
@@ -943,6 +1633,77 @@ fn create_delivery(
     })
 }
 
+fn route_captured_event<'a>(
+    pid_routing: &'a PidRouting,
+    cgroup_routing: &'a CgroupRouting,
+    pid: u32,
+    scope_cgroup_id: u64,
+    policy_generation: u64,
+) -> Option<&'a str> {
+    let pid_service = pid_routing.service_for(pid);
+    if scope_cgroup_id == 0 {
+        if policy_generation == 0 || pid_routing.policy_generation() != Some(policy_generation) {
+            warn!(
+                pid,
+                policy_generation,
+                current_policy_generation = ?pid_routing.policy_generation(),
+                "eBPF: PID-authorized event has a stale policy generation; dropping captured event"
+            );
+            return None;
+        }
+        return pid_service;
+    }
+
+    if policy_generation == 0 || cgroup_routing.policy_generation() != Some(policy_generation) {
+        warn!(
+            pid,
+            scope_cgroup_id,
+            policy_generation,
+            current_policy_generation = ?cgroup_routing.policy_generation(),
+            "eBPF: cgroup-authorized event has a stale policy generation; dropping captured event"
+        );
+        return None;
+    }
+
+    let cgroup_service = cgroup_routing.service_for(scope_cgroup_id);
+
+    match (pid_service, cgroup_service) {
+        (Some(pid_service), Some(cgroup_service)) if pid_service != cgroup_service => {
+            warn!(
+                pid,
+                scope_cgroup_id,
+                pid_service,
+                cgroup_service,
+                "eBPF: conflicting PID and cgroup routing; dropping captured event"
+            );
+            None
+        }
+        (Some(service), Some(_)) | (None, Some(service)) => Some(service),
+        (Some(_), None) => {
+            warn!(
+                pid,
+                scope_cgroup_id,
+                "eBPF: cgroup-authorized event has no current scope routing; dropping captured event"
+            );
+            None
+        }
+        (None, None) => None,
+    }
+}
+
+fn capture_generation_is_current(record_generation: u64, active_generation: Option<u64>) -> bool {
+    record_generation != 0 && active_generation == Some(record_generation)
+}
+
+fn authorization_generation_changed(
+    previous_capture: Option<u64>,
+    current_capture: Option<u64>,
+    previous_pid_policy: Option<u64>,
+    current_pid_policy: Option<u64>,
+) -> bool {
+    previous_capture != current_capture || previous_pid_policy != current_pid_policy
+}
+
 fn now_ns() -> i64 {
     let Ok(duration) = SystemTime::now().duration_since(UNIX_EPOCH) else {
         return 0;
@@ -957,6 +1718,90 @@ fn sanitize_id(id: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ebpf::cgroup_resolver::CgroupAnchor;
+
+    fn cgroup_routing(service: &str) -> CgroupRouting {
+        CgroupRouting::from_entries(7, [(CgroupAnchor { id: 42, level: 3 }, service)]).unwrap()
+    }
+
+    #[test]
+    fn captured_event_routes_by_whichever_authorized_identity_is_present() {
+        let pid = PidRouting::from_entries([(11, "source")]).unwrap();
+        let cgroup = cgroup_routing("source");
+
+        assert_eq!(
+            route_captured_event(&pid, &CgroupRouting::default(), 11, 0, 1),
+            Some("source")
+        );
+        assert_eq!(
+            route_captured_event(&PidRouting::default(), &cgroup, 99, 42, 7),
+            Some("source")
+        );
+        assert_eq!(
+            route_captured_event(&pid, &cgroup, 11, 42, 7),
+            Some("source")
+        );
+        assert_eq!(route_captured_event(&pid, &cgroup, 11, 999, 7), None);
+        assert_eq!(
+            route_captured_event(&PidRouting::default(), &CgroupRouting::default(), 99, 0, 0),
+            None
+        );
+    }
+
+    #[test]
+    fn captured_event_drops_conflicting_pid_and_cgroup_attribution() {
+        let pid = PidRouting::from_entries([(11, "pid-source")]).unwrap();
+        let cgroup = cgroup_routing("cgroup-source");
+
+        assert_eq!(route_captured_event(&pid, &cgroup, 11, 42, 7), None);
+    }
+
+    #[test]
+    fn captured_event_drops_stale_or_malformed_policy_generation() {
+        let pid = PidRouting::from_entries([(11, "source")]).unwrap();
+        let cgroup = cgroup_routing("source");
+
+        assert_eq!(route_captured_event(&pid, &cgroup, 11, 42, 6), None);
+        assert_eq!(route_captured_event(&pid, &cgroup, 11, 42, 0), None);
+        assert_eq!(route_captured_event(&pid, &cgroup, 11, 0, 7), None);
+        assert_eq!(route_captured_event(&pid, &cgroup, 11, 0, 0), None);
+    }
+
+    #[test]
+    fn capture_generation_must_match_the_current_loaded_program() {
+        assert!(capture_generation_is_current(7, Some(7)));
+        assert!(!capture_generation_is_current(6, Some(7)));
+        assert!(!capture_generation_is_current(0, Some(7)));
+        assert!(!capture_generation_is_current(7, None));
+    }
+
+    #[test]
+    fn l7_state_resets_when_capture_or_pid_authorization_generation_changes() {
+        assert!(!authorization_generation_changed(
+            Some(7),
+            Some(7),
+            Some(11),
+            Some(11)
+        ));
+        assert!(authorization_generation_changed(
+            Some(7),
+            Some(7),
+            Some(11),
+            Some(12)
+        ));
+        assert!(authorization_generation_changed(
+            Some(7),
+            Some(8),
+            Some(11),
+            Some(11)
+        ));
+        assert!(authorization_generation_changed(
+            Some(7),
+            Some(7),
+            Some(11),
+            None
+        ));
+    }
 
     #[test]
     fn stale_listener_health_cannot_fail_a_replacement_generation() {
@@ -979,16 +1824,140 @@ mod tests {
     #[test]
     fn snapshot_worker_reservation_prevents_overlap_until_the_worker_exits() {
         let running = Arc::new(AtomicBool::new(false));
-        let reservation = reserve_snapshot_worker(Arc::clone(&running)).unwrap();
-        assert!(reserve_snapshot_worker(Arc::clone(&running)).is_err());
+        let reservation = reserve_worker(Arc::clone(&running)).unwrap();
+        assert!(reserve_worker(Arc::clone(&running)).is_err());
 
         drop(reservation);
 
-        assert!(reserve_snapshot_worker(running).is_ok());
+        assert!(reserve_worker(running).is_ok());
+    }
+
+    #[test]
+    fn cgroup_resolution_result_requires_current_listener_capture_and_inventory() {
+        let mut state = ListenerState::default();
+        let listener_generation = state.begin_snapshot(100).unwrap();
+        state
+            .apply_snapshot(
+                listener_generation,
+                ListenerSnapshot::new(1, [], []).unwrap(),
+                MAX_PORT_CGROUP_ASSOCIATIONS,
+            )
+            .unwrap();
+        let key = CgroupResolutionKey {
+            listener_generation,
+            authorization_revision: 11,
+            capture_generation: 7,
+        };
+
+        assert!(cgroup_resolution_is_current(key, &state, Some(7), 11));
+        assert!(!cgroup_resolution_is_current(key, &state, Some(8), 11));
+        assert!(!cgroup_resolution_is_current(key, &state, Some(7), 12));
+
+        assert_eq!(
+            state.record_delta(
+                ListenerAssociation {
+                    family: libc::AF_INET as u16,
+                    port: 8080,
+                    cgroup_id: 42,
+                },
+                101,
+            ),
+            DeltaOutcome::Invalidated
+        );
+        assert!(!cgroup_resolution_is_current(key, &state, Some(7), 11));
+    }
+
+    #[test]
+    fn replacement_snapshot_preserves_policy_but_makes_prior_resolution_stale() {
+        let mut state = ListenerState::default();
+        let listener_generation = state.begin_snapshot(100).unwrap();
+        state
+            .apply_snapshot(
+                listener_generation,
+                ListenerSnapshot::new(1, [], []).unwrap(),
+                MAX_PORT_CGROUP_ASSOCIATIONS,
+            )
+            .unwrap();
+        let key = CgroupResolutionKey {
+            listener_generation,
+            authorization_revision: 11,
+            capture_generation: 7,
+        };
+        let listener_revision = state.authorization_revision().unwrap();
+
+        assert!(listener_authorization_is_available(&state));
+
+        let replacement = state.begin_snapshot(200).unwrap();
+
+        assert!(
+            listener_authorization_is_available(&state),
+            "the last applied policy remains valid while its replacement is collected"
+        );
+        assert!(!cgroup_resolution_is_current(key, &state, Some(7), 11));
+
+        state
+            .apply_snapshot(
+                replacement,
+                ListenerSnapshot::new(1, [], []).unwrap(),
+                MAX_PORT_CGROUP_ASSOCIATIONS,
+            )
+            .unwrap();
+        assert_eq!(state.authorization_revision(), Some(listener_revision));
+        assert!(listener_authorization_is_available(&state));
+        assert!(cgroup_resolution_is_current(
+            CgroupResolutionKey {
+                listener_generation: replacement,
+                ..key
+            },
+            &state,
+            Some(7),
+            11,
+        ));
+    }
+
+    #[test]
+    fn cgroup_publication_rejects_runtime_move_after_map_write() {
+        let routing = cgroup_routing("source");
+        let mut validations = 0;
+        let mut published = false;
+
+        let error = publish_revalidated_cgroups(
+            &routing,
+            |_| {
+                validations += 1;
+                if validations == 2 {
+                    Err("runtime moved after publication".to_string())
+                } else {
+                    Ok(())
+                }
+            },
+            |_| {
+                published = true;
+                Ok(())
+            },
+        )
+        .unwrap_err();
+
+        assert!(published);
+        assert_eq!(validations, 2);
+        assert_eq!(error, "runtime moved after publication");
+    }
+
+    #[test]
+    fn unchanged_cgroup_authorization_skips_map_publication() {
+        let mut active = cgroup_routing("source");
+        active.assign_policy_generation(99).unwrap();
+        let desired = cgroup_routing("source");
+
+        assert!(!cgroup_publication_is_required(&active, &desired));
+        assert!(cgroup_publication_is_required(
+            &active,
+            &cgroup_routing("other-source")
+        ));
     }
 
     #[tokio::test]
-    async fn fence_ack_consumes_already_queued_listener_before_readiness() {
+    async fn fence_ack_quarantines_already_queued_unclassified_listener() {
         let mut state = ListenerState::default();
         let generation = state.begin_snapshot(100).unwrap();
         let (listener_tx, mut listener_rx) = mpsc::channel(1);
@@ -1008,17 +1977,63 @@ mod tests {
         drain_listener_until_fence(fence_rx, &mut listener_rx, &mut state)
             .await
             .unwrap();
-        state
+        let error = state
             .apply_snapshot(
                 generation,
                 ListenerSnapshot::new(1, [], []).unwrap(),
                 MAX_PORT_CGROUP_ASSOCIATIONS,
             )
-            .unwrap();
+            .unwrap_err();
 
-        assert_eq!(
-            state.cgroups_for_port(8080),
-            std::collections::HashSet::from([42])
-        );
+        assert!(error.contains("unclassified listener change"), "{error}");
+        assert!(!state.is_ready());
+        assert!(state.cgroups_for_port(8080).is_empty());
+    }
+
+    #[tokio::test]
+    async fn late_listener_publication_requires_another_drain_fence() {
+        let observations = std::cell::RefCell::new(std::collections::VecDeque::from([
+            ListenerObservation {
+                generation: 7,
+                drop_counts: vec![0],
+                published_counts: vec![2],
+            },
+            ListenerObservation {
+                generation: 7,
+                drop_counts: vec![0],
+                published_counts: vec![2],
+            },
+        ]));
+        let fenced_counts = std::cell::RefCell::new(Vec::new());
+        let (_listener_tx, mut listener_rx) = mpsc::channel(1);
+        let mut state = ListenerState::default();
+
+        let stable = drain_listener_until_publication_stable(
+            7,
+            ListenerObservation {
+                generation: 7,
+                drop_counts: vec![0],
+                published_counts: vec![1],
+            },
+            || {
+                observations
+                    .borrow_mut()
+                    .pop_front()
+                    .ok_or_else(|| "missing scripted listener observation".to_string())
+            },
+            |counts| {
+                fenced_counts.borrow_mut().push(counts);
+                let (ack, receiver) = oneshot::channel();
+                ack.send(Ok(())).unwrap();
+                Ok(receiver)
+            },
+            &mut listener_rx,
+            &mut state,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(stable.published_counts, vec![2]);
+        assert_eq!(*fenced_counts.borrow(), vec![vec![1], vec![2]]);
     }
 }

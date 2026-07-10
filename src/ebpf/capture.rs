@@ -1,9 +1,7 @@
-//! Aya-backed [`CaptureProgram`] + the ring drains — the single boundary between
-//! the manager and the kernel. Loads the embedded BPF object, attaches the
-//! capture tracepoints, mirrors the resolved [`PidRouting`] into the kernel
-//! `TARGET_PIDS` filter, and forwards captured write payloads as [`CapturedLine`]s
-//! and (when network flows are enabled) outbound connects as [`CapturedFlow`]s
-//! over mpsc channels the runner routes by PID → service.
+//! Aya-backed [`CaptureProgram`] + ring drains: the boundary between the manager
+//! and kernel. It loads the embedded object, mirrors additive PID and cgroup
+//! authorization policies into kernel maps, and forwards captured records with
+//! their capture and policy identities for fail-closed userspace routing.
 //!
 //! Linux + `ebpf` only (it links aya). The reconcile orchestration that drives
 //! it lives in `manager.rs` and is tested on every platform via a fake.
@@ -13,7 +11,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use aya::Ebpf;
-use aya::maps::{HashMap as AyaHashMap, MapData, MapError, PerCpuArray, RingBuf};
+use aya::maps::{
+    Array as AyaArray, HashMap as AyaHashMap, MapData, MapError, PerCpuArray, RingBuf,
+};
 use aya::programs::{TracePoint, UProbe};
 use tokio::io::unix::AsyncFd;
 use tokio::sync::{mpsc, oneshot, watch};
@@ -21,10 +21,12 @@ use tokio::task::JoinHandle;
 use tracing::warn;
 
 use edgepacer_ebpf_common::{
-    CHUNK_LEN, ConnectEvent, L7_CHUNK_LEN, L7_DIR_INBOUND, L7Chunk, ListenerEvent, LogChunk,
-    TlsChunk,
+    CGROUP_MAX_LEVEL_SHIFT, CGROUP_MIN_LEVEL_SHIFT, CGROUP_SELECTOR_GENERATION_MASK,
+    CGROUP_SELECTOR_SLOT_SHIFT, CHUNK_LEN, ConnectEvent, L7_CHUNK_LEN, L7_DIR_INBOUND, L7Chunk,
+    ListenerEvent, LogChunk, MAX_ALLOWED_CGROUPS, MAX_CGROUP_ANCESTOR_LEVEL, TlsChunk,
 };
 
+use super::cgroup_resolver::{CgroupAnchor, CgroupRouting};
 use super::l7::{CapturedSegment, Direction};
 use super::manager::{CaptureProgram, ListenerObservation};
 use super::pid_resolver::PidRouting;
@@ -76,28 +78,36 @@ const L7_READ_EXIT: (&str, &[(&str, &str)]) = (
 // layout crate that the kernel BPF program (bpf/) also uses, so the ring-buffer wire
 // layout has a single source of truth and can't drift from a hand-mirrored copy.
 
-/// One captured `write(2)` payload, routed to a service by `pid` downstream.
+/// One captured `write(2)` payload, routed by its authorizing identity downstream.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CapturedLine {
+    pub capture_generation: u64,
     pub pid: u32,
     pub cgroup_id: u64,
+    pub scope_cgroup_id: u64,
+    pub policy_generation: u64,
     pub fd: u32,
     pub bytes: Vec<u8>,
 }
 
-/// One captured outbound `connect(2)` (network-flow signal), routed by `pid`.
+/// One captured outbound `connect(2)` (network-flow signal), routed by its
+/// authorizing identity.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CapturedFlow {
+    pub capture_generation: u64,
     pub pid: u32,
     pub cgroup_id: u64,
+    pub scope_cgroup_id: u64,
+    pub policy_generation: u64,
     pub daddr: [u8; 4],
     pub dport: u16,
     pub family: u16,
 }
 
 /// One successful TCP listener transition — the event-driven port→cgroup
-/// discovery signal. Userspace combines these live events with an authoritative
-/// snapshot before using listener ownership for capture scoping.
+/// discovery signal. Because these events lack network-namespace provenance,
+/// userspace uses them to invalidate ownership and refresh the authoritative
+/// snapshot; they never become authorization evidence directly.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CapturedListener {
     pub cgroup_id: u64,
@@ -124,19 +134,32 @@ impl ListenerDrainHealth {
 
 const MAX_OUT_OF_ORDER_LISTENER_SEQUENCES: usize = 16_384;
 const MAX_LISTENER_SEQUENCE_CPUS: usize = 4_096;
+#[derive(Debug, PartialEq, Eq)]
+struct CgroupPolicy {
+    ids: HashSet<u64>,
+    level_policy: u64,
+    generation: u64,
+}
 
 /// Live aya state held while capture is loaded.
 struct Loaded {
     // Held for its `Drop`: dropping the `Ebpf` detaches every attached program.
     #[allow(dead_code)]
     ebpf: Ebpf,
-    target_pids: AyaHashMap<MapData, u32, u8>,
+    target_pids: AyaHashMap<MapData, u32, u64>,
+    allowed_cgroups: [AyaHashMap<MapData, u64, u64>; 2],
+    allowed_cgroup_levels: [AyaArray<MapData, u64>; 2],
+    active_cgroup_slot: AyaArray<MapData, u64>,
     listener_drops: PerCpuArray<MapData, u64>,
     listener_published: PerCpuArray<MapData, u64>,
     listener_generation: u64,
     listener_fence_tx: mpsc::Sender<ListenerFence>,
     /// PIDs currently written into the kernel filter, to diff on the next refresh.
-    seeded: HashSet<u32>,
+    seeded: HashMap<u32, u64>,
+    seeded_allowed_cgroups: [HashSet<u64>; 2],
+    seeded_allowed_cgroup_levels: [u64; 2],
+    seeded_allowed_cgroup_generations: [u64; 2],
+    active_cgroup_slot_index: usize,
     /// Cleared if the mandatory listener drain exits after start-up.
     listener_drain_running: Arc<AtomicBool>,
     /// Active ring drains, all sharing the same stop lifecycle.
@@ -214,6 +237,8 @@ impl AyaCaptureProgram {
 
 impl CaptureProgram for AyaCaptureProgram {
     fn start(&mut self, section: &EbpfSectionConfig) -> Result<(), String> {
+        super::cgroup_v2::validate_environment()
+            .map_err(|error| format!("cgroup v2 required for eBPF capture scoping: {error}"))?;
         let mut ebpf = Ebpf::load(BPF_OBJECT).map_err(|e| format!("load BPF object: {e}"))?;
 
         attach_tracepoint(&mut ebpf, CAPTURE_WRITE)?;
@@ -300,6 +325,47 @@ impl CaptureProgram for AyaCaptureProgram {
         let target_pids =
             AyaHashMap::try_from(target_map).map_err(|e| format!("open TARGET_PIDS map: {e}"))?;
 
+        let allowed_cgroups_a = ebpf
+            .take_map("ALLOWED_CGROUPS_A")
+            .ok_or("BPF map ALLOWED_CGROUPS_A not found")?;
+        let allowed_cgroups_a = AyaHashMap::try_from(allowed_cgroups_a)
+            .map_err(|e| format!("open ALLOWED_CGROUPS_A map: {e}"))?;
+        let allowed_cgroups_b = ebpf
+            .take_map("ALLOWED_CGROUPS_B")
+            .ok_or("BPF map ALLOWED_CGROUPS_B not found")?;
+        let allowed_cgroups_b = AyaHashMap::try_from(allowed_cgroups_b)
+            .map_err(|e| format!("open ALLOWED_CGROUPS_B map: {e}"))?;
+        let allowed_cgroup_levels_a = ebpf
+            .take_map("ALLOWED_CGROUP_LEVELS_A")
+            .ok_or("BPF map ALLOWED_CGROUP_LEVELS_A not found")?;
+        let allowed_cgroup_levels_a = AyaArray::try_from(allowed_cgroup_levels_a)
+            .map_err(|e| format!("open ALLOWED_CGROUP_LEVELS_A map: {e}"))?;
+        let allowed_cgroup_levels_b = ebpf
+            .take_map("ALLOWED_CGROUP_LEVELS_B")
+            .ok_or("BPF map ALLOWED_CGROUP_LEVELS_B not found")?;
+        let allowed_cgroup_levels_b = AyaArray::try_from(allowed_cgroup_levels_b)
+            .map_err(|e| format!("open ALLOWED_CGROUP_LEVELS_B map: {e}"))?;
+        let active_cgroup_slot = ebpf
+            .take_map("ACTIVE_CGROUP_SLOT")
+            .ok_or("BPF map ACTIVE_CGROUP_SLOT not found")?;
+        let active_cgroup_slot = AyaArray::try_from(active_cgroup_slot)
+            .map_err(|e| format!("open ACTIVE_CGROUP_SLOT map: {e}"))?;
+        let active_cgroup_selector = active_cgroup_slot
+            .get(&0, 0)
+            .map_err(|e| format!("read ACTIVE_CGROUP_SLOT: {e}"))?;
+        let (active_cgroup_slot_index, active_cgroup_generation) =
+            unpack_cgroup_selector(active_cgroup_selector);
+        let seeded_allowed_cgroup_levels = [
+            allowed_cgroup_levels_a
+                .get(&0, 0)
+                .map_err(|e| format!("read ALLOWED_CGROUP_LEVELS_A: {e}"))?,
+            allowed_cgroup_levels_b
+                .get(&0, 0)
+                .map_err(|e| format!("read ALLOWED_CGROUP_LEVELS_B: {e}"))?,
+        ];
+        let mut seeded_allowed_cgroup_generations = [0, 0];
+        seeded_allowed_cgroup_generations[active_cgroup_slot_index] = active_cgroup_generation;
+
         // Start drains only after every required program and map is ready. If a
         // later attach/open fails, returning here must not leave orphan tasks
         // polling rings that `self.loaded` never took ownership of.
@@ -316,24 +382,47 @@ impl CaptureProgram for AyaCaptureProgram {
             listener_fence_rx,
         )?;
         let mut drains = Vec::with_capacity(5);
-        drains.push(spawn_drain(ring, self.captured_tx.clone()));
+        drains.push(spawn_drain(
+            ring,
+            self.captured_tx.clone(),
+            listener_generation,
+        ));
         drains.push(listener_drain);
         if let Some(ring) = flow_ring {
-            drains.push(spawn_flow_drain(ring, self.flow_tx.clone()));
+            drains.push(spawn_flow_drain(
+                ring,
+                self.flow_tx.clone(),
+                listener_generation,
+            ));
         }
-        drains.push(spawn_l7_drain(l7_ring, self.l7_tx.clone()));
+        drains.push(spawn_l7_drain(
+            l7_ring,
+            self.l7_tx.clone(),
+            listener_generation,
+        ));
         if let Some(ring) = tls_ring {
-            drains.push(spawn_tls_drain(ring, self.l7_tx.clone()));
+            drains.push(spawn_tls_drain(
+                ring,
+                self.l7_tx.clone(),
+                listener_generation,
+            ));
         }
 
         self.loaded = Some(Loaded {
             ebpf,
             target_pids,
+            allowed_cgroups: [allowed_cgroups_a, allowed_cgroups_b],
+            allowed_cgroup_levels: [allowed_cgroup_levels_a, allowed_cgroup_levels_b],
+            active_cgroup_slot,
             listener_drops,
             listener_published,
             listener_generation,
             listener_fence_tx,
-            seeded: HashSet::new(),
+            seeded: HashMap::new(),
+            seeded_allowed_cgroups: [HashSet::new(), HashSet::new()],
+            seeded_allowed_cgroup_levels,
+            seeded_allowed_cgroup_generations,
+            active_cgroup_slot_index,
             listener_drain_running,
             drains,
         });
@@ -356,8 +445,35 @@ impl CaptureProgram for AyaCaptureProgram {
         ensure_listener_drain_running(&loaded.listener_drain_running)?;
 
         let desired: HashSet<u32> = routing.target_pids().collect();
-        let to_add: Vec<u32> = desired.difference(&loaded.seeded).copied().collect();
-        let to_remove: Vec<u32> = loaded.seeded.difference(&desired).copied().collect();
+        let generation = if desired.is_empty() {
+            if routing.policy_generation().is_some() {
+                return Err("empty PID routing must not carry a policy generation".to_string());
+            }
+            0
+        } else {
+            routing
+                .policy_generation()
+                .filter(|generation| *generation != 0)
+                .ok_or_else(|| "nonempty PID routing has no policy generation".to_string())?
+        };
+        if loaded.seeded.len() == desired.len()
+            && desired
+                .iter()
+                .all(|pid| loaded.seeded.get(pid) == Some(&generation))
+        {
+            return Ok(());
+        }
+        let to_add_tls: Vec<u32> = desired
+            .iter()
+            .filter(|pid| !loaded.seeded.contains_key(pid))
+            .copied()
+            .collect();
+        let to_remove: Vec<u32> = loaded
+            .seeded
+            .keys()
+            .filter(|pid| !desired.contains(pid))
+            .copied()
+            .collect();
 
         // Remove stale scope before adding new scope. If either syscall fails,
         // the manager unloads the whole program; ordering therefore minimizes
@@ -368,11 +484,13 @@ impl CaptureProgram for AyaCaptureProgram {
                 Err(error) => return Err(format!("remove pid {pid}: {error}")),
             }
         }
-        for pid in to_add {
+        for pid in &desired {
             loaded
                 .target_pids
-                .insert(pid, 0u8, 0)
+                .insert(*pid, generation, 0)
                 .map_err(|e| format!("seed pid {pid}: {e}"))?;
+        }
+        for pid in to_add_tls {
             // Per-target TLS: attach the uprobes to this process's bundled TLS libs
             // (Node static OpenSSL, Java BoringSSL) that the system-wide libssl
             // attach misses — the zero-config win for native-Java + Node TLS.
@@ -380,7 +498,77 @@ impl CaptureProgram for AyaCaptureProgram {
                 attach_tls_to_lib(&mut loaded.ebpf, &lib, pid as i32);
             }
         }
-        loaded.seeded = desired;
+        loaded.seeded = desired.into_iter().map(|pid| (pid, generation)).collect();
+        Ok(())
+    }
+
+    fn set_allowed_cgroups(&mut self, routing: &CgroupRouting) -> Result<(), String> {
+        let Some(loaded) = self.loaded.as_mut() else {
+            return Err("set_allowed_cgroups called while capture is stopped".to_string());
+        };
+        ensure_listener_drain_running(&loaded.listener_drain_running)?;
+
+        let desired = cgroup_policy_from_routing(routing)?;
+        let active = loaded.active_cgroup_slot_index;
+        if loaded.seeded_allowed_cgroups[active] == desired.ids
+            && loaded.seeded_allowed_cgroup_levels[active] == desired.level_policy
+            && loaded.seeded_allowed_cgroup_generations[active] == desired.generation
+        {
+            return Ok(());
+        }
+
+        let inactive = 1 - active;
+        let stale_ids: Vec<u64> = loaded.seeded_allowed_cgroups[inactive]
+            .iter()
+            .copied()
+            .collect();
+        for id in stale_ids {
+            match loaded.allowed_cgroups[inactive].remove(&id) {
+                Ok(()) | Err(MapError::KeyNotFound) => {
+                    loaded.seeded_allowed_cgroups[inactive].remove(&id);
+                }
+                Err(error) => {
+                    return Err(format!(
+                        "clear ALLOWED_CGROUPS_{} id {id}: {error}",
+                        cgroup_slot_name(inactive)
+                    ));
+                }
+            }
+        }
+        for id in &desired.ids {
+            loaded.allowed_cgroups[inactive]
+                .insert(*id, desired.generation, 0)
+                .map_err(|error| {
+                    format!(
+                        "seed ALLOWED_CGROUPS_{} id {id}: {error}",
+                        cgroup_slot_name(inactive)
+                    )
+                })?;
+            loaded.seeded_allowed_cgroups[inactive].insert(*id);
+        }
+        loaded.allowed_cgroup_levels[inactive]
+            .set(0, desired.level_policy, 0)
+            .map_err(|error| {
+                format!(
+                    "write ALLOWED_CGROUP_LEVELS_{}: {error}",
+                    cgroup_slot_name(inactive)
+                )
+            })?;
+        loaded.seeded_allowed_cgroup_levels[inactive] = desired.level_policy;
+        loaded.seeded_allowed_cgroup_generations[inactive] = desired.generation;
+
+        let selector = pack_cgroup_selector(inactive, desired.generation)?;
+        loaded
+            .active_cgroup_slot
+            .set(0, selector, 0)
+            .map_err(|error| {
+                format!(
+                    "publish ACTIVE_CGROUP_SLOT={} generation={}: {error}",
+                    cgroup_slot_name(inactive),
+                    desired.generation
+                )
+            })?;
+        loaded.active_cgroup_slot_index = inactive;
         Ok(())
     }
 
@@ -435,7 +623,11 @@ impl CaptureProgram for AyaCaptureProgram {
 /// Poll the `LOG_EVENTS` ring async, decode each `LogChunk`, and forward a
 /// `CapturedLine`. Exits when the consumer drops the channel or the task is
 /// aborted (on `stop()`).
-fn spawn_drain(ring: RingBuf<MapData>, tx: mpsc::Sender<CapturedLine>) -> JoinHandle<()> {
+fn spawn_drain(
+    ring: RingBuf<MapData>,
+    tx: mpsc::Sender<CapturedLine>,
+    capture_generation: u64,
+) -> JoinHandle<()> {
     tokio::spawn(async move {
         let mut async_fd = match AsyncFd::new(ring) {
             Ok(fd) => fd,
@@ -464,8 +656,11 @@ fn spawn_drain(ring: RingBuf<MapData>, tx: mpsc::Sender<CapturedLine>) -> JoinHa
                 let chunk = unsafe { std::ptr::read_unaligned(bytes.as_ptr() as *const LogChunk) };
                 let n = (chunk.len as usize).min(CHUNK_LEN);
                 let line = CapturedLine {
+                    capture_generation,
                     pid: chunk.pid,
                     cgroup_id: chunk.cgroup_id,
+                    scope_cgroup_id: chunk.scope_cgroup_id,
+                    policy_generation: chunk.policy_generation,
                     fd: chunk.fd,
                     bytes: chunk.data[..n].to_vec(),
                 };
@@ -481,7 +676,11 @@ fn spawn_drain(ring: RingBuf<MapData>, tx: mpsc::Sender<CapturedLine>) -> JoinHa
 /// Poll the `CONNECT_EVENTS` ring async, decode each `ConnectEvent`, and forward
 /// a `CapturedFlow`. Exits when the consumer drops the channel or the task is
 /// aborted (on `stop()`).
-fn spawn_flow_drain(ring: RingBuf<MapData>, tx: mpsc::Sender<CapturedFlow>) -> JoinHandle<()> {
+fn spawn_flow_drain(
+    ring: RingBuf<MapData>,
+    tx: mpsc::Sender<CapturedFlow>,
+    capture_generation: u64,
+) -> JoinHandle<()> {
     tokio::spawn(async move {
         let mut async_fd = match AsyncFd::new(ring) {
             Ok(fd) => fd,
@@ -508,8 +707,11 @@ fn spawn_flow_drain(ring: RingBuf<MapData>, tx: mpsc::Sender<CapturedFlow>) -> J
                 // SAFETY: ConnectEvent is repr(C) POD written by the kernel.
                 let ev = unsafe { std::ptr::read_unaligned(bytes.as_ptr() as *const ConnectEvent) };
                 let flow = CapturedFlow {
+                    capture_generation,
                     pid: ev.pid,
                     cgroup_id: ev.cgroup_id,
+                    scope_cgroup_id: ev.scope_cgroup_id,
+                    policy_generation: ev.policy_generation,
                     daddr: ev.daddr,
                     dport: ev.dport,
                     family: ev.family,
@@ -674,6 +876,106 @@ fn advance_listener_sequence(
     Ok(())
 }
 
+fn cgroup_policy_from_routing(routing: &CgroupRouting) -> Result<CgroupPolicy, String> {
+    let generation = if routing.is_empty() {
+        0
+    } else {
+        routing
+            .policy_generation()
+            .filter(|generation| *generation != 0)
+            .ok_or_else(|| "nonempty cgroup routing has no policy generation".to_string())?
+    };
+    cgroup_policy_from_anchors(routing.allowed_cgroups(), generation)
+}
+
+fn cgroup_policy_from_anchors(
+    anchors: impl IntoIterator<Item = CgroupAnchor>,
+    generation: u64,
+) -> Result<CgroupPolicy, String> {
+    let mut ids = HashSet::new();
+    let mut level_mask = 0u64;
+    let mut min_level = MAX_CGROUP_ANCESTOR_LEVEL;
+    let mut max_level = 0u32;
+    for anchor in anchors {
+        if anchor.id == 0 {
+            return Err("allowed cgroup id must be non-zero".to_string());
+        }
+        if anchor.id == 1 {
+            return Err("the root cgroup is not an allowed workload scope".to_string());
+        }
+        if anchor.level == 0 {
+            return Err(format!(
+                "allowed cgroup {} is the cgroup-v2 root",
+                anchor.id
+            ));
+        }
+        if anchor.level > MAX_CGROUP_ANCESTOR_LEVEL {
+            return Err(format!(
+                "allowed cgroup {} has unsupported level {} (max {MAX_CGROUP_ANCESTOR_LEVEL})",
+                anchor.id, anchor.level
+            ));
+        }
+        if ids.insert(anchor.id) && ids.len() > MAX_ALLOWED_CGROUPS as usize {
+            return Err(format!(
+                "cgroup policy exceeds kernel allow-set capacity of {MAX_ALLOWED_CGROUPS} distinct anchors"
+            ));
+        }
+        level_mask |= 1u64 << (anchor.level - 1);
+        min_level = min_level.min(anchor.level);
+        max_level = max_level.max(anchor.level);
+    }
+    if ids.is_empty() {
+        if generation != 0 {
+            return Err("empty cgroup policy must use generation zero".to_string());
+        }
+        return Ok(CgroupPolicy {
+            ids,
+            level_policy: 0,
+            generation: 0,
+        });
+    }
+    if generation == 0 {
+        return Err("nonempty cgroup policy must use a nonzero generation".to_string());
+    }
+    if generation > CGROUP_SELECTOR_GENERATION_MASK {
+        return Err(format!(
+            "cgroup policy generation {generation} exceeds packed selector maximum {CGROUP_SELECTOR_GENERATION_MASK}"
+        ));
+    }
+
+    let level_policy = level_mask
+        | ((min_level as u64) << CGROUP_MIN_LEVEL_SHIFT)
+        | ((max_level as u64) << CGROUP_MAX_LEVEL_SHIFT);
+    Ok(CgroupPolicy {
+        ids,
+        level_policy,
+        generation,
+    })
+}
+
+fn pack_cgroup_selector(slot: usize, generation: u64) -> Result<u64, String> {
+    if slot > 1 {
+        return Err(format!("invalid cgroup policy slot {slot}"));
+    }
+    if generation > CGROUP_SELECTOR_GENERATION_MASK {
+        return Err(format!(
+            "cgroup policy generation {generation} exceeds packed selector maximum {CGROUP_SELECTOR_GENERATION_MASK}"
+        ));
+    }
+    Ok(((slot as u64) << CGROUP_SELECTOR_SLOT_SHIFT) | generation)
+}
+
+fn unpack_cgroup_selector(selector: u64) -> (usize, u64) {
+    (
+        (selector >> CGROUP_SELECTOR_SLOT_SHIFT) as usize,
+        selector & CGROUP_SELECTOR_GENERATION_MASK,
+    )
+}
+
+fn cgroup_slot_name(slot: usize) -> char {
+    if slot == 0 { 'A' } else { 'B' }
+}
+
 fn ensure_listener_drain_running(running: &AtomicBool) -> Result<(), String> {
     if running.load(Ordering::Acquire) {
         Ok(())
@@ -684,7 +986,11 @@ fn ensure_listener_drain_running(running: &AtomicBool) -> Result<(), String> {
 
 /// Poll the `L7_EVENTS` ring async, decode each `L7Chunk`, and forward a
 /// direction-tagged `CapturedSegment` for userspace L7 reassembly + parsing.
-fn spawn_l7_drain(ring: RingBuf<MapData>, tx: mpsc::Sender<CapturedSegment>) -> JoinHandle<()> {
+fn spawn_l7_drain(
+    ring: RingBuf<MapData>,
+    tx: mpsc::Sender<CapturedSegment>,
+    capture_generation: u64,
+) -> JoinHandle<()> {
     tokio::spawn(async move {
         let mut async_fd = match AsyncFd::new(ring) {
             Ok(fd) => fd,
@@ -721,8 +1027,11 @@ fn spawn_l7_drain(ring: RingBuf<MapData>, tx: mpsc::Sender<CapturedSegment>) -> 
                     .map(|d| d.as_nanos() as i64)
                     .unwrap_or(0);
                 let seg = CapturedSegment {
+                    capture_generation,
                     pid: chunk.pid,
                     cgroup_id: chunk.cgroup_id,
+                    scope_cgroup_id: chunk.scope_cgroup_id,
+                    policy_generation: chunk.policy_generation,
                     fd: chunk.fd,
                     direction,
                     timestamp_nano,
@@ -741,7 +1050,11 @@ fn spawn_l7_drain(ring: RingBuf<MapData>, tx: mpsc::Sender<CapturedSegment>) -> 
 /// the SSL_read/SSL_write boundary), and forward it as a `CapturedSegment` into
 /// the same L7 pipeline. The connection is keyed by a stable id derived from the
 /// `SSL*` pointer — real fds are small ints and never collide with it.
-fn spawn_tls_drain(ring: RingBuf<MapData>, tx: mpsc::Sender<CapturedSegment>) -> JoinHandle<()> {
+fn spawn_tls_drain(
+    ring: RingBuf<MapData>,
+    tx: mpsc::Sender<CapturedSegment>,
+    capture_generation: u64,
+) -> JoinHandle<()> {
     tokio::spawn(async move {
         let mut async_fd = match AsyncFd::new(ring) {
             Ok(fd) => fd,
@@ -778,8 +1091,11 @@ fn spawn_tls_drain(ring: RingBuf<MapData>, tx: mpsc::Sender<CapturedSegment>) ->
                     .map(|d| d.as_nanos() as i64)
                     .unwrap_or(0);
                 let seg = CapturedSegment {
+                    capture_generation,
                     pid: chunk.pid,
                     cgroup_id: chunk.cgroup_id,
+                    scope_cgroup_id: chunk.scope_cgroup_id,
+                    policy_generation: chunk.policy_generation,
                     // Stable per-connection id from the SSL* pointer (drop alignment
                     // bits); real fds are small ints, so there's no collision.
                     fd: (chunk.ssl >> 4) as u32,
@@ -915,3 +1231,29 @@ fn attach_tls_to_lib(ebpf: &mut Ebpf, lib: &str, pid: i32) {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod cgroup_policy_capacity_tests {
+    use super::*;
+
+    #[test]
+    fn policy_accepts_map_capacity_and_rejects_the_next_distinct_anchor() {
+        let anchors = |count| {
+            (0..count).map(|index| CgroupAnchor {
+                id: u64::from(index) + 2,
+                level: 3,
+            })
+        };
+
+        let policy = cgroup_policy_from_anchors(anchors(MAX_ALLOWED_CGROUPS), 1).unwrap();
+        assert_eq!(policy.ids.len(), MAX_ALLOWED_CGROUPS as usize);
+
+        let error = cgroup_policy_from_anchors(anchors(MAX_ALLOWED_CGROUPS + 1), 1).unwrap_err();
+        assert_eq!(
+            error,
+            format!(
+                "cgroup policy exceeds kernel allow-set capacity of {MAX_ALLOWED_CGROUPS} distinct anchors"
+            )
+        );
+    }
+}

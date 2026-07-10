@@ -8,6 +8,21 @@
 
 pub const COMM_LEN: usize = 16;
 
+/// Maximum distinct workload anchors accepted by one cgroup policy slot.
+pub const MAX_ALLOWED_CGROUPS: u32 = 1024;
+/// Maximum absolute cgroup-v2 hierarchy level inspected by the kernel policy.
+pub const MAX_CGROUP_ANCESTOR_LEVEL: u32 = 32;
+/// Low bits in the packed level policy, one per supported absolute level.
+pub const CGROUP_LEVEL_MASK: u64 = u32::MAX as u64;
+pub const CGROUP_MIN_LEVEL_SHIFT: u32 = 32;
+pub const CGROUP_MAX_LEVEL_SHIFT: u32 = 40;
+pub const CGROUP_LEVEL_FIELD_MASK: u64 = u8::MAX as u64;
+/// The active policy map stores its double-buffer slot in the high bit and the
+/// policy generation in the remaining bits, so one array update publishes both
+/// values atomically to BPF readers.
+pub const CGROUP_SELECTOR_SLOT_SHIFT: u32 = 63;
+pub const CGROUP_SELECTOR_GENERATION_MASK: u64 = u64::MAX >> 1;
+
 /// One `sched_process_exec` observation: the post-exec PID and command name.
 ///
 /// Mirrors what ADR-002 Level 1 ("Observe") calls process lifecycle — the
@@ -19,18 +34,17 @@ pub struct ExecEvent {
     pub comm: [u8; COMM_LEN],
 }
 
-/// One successful TCP listener transition — the event-driven port→cgroup
-/// discovery signal. Pairing the listening port with the task's cgroup id lets
-/// userspace resolve "watch port P" → the owning cgroup(s) with no
-/// `/proc/<pid>/fd` readlink (and so no `CAP_SYS_PTRACE`). cgroup id is the
-/// container dimension, so two containers on the same port stay distinct.
+/// One successful TCP listener transition. This host-wide event is a change
+/// signal, not direct authorization evidence: it has no network-namespace
+/// identity, so userspace invalidates its authoritative snapshot and rebuilds
+/// ownership before changing the cgroup allow-set.
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct ListenerEvent {
     pub cgroup_id: u64,
     /// `bpf_ktime_get_ns()` at successful `listen(2)` completion. Userspace
-    /// uses the monotonic timestamp to replay live deltas across a snapshot
-    /// cut without resurrecting listeners observed before that cut.
+    /// compares it with the snapshot cut to reject a snapshot crossed by an
+    /// unclassified listener change.
     pub observed_at_ns: u64,
     /// Per-CPU publication sequence. Userspace advances one contiguous
     /// watermark per CPU so a snapshot fence cannot substitute another CPU's
@@ -55,6 +69,12 @@ pub struct LogChunk {
     /// The capturing task's v2 cgroup id (`bpf_get_current_cgroup_id`) — the
     /// tamper-proof container/service key, joined to identity in userspace.
     pub cgroup_id: u64,
+    /// The configured workload cgroup anchor that authorized capture. This is
+    /// zero while the additive PID fallback is what authorized the event.
+    pub scope_cgroup_id: u64,
+    /// Atomically selected cgroup or PID authorization-policy generation. Zero
+    /// is invalid and fails closed in userspace.
+    pub policy_generation: u64,
     pub pid: u32,
     pub fd: u32,
     pub len: u32,
@@ -69,6 +89,11 @@ pub struct LogChunk {
 pub struct ConnectEvent {
     /// The connecting task's v2 cgroup id — see `LogChunk::cgroup_id`.
     pub cgroup_id: u64,
+    /// The workload anchor that authorized capture — see
+    /// `LogChunk::scope_cgroup_id`.
+    pub scope_cgroup_id: u64,
+    /// The authorization-policy generation — see `LogChunk::policy_generation`.
+    pub policy_generation: u64,
     pub pid: u32,
     pub daddr: [u8; 4],
     pub dport: u16,
@@ -93,6 +118,11 @@ pub const L7_DIR_OUTBOUND: u8 = 1; // write/send — response bytes
 pub struct L7Chunk {
     /// The capturing task's v2 cgroup id — see `LogChunk::cgroup_id`.
     pub cgroup_id: u64,
+    /// The workload anchor that authorized capture — see
+    /// `LogChunk::scope_cgroup_id`.
+    pub scope_cgroup_id: u64,
+    /// The authorization-policy generation — see `LogChunk::policy_generation`.
+    pub policy_generation: u64,
     pub pid: u32,
     pub fd: u32,
     pub len: u32,
@@ -110,6 +140,11 @@ pub struct L7Chunk {
 pub struct TlsChunk {
     /// The capturing task's v2 cgroup id — see `LogChunk::cgroup_id`.
     pub cgroup_id: u64,
+    /// The workload anchor that authorized capture — see
+    /// `LogChunk::scope_cgroup_id`.
+    pub scope_cgroup_id: u64,
+    /// The authorization-policy generation — see `LogChunk::policy_generation`.
+    pub policy_generation: u64,
     pub ssl: u64,
     pub pid: u32,
     pub len: u32,

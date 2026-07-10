@@ -11,6 +11,8 @@ mod capability;
 // Cgroup-v2 process identity. Parsing is host-tested; the filesystem lookup is
 // Linux + ebpf only.
 #[cfg(any(test, all(target_os = "linux", feature = "ebpf")))]
+mod cgroup_resolver;
+#[cfg(any(test, target_os = "linux"))]
 #[allow(dead_code)]
 mod cgroup_v2;
 // Pure control-plane logic, used by the (Linux-only) manager and exercised by
@@ -76,10 +78,11 @@ pub struct EbpfStatus {
     pub build_support: bool,
     pub running: bool,
     pub last_error: Option<String>,
-    /// PIDs seeded into the kernel filter this tick. Distinguishes healthy
-    /// capture from capture that targets nothing (e.g. docker-proxy pids
-    /// bypassed by DNAT) — `running` alone can't tell those apart.
+    /// PIDs seeded into the temporary additive fallback this tick.
     pub pids_targeted: usize,
+    /// Workload cgroup anchors in the active kernel allow-set. Together with
+    /// `pids_targeted`, this distinguishes healthy capture from an empty scope.
+    pub cgroups_targeted: usize,
 }
 
 /// Shared, hot-readable eBPF status. The stats reporter reads it each tick.
@@ -102,6 +105,7 @@ pub async fn probe(status: &SharedEbpfStatus) {
     if capability.available {
         info!(
             kernel = capability.kernel_version.as_deref().unwrap_or("unknown"),
+            cgroup_v2 = capability.has_cgroup_v2,
             cap_perfmon = capability.has_cap_perfmon,
             lockdown = capability.lockdown.as_deref().unwrap_or("none"),
             build_support = BUILD_SUPPORT,

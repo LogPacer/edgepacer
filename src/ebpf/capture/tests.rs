@@ -1,7 +1,10 @@
 use super::*;
 use crate::config::EbpfTargetConfig;
 use crate::discovery::ports::ListeningPort;
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Write};
+#[cfg(target_os = "linux")]
+use std::os::unix::fs::MetadataExt;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Stdio};
 use std::time::Duration;
 
@@ -55,6 +58,97 @@ fn program() -> (
         l7_rx,
         listener_rx,
     )
+}
+
+#[test]
+fn cgroup_policy_deduplicates_ids_and_tracks_extreme_levels() {
+    let policy = cgroup_policy_from_anchors(
+        [
+            CgroupAnchor { id: 11, level: 1 },
+            CgroupAnchor { id: 22, level: 32 },
+            CgroupAnchor { id: 11, level: 1 },
+        ],
+        7,
+    )
+    .unwrap();
+
+    assert_eq!(policy.ids, HashSet::from([11, 22]));
+    assert_eq!(
+        policy.level_policy,
+        1 | (1u64 << 31) | (1u64 << CGROUP_MIN_LEVEL_SHIFT) | (32u64 << CGROUP_MAX_LEVEL_SHIFT)
+    );
+    assert_eq!(policy.generation, 7);
+}
+
+#[test]
+fn empty_cgroup_policy_has_no_ids_or_levels() {
+    let policy = cgroup_policy_from_anchors([], 0).unwrap();
+
+    assert!(policy.ids.is_empty());
+    assert_eq!(policy.level_policy, 0);
+    assert_eq!(policy.generation, 0);
+}
+
+#[test]
+fn cgroup_policy_rejects_zero_root_and_unsupported_levels() {
+    assert_eq!(
+        cgroup_policy_from_anchors([CgroupAnchor { id: 0, level: 1 }], 1).unwrap_err(),
+        "allowed cgroup id must be non-zero"
+    );
+    assert_eq!(
+        cgroup_policy_from_anchors([CgroupAnchor { id: 1, level: 1 }], 1).unwrap_err(),
+        "the root cgroup is not an allowed workload scope"
+    );
+    assert_eq!(
+        cgroup_policy_from_anchors([CgroupAnchor { id: 11, level: 0 }], 1).unwrap_err(),
+        "allowed cgroup 11 is the cgroup-v2 root"
+    );
+    assert!(
+        cgroup_policy_from_anchors([CgroupAnchor { id: 11, level: 33 }], 1)
+            .unwrap_err()
+            .contains("unsupported level 33")
+    );
+    assert_eq!(
+        cgroup_policy_from_anchors([CgroupAnchor { id: 11, level: 1 }], 0).unwrap_err(),
+        "nonempty cgroup policy must use a nonzero generation"
+    );
+    assert_eq!(
+        cgroup_policy_from_anchors([], 1).unwrap_err(),
+        "empty cgroup policy must use generation zero"
+    );
+    assert!(
+        cgroup_policy_from_anchors(
+            [CgroupAnchor { id: 11, level: 1 }],
+            CGROUP_SELECTOR_GENERATION_MASK + 1,
+        )
+        .unwrap_err()
+        .contains("exceeds packed selector maximum")
+    );
+}
+
+#[test]
+fn packed_cgroup_selector_publishes_slot_and_generation_together() {
+    let selector = pack_cgroup_selector(1, 19).unwrap();
+
+    assert_eq!(selector, (1u64 << CGROUP_SELECTOR_SLOT_SHIFT) | 19);
+    assert_eq!(unpack_cgroup_selector(selector), (1, 19));
+    assert_eq!(unpack_cgroup_selector(0), (0, 0));
+    assert!(pack_cgroup_selector(2, 1).is_err());
+    assert!(pack_cgroup_selector(0, CGROUP_SELECTOR_GENERATION_MASK + 1).is_err());
+}
+
+#[test]
+fn cgroup_policy_uses_the_routing_discovery_epoch() {
+    let routing =
+        CgroupRouting::from_entries(19, [(CgroupAnchor { id: 11, level: 4 }, "source")]).unwrap();
+
+    let policy = cgroup_policy_from_routing(&routing).unwrap();
+
+    assert_eq!(policy.generation, 19);
+    assert_eq!(
+        policy.level_policy,
+        (1u64 << 3) | (4u64 << 32) | (4u64 << 40)
+    );
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -622,8 +716,9 @@ async fn captures_a_targeted_write() {
         .expect("spawn marker child");
     let pid = child.id();
 
+    let routing = routing_for(pid);
     program
-        .set_target_pids(&routing_for(pid))
+        .set_target_pids(&routing)
         .expect("seed TARGET_PIDS with the child PID");
 
     let line = tokio::time::timeout(Duration::from_secs(5), rx.recv())
@@ -632,6 +727,13 @@ async fn captures_a_targeted_write() {
         .expect("capture channel closed");
 
     assert_eq!(line.pid, pid, "captured the targeted PID's write");
+    assert_eq!(
+        line.policy_generation,
+        routing
+            .policy_generation()
+            .expect("nonempty PID routing generation"),
+        "the kernel stamps the generation that authorized the PID"
+    );
     assert!(
         String::from_utf8_lossy(&line.bytes).contains(marker),
         "captured bytes contain the marker: {:?}",
@@ -639,6 +741,536 @@ async fn captures_a_targeted_write() {
     );
 
     let _ = child.wait();
+    program.stop();
+}
+
+struct TestCgroupTree {
+    root: PathBuf,
+    allowed: PathBuf,
+    allowed_leaf: PathBuf,
+    denied: PathBuf,
+    allowed_anchor: CgroupAnchor,
+    denied_anchor: CgroupAnchor,
+    allowed_leaf_id: u64,
+}
+
+impl TestCgroupTree {
+    fn create() -> Self {
+        let current = std::fs::read_to_string("/proc/self/cgroup").expect("read current cgroup");
+        let current = super::super::cgroup_v2::parse_unified_cgroup_path(&current)
+            .expect("one unified cgroup entry");
+        let current_dir =
+            super::super::cgroup_v2::join_cgroup_mount(Path::new("/sys/fs/cgroup"), &current)
+                .expect("join current cgroup path");
+        let unique = format!(
+            "edgepacer-capture-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("wall clock after epoch")
+                .as_nanos()
+        );
+        let root = current_dir.join(unique);
+        let allowed = root.join("allowed");
+        let allowed_leaf = allowed.join("leaf");
+        let denied = root.join("denied");
+        std::fs::create_dir(&root).expect("create test cgroup root");
+        std::fs::create_dir(&allowed).expect("create allowed cgroup");
+        std::fs::create_dir(&allowed_leaf).expect("create allowed descendant cgroup");
+        std::fs::create_dir(&denied).expect("create denied cgroup");
+
+        let current_level = current
+            .trim_start_matches('/')
+            .split('/')
+            .filter(|component| !component.is_empty())
+            .count() as u32;
+        let allowed_anchor = CgroupAnchor {
+            id: std::fs::metadata(&allowed)
+                .expect("stat allowed cgroup")
+                .ino(),
+            level: current_level + 2,
+        };
+        let denied_anchor = CgroupAnchor {
+            id: std::fs::metadata(&denied)
+                .expect("stat denied cgroup")
+                .ino(),
+            level: current_level + 2,
+        };
+        let allowed_leaf_id = std::fs::metadata(&allowed_leaf)
+            .expect("stat allowed leaf cgroup")
+            .ino();
+
+        Self {
+            root,
+            allowed,
+            allowed_leaf,
+            denied,
+            allowed_anchor,
+            denied_anchor,
+            allowed_leaf_id,
+        }
+    }
+
+    fn move_pid(path: &Path, pid: u32) {
+        std::fs::write(path.join("cgroup.procs"), pid.to_string())
+            .expect("move marker process into test cgroup");
+    }
+}
+
+impl Drop for TestCgroupTree {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir(&self.allowed_leaf);
+        let _ = std::fs::remove_dir(&self.allowed);
+        let _ = std::fs::remove_dir(&self.denied);
+        let _ = std::fs::remove_dir(&self.root);
+    }
+}
+
+fn spawn_cgroup_marker(marker: &str) -> Child {
+    std::process::Command::new("sh")
+        .arg("-c")
+        .arg("IFS= read -r _; printf '%s\\n' \"$1\"")
+        .arg("edgepacer-cgroup-marker")
+        .arg(marker)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .spawn()
+        .expect("spawn cgroup marker child")
+}
+
+fn release_cgroup_marker(child: &mut Child) {
+    child
+        .stdin
+        .take()
+        .expect("marker child stdin pipe")
+        .write_all(b"\n")
+        .expect("release cgroup marker child");
+}
+
+fn wait_for_cgroup_marker(child: &mut Child) {
+    let status = child.wait().expect("wait for cgroup marker child");
+    assert!(status.success(), "cgroup marker child failed: {status}");
+}
+
+fn spawn_cgroup_stream(marker: &str) -> Child {
+    std::process::Command::new("python3")
+        .arg("-u")
+        .arg("-c")
+        .arg("import os, sys\nmarker = (sys.argv[1] + '\\n').encode()\nwhile os.read(0, 1):\n    os.write(1, marker)\n")
+        .arg(marker)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .spawn()
+        .expect("spawn cgroup stream child")
+}
+
+fn pump_cgroup_stream(
+    child: &mut Child,
+    running: std::sync::Arc<std::sync::atomic::AtomicBool>,
+) -> std::thread::JoinHandle<()> {
+    let mut stdin = child.stdin.take().expect("cgroup stream stdin pipe");
+    std::thread::spawn(move || {
+        while running.load(std::sync::atomic::Ordering::Acquire) {
+            stdin.write_all(b"\n").expect("trigger cgroup stream write");
+            std::thread::sleep(Duration::from_micros(250));
+        }
+    })
+}
+
+async fn receive_cgroup_marker(
+    rx: &mut mpsc::Receiver<CapturedLine>,
+    marker: &str,
+    timeout: Duration,
+) -> Option<CapturedLine> {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        let line = tokio::time::timeout_at(deadline, rx.recv()).await.ok()??;
+        if String::from_utf8_lossy(&line.bytes).contains(marker) {
+            return Some(line);
+        }
+    }
+}
+
+async fn receive_l7_marker(
+    rx: &mut mpsc::Receiver<CapturedSegment>,
+    marker: &[u8],
+    timeout: Duration,
+) -> Option<CapturedSegment> {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        let segment = tokio::time::timeout_at(deadline, rx.recv()).await.ok()??;
+        if segment
+            .bytes
+            .windows(marker.len())
+            .any(|bytes| bytes == marker)
+        {
+            return Some(segment);
+        }
+    }
+}
+
+struct CgroupPolicySubject<'a> {
+    path: &'a Path,
+    anchor: CgroupAnchor,
+    cgroup_id: u64,
+}
+
+async fn assert_cgroup_policy_round(
+    program: &mut AyaCaptureProgram,
+    rx: &mut mpsc::Receiver<CapturedLine>,
+    authorized: &CgroupPolicySubject<'_>,
+    unauthorized: &CgroupPolicySubject<'_>,
+    previous_generation: Option<u64>,
+    generation: u64,
+) {
+    let routing = CgroupRouting::from_entries(
+        generation,
+        [(authorized.anchor, format!("round-{generation}"))],
+    )
+    .unwrap();
+
+    let authorized_stream_marker = format!("EDGEPACER_CGROUP_STREAM_NEXT_{generation}");
+    let previous_stream_marker = format!("EDGEPACER_CGROUP_STREAM_PREVIOUS_{generation}");
+    let mut authorized_stream = spawn_cgroup_stream(&authorized_stream_marker);
+    let mut previous_stream = spawn_cgroup_stream(&previous_stream_marker);
+    TestCgroupTree::move_pid(authorized.path, authorized_stream.id());
+    TestCgroupTree::move_pid(unauthorized.path, previous_stream.id());
+    let streams_running = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let authorized_pump = pump_cgroup_stream(
+        &mut authorized_stream,
+        std::sync::Arc::clone(&streams_running),
+    );
+    let previous_pump = pump_cgroup_stream(
+        &mut previous_stream,
+        std::sync::Arc::clone(&streams_running),
+    );
+
+    // Keep both the old- and new-policy cgroups writing before, throughout,
+    // and after the inactive-map rewrite plus selector publication.
+    std::thread::sleep(Duration::from_millis(20));
+    let publication = program.set_allowed_cgroups(&routing);
+    std::thread::sleep(Duration::from_millis(20));
+    streams_running.store(false, std::sync::atomic::Ordering::Release);
+    authorized_pump.join().expect("join authorized stream pump");
+    previous_pump.join().expect("join previous stream pump");
+    wait_for_cgroup_marker(&mut authorized_stream);
+    wait_for_cgroup_marker(&mut previous_stream);
+    publication.expect("atomically replace active cgroup policy");
+
+    let authorized_marker = format!("EDGEPACER_CGROUP_ALLOWED_{generation}");
+    let unauthorized_marker = format!("EDGEPACER_CGROUP_DENIED_{generation}");
+    let mut authorized_child = spawn_cgroup_marker(&authorized_marker);
+    let mut unauthorized_child = spawn_cgroup_marker(&unauthorized_marker);
+    TestCgroupTree::move_pid(authorized.path, authorized_child.id());
+    TestCgroupTree::move_pid(unauthorized.path, unauthorized_child.id());
+
+    // Both children are parked on the same stdin barrier. Releasing them back
+    // to back makes the allowed and denied writes race under one published
+    // selector, exposing any stale identity left in a reused slot.
+    release_cgroup_marker(&mut authorized_child);
+    release_cgroup_marker(&mut unauthorized_child);
+    wait_for_cgroup_marker(&mut authorized_child);
+    wait_for_cgroup_marker(&mut unauthorized_child);
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    let mut authorized_event = None;
+    let mut authorized_stream_event = false;
+    let mut previous_stream_event = false;
+    loop {
+        let Ok(Some(line)) = tokio::time::timeout_at(deadline, rx.recv()).await else {
+            break;
+        };
+        let bytes = String::from_utf8_lossy(&line.bytes);
+        if bytes.contains(&authorized_stream_marker) {
+            assert_eq!(line.scope_cgroup_id, authorized.anchor.id);
+            assert_eq!(line.cgroup_id, authorized.cgroup_id);
+            assert_eq!(line.policy_generation, generation);
+            authorized_stream_event = true;
+        }
+        if bytes.contains(&previous_stream_marker) {
+            let previous_generation = previous_generation.unwrap_or_else(|| {
+                panic!(
+                    "empty policy captured the previous stream with scope={} policy_generation={}",
+                    line.scope_cgroup_id, line.policy_generation
+                )
+            });
+            assert_eq!(line.scope_cgroup_id, unauthorized.anchor.id);
+            assert_eq!(line.cgroup_id, unauthorized.cgroup_id);
+            assert_eq!(line.policy_generation, previous_generation);
+            previous_stream_event = true;
+        }
+        assert!(
+            !bytes.contains(&unauthorized_marker),
+            "generation {generation} captured the denied sibling with scope={} policy_generation={}",
+            line.scope_cgroup_id,
+            line.policy_generation
+        );
+        if bytes.contains(&authorized_marker) {
+            assert_eq!(line.scope_cgroup_id, authorized.anchor.id);
+            assert_eq!(line.cgroup_id, authorized.cgroup_id);
+            assert_eq!(line.policy_generation, generation);
+            assert_ne!(line.capture_generation, 0);
+            authorized_event = Some(line);
+        }
+    }
+    assert!(
+        authorized_event.is_some(),
+        "generation {generation} did not capture the authorized cgroup write"
+    );
+    assert!(
+        authorized_stream_event,
+        "generation {generation} did not capture the new-policy stream after publication"
+    );
+    if previous_generation.is_some() {
+        assert!(
+            previous_stream_event,
+            "generation {generation} did not capture the old-policy stream before publication"
+        );
+    }
+}
+
+fn spawn_blocking_read_child() -> Child {
+    std::process::Command::new("python3")
+        .arg("-u")
+        .arg("-c")
+        .arg(
+            "import os\n\
+             os.read(0, 1)\n\
+             os.write(1, b'CONTROL_READY\\n')\n\
+             os.read(0, 4096)\n\
+             os.write(1, b'NEGATIVE_READY\\n')\n\
+             os.read(0, 4096)\n",
+        )
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("spawn blocking read child")
+}
+
+fn write_child_stdin(child: &mut Child, bytes: &[u8]) {
+    let stdin = child.stdin.as_mut().expect("blocking child stdin pipe");
+    stdin.write_all(bytes).expect("write blocking child stdin");
+    stdin.flush().expect("flush blocking child stdin");
+}
+
+fn wait_for_l7_read_entry(
+    program: &mut AyaCaptureProgram,
+    pid: u32,
+    expected_cgroup_id: u64,
+    expected_scope_cgroup_id: u64,
+    expected_policy_generation: u64,
+    timeout: Duration,
+) {
+    let key = ((pid as u64) << 32) | pid as u64;
+    let loaded = program.loaded.as_mut().expect("capture program loaded");
+    let map = loaded
+        .ebpf
+        .map_mut("L7_READ_ARGS")
+        .expect("L7_READ_ARGS map present");
+    // Kernel ReadArgs is five contiguous u64s: buf, fd, and CaptureScope's
+    // actual cgroup, matched scope, and policy generation.
+    let args: AyaHashMap<_, u64, [u64; 5]> =
+        AyaHashMap::try_from(map).expect("open L7_READ_ARGS map");
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        match args.get(&key, 0) {
+            Ok([_buf, _fd, cgroup_id, scope_cgroup_id, policy_generation]) => {
+                assert_eq!(cgroup_id, expected_cgroup_id);
+                assert_eq!(scope_cgroup_id, expected_scope_cgroup_id);
+                assert_eq!(policy_generation, expected_policy_generation);
+                return;
+            }
+            Err(MapError::KeyNotFound) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Err(MapError::KeyNotFound) => {
+                panic!("timed out waiting for child {pid} to enter read(2)")
+            }
+            Err(error) => panic!("read L7_READ_ARGS for child {pid}: {error}"),
+        }
+    }
+}
+
+/// Proves cgroup-only authorization for logs and network flows, ancestor
+/// matching, sibling exclusion, repeated atomic policy replacement with both
+/// map slots reused, and policy clearing against the real kernel.
+#[tokio::test]
+#[ignore = "requires root, writable cgroup v2, and python3; run on the ebpf-spike VM"]
+async fn cgroup_policy_captures_descendants_and_replaces_atomically() {
+    assert_eq!(unsafe { libc::geteuid() }, 0, "test must run as root");
+    let tree = TestCgroupTree::create();
+    let (mut program, mut rx, mut flow_rx, _l7_rx, _listener_rx) = program();
+    program
+        .start(&enabled_section(true))
+        .expect("load + attach capture programs from the embedded object");
+    program
+        .set_target_pids(&PidRouting::default())
+        .expect("keep PID fallback empty");
+
+    let allowed = CgroupPolicySubject {
+        path: &tree.allowed_leaf,
+        anchor: tree.allowed_anchor,
+        cgroup_id: tree.allowed_leaf_id,
+    };
+    let denied = CgroupPolicySubject {
+        path: &tree.denied,
+        anchor: tree.denied_anchor,
+        cgroup_id: tree.denied_anchor.id,
+    };
+
+    // Initial publication plus three replacements alternates A/B/A/B. The
+    // third and fourth publications necessarily reuse the two inactive maps,
+    // so stale IDs or generations left in either slot become observable.
+    assert_cgroup_policy_round(&mut program, &mut rx, &allowed, &denied, None, 1).await;
+
+    let mut connect_child = std::process::Command::new("python3")
+        .arg("-c")
+        .arg(
+            "import socket,sys; sys.stdin.buffer.read(1); \
+             socket.socket().connect_ex(('127.0.0.1', 9999))",
+        )
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn cgroup-authorized connect child");
+    let connect_pid = connect_child.id();
+    TestCgroupTree::move_pid(&tree.allowed_leaf, connect_pid);
+    connect_child
+        .stdin
+        .take()
+        .expect("connect child stdin pipe")
+        .write_all(b"\n")
+        .expect("release cgroup-authorized connect child");
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let flow = loop {
+        let flow = tokio::time::timeout_at(deadline, flow_rx.recv())
+            .await
+            .expect("timed out waiting for a cgroup-authorized connect")
+            .expect("flow channel closed");
+        if flow.pid == connect_pid {
+            break flow;
+        }
+    };
+    assert_eq!(flow.cgroup_id, tree.allowed_leaf_id);
+    assert_eq!(flow.scope_cgroup_id, tree.allowed_anchor.id);
+    assert_eq!(flow.policy_generation, 1);
+    assert_ne!(flow.capture_generation, 0);
+    assert_eq!(flow.daddr, [127, 0, 0, 1]);
+    assert_eq!(flow.dport, 9999);
+    let status = connect_child.wait().expect("wait for connect child");
+    assert!(status.success(), "connect child failed: {status}");
+
+    assert_cgroup_policy_round(&mut program, &mut rx, &denied, &allowed, Some(1), 2).await;
+    assert_cgroup_policy_round(&mut program, &mut rx, &allowed, &denied, Some(2), 3).await;
+    assert_cgroup_policy_round(&mut program, &mut rx, &denied, &allowed, Some(3), 4).await;
+
+    program
+        .set_allowed_cgroups(&CgroupRouting::default())
+        .expect("clear active cgroup policy");
+    let cleared_marker = "EDGEPACER_CGROUP_CLEARED";
+    let mut cleared_child = spawn_cgroup_marker(cleared_marker);
+    TestCgroupTree::move_pid(&tree.denied, cleared_child.id());
+    release_cgroup_marker(&mut cleared_child);
+    wait_for_cgroup_marker(&mut cleared_child);
+    assert!(
+        receive_cgroup_marker(&mut rx, cleared_marker, Duration::from_secs(2))
+            .await
+            .is_none(),
+        "cleared cgroup policy must capture nothing"
+    );
+    program.stop();
+}
+
+/// A read authorized at syscall entry must not be emitted under a replacement
+/// policy at syscall exit. Polling the in-kernel args map makes the policy flip
+/// deterministic instead of relying on a scheduling sleep.
+#[tokio::test]
+#[ignore = "requires root, writable cgroup v2, and python3; run on the ebpf-spike VM"]
+async fn cgroup_policy_change_drops_an_in_flight_read() {
+    assert_eq!(unsafe { libc::geteuid() }, 0, "test must run as root");
+    let tree = TestCgroupTree::create();
+    let (mut program, _rx, _flow_rx, mut l7_rx, _listener_rx) = program();
+    program
+        .start(&enabled_section(true))
+        .expect("load + attach capture programs from the embedded object");
+    program
+        .set_target_pids(&PidRouting::default())
+        .expect("keep PID fallback empty");
+    program
+        .set_allowed_cgroups(
+            &CgroupRouting::from_entries(1, [(tree.allowed_anchor, "allowed")]).unwrap(),
+        )
+        .expect("activate allowed workload cgroup");
+
+    let mut child = spawn_blocking_read_child();
+    let pid = child.id();
+    TestCgroupTree::move_pid(&tree.allowed_leaf, pid);
+
+    // The first byte releases a setup read that began before the child moved.
+    // A positive read under the unchanged policy proves this fixture can emit
+    // the expected descendant-cgroup identity before the replacement case.
+    write_child_stdin(&mut child, b"S");
+    let mut child_stdout = BufReader::new(child.stdout.take().expect("blocking child stdout pipe"));
+    let mut control_ready = String::new();
+    child_stdout
+        .read_line(&mut control_ready)
+        .expect("read blocking child readiness");
+    assert_eq!(control_ready, "CONTROL_READY\n");
+    let control_marker = b"EDGEPACER_IN_FLIGHT_READ_CONTROL";
+    write_child_stdin(&mut child, control_marker);
+    let control = receive_l7_marker(&mut l7_rx, control_marker, Duration::from_secs(5))
+        .await
+        .expect("unchanged cgroup policy captures the control read");
+    assert_eq!(control.pid, pid);
+    assert_eq!(control.cgroup_id, tree.allowed_leaf_id);
+    assert_eq!(control.scope_cgroup_id, tree.allowed_anchor.id);
+    assert_eq!(control.policy_generation, 1);
+    assert_ne!(control.capture_generation, 0);
+
+    let mut negative_ready = String::new();
+    child_stdout
+        .read_line(&mut negative_ready)
+        .expect("read negative-case readiness");
+    assert_eq!(negative_ready, "NEGATIVE_READY\n");
+
+    // The child has now entered a second authorized read. The map poll proves
+    // its enter probe persisted generation 1 before the policy is replaced.
+    wait_for_l7_read_entry(
+        &mut program,
+        pid,
+        tree.allowed_leaf_id,
+        tree.allowed_anchor.id,
+        1,
+        Duration::from_secs(5),
+    );
+
+    program
+        .set_allowed_cgroups(
+            &CgroupRouting::from_entries(2, [(tree.allowed_anchor, "allowed-v2")]).unwrap(),
+        )
+        .expect("replace the same scope generation while child is blocked in read(2)");
+    let marker = b"EDGEPACER_IN_FLIGHT_READ_MUST_DROP";
+    write_child_stdin(&mut child, marker);
+    wait_for_cgroup_marker(&mut child);
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    loop {
+        let Ok(Some(segment)) = tokio::time::timeout_at(deadline, l7_rx.recv()).await else {
+            break;
+        };
+        assert!(
+            segment.pid != pid
+                || !segment
+                    .bytes
+                    .windows(marker.len())
+                    .any(|bytes| bytes == marker),
+            "read spanning the policy change was emitted with scope={} policy_generation={}",
+            segment.scope_cgroup_id,
+            segment.policy_generation
+        );
+    }
     program.stop();
 }
 

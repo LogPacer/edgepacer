@@ -41,16 +41,22 @@ fn preview(b: &[u8]) -> String {
 fn demo(out: &mut String, name: &str, key: Option<&str>, req: &[u8], resp: &[u8], seed: u64) {
     let mut reg = ConnRegistry::new();
     let inbound = CapturedSegment {
+        capture_generation: 0,
+        policy_generation: 0,
         pid: 4242,
         cgroup_id: 0,
+        scope_cgroup_id: 0,
         fd: 7,
         direction: Direction::Inbound,
         timestamp_nano: REQ_TS,
         bytes: req.to_vec(),
     };
     let outbound = CapturedSegment {
+        capture_generation: 0,
+        policy_generation: 0,
         pid: 4242,
         cgroup_id: 0,
+        scope_cgroup_id: 0,
         fd: 7,
         direction: Direction::Outbound,
         timestamp_nano: RESP_TS,

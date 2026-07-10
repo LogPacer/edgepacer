@@ -200,6 +200,7 @@ windows-sys = { version = "0.61", features = [
 libc = "0.2"
 
 [dev-dependencies]
+edgepacer-ebpf-common = { path = "bpf-common", version = "0.1.0" }
 tokio-test = "0.4"
 wiremock = "0.6"
 tempfile = "3"

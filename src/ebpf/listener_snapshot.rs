@@ -22,7 +22,9 @@ use thiserror::Error;
 
 use super::cgroup_v2;
 #[cfg(target_os = "linux")]
-use super::listener_state::{ListenerAssociation, ListenerSnapshot};
+use super::listener_state::{
+    ForeignListenerCandidate, ListenerAssociation, ListenerSnapshot, NetworkNamespaceToken,
+};
 use super::sock_diag;
 use crate::discovery::{Container, RuntimeProcessIdentity};
 
@@ -97,10 +99,24 @@ struct RuntimeSource {
 }
 
 #[cfg(target_os = "linux")]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-struct NetworkTableIdentity {
-    device: u64,
-    inode: u64,
+type NetworkTableIdentity = NetworkNamespaceToken;
+
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct RuntimeNetworkNamespace {
+    table: NetworkTableIdentity,
+    uses_host_namespace: bool,
+}
+
+#[cfg(target_os = "linux")]
+impl RuntimeNetworkNamespace {
+    pub(crate) fn uses_host_namespace(self) -> bool {
+        self.uses_host_namespace
+    }
+
+    pub(crate) fn token(self) -> NetworkNamespaceToken {
+        self.table
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -166,23 +182,27 @@ pub fn collect(
         let mut namespace_ports = BTreeSet::new();
         for (table, family) in [("tcp", libc::AF_INET), ("tcp6", libc::AF_INET6)] {
             let path = PathBuf::from(format!("/proc/{pid}/net/{table}"));
-            let expected_identity = (table == "tcp").then_some(netns);
+            // TCP and TCP6 have distinct procfs inode identities. Bracket the
+            // table-specific open/read check with the namespace's TCP token;
+            // any move observed during collection invalidates the whole result.
+            ensure_runtime_network_namespace(reader, netns)?;
+            let expected_identity = if table == "tcp" {
+                netns
+            } else {
+                network_table_identity(&path)?
+            };
+            ensure_runtime_network_namespace(reader, netns)?;
             for port in read_network_table(&path, expected_identity, deadline)? {
                 namespace_ports.insert((family as u16, port));
             }
+            ensure_runtime_network_namespace(reader, netns)?;
         }
 
         for (source, before_cgroup_id) in &sources.sources {
             check_deadline(deadline, "revalidating runtime namespaces")?;
             ensure_current_runtime_process(source)?;
             let pid = source.process.pid();
-            let table_path = PathBuf::from(format!("/proc/{pid}/net/tcp"));
-            if network_table_identity(&table_path)? != netns {
-                return Err(ListenerSnapshotError::NetworkNamespaceChanged {
-                    container: source.runtime_id.clone(),
-                    pid,
-                });
-            }
+            ensure_runtime_network_namespace(source, netns)?;
             let after_cgroup_id = cgroup_v2::cgroup_id_for_pid(pid, &source.runtime_id)?;
             if after_cgroup_id != *before_cgroup_id {
                 return Err(ListenerSnapshotError::CgroupChanged {
@@ -206,7 +226,11 @@ pub fn collect(
                 insert_unique_evidence(
                     &mut foreign_candidates,
                     associations.len(),
-                    (port, cgroup_id),
+                    ForeignListenerCandidate {
+                        port,
+                        cgroup_id,
+                        network_namespace: netns,
+                    },
                     evidence_limit,
                 )?;
             }
@@ -245,7 +269,7 @@ fn check_deadline(deadline: Instant, operation: &'static str) -> Result<(), List
 #[cfg(target_os = "linux")]
 fn read_network_table(
     path: &Path,
-    expected_identity: Option<NetworkTableIdentity>,
+    expected_identity: NetworkTableIdentity,
     deadline: Instant,
 ) -> Result<Vec<u16>, ListenerSnapshotError> {
     check_deadline(deadline, "opening a runtime network table")?;
@@ -254,24 +278,30 @@ fn read_network_table(
         path: path.to_path_buf(),
         source,
     })?;
-    if expected_identity.is_some_and(|expected| {
-        file.metadata()
-            .ok()
-            .and_then(|metadata| network_table_identity_from_metadata(&metadata))
-            != Some(expected)
-    }) {
+    if file
+        .metadata()
+        .ok()
+        .and_then(|metadata| network_table_identity_from_metadata(&metadata))
+        != Some(expected_identity)
+    {
         return Err(ListenerSnapshotError::NetworkTableChanged(
             path.to_path_buf(),
         ));
     }
     let mut reader = BufReader::new(file.take((MAX_PROC_NETWORK_TABLE_BYTES + 1) as u64));
-    parse_proc_net_tcp_reader(
+    let ports = parse_proc_net_tcp_reader(
         &mut reader,
         &path.display().to_string(),
         Some(deadline),
         MAX_PROC_NETWORK_TABLE_ROWS,
         MAX_PROC_NETWORK_TABLE_BYTES,
-    )
+    )?;
+    if network_table_identity(path)? != expected_identity {
+        return Err(ListenerSnapshotError::NetworkTableChanged(
+            path.to_path_buf(),
+        ));
+    }
+    Ok(ports)
 }
 
 fn runtime_sources(containers: &[Container]) -> Result<Vec<RuntimeSource>, ListenerSnapshotError> {
@@ -332,6 +362,57 @@ fn ensure_current_runtime_process(source: &RuntimeSource) -> Result<(), Listener
     }
 }
 
+#[cfg(target_os = "linux")]
+fn ensure_runtime_network_namespace(
+    source: &RuntimeSource,
+    expected: NetworkTableIdentity,
+) -> Result<(), ListenerSnapshotError> {
+    ensure_current_runtime_process(source)?;
+    let pid = source.process.pid();
+    let table_path = PathBuf::from(format!("/proc/{pid}/net/tcp"));
+    if network_table_identity(&table_path)? != expected {
+        return Err(ListenerSnapshotError::NetworkNamespaceChanged {
+            container: source.runtime_id.clone(),
+            pid,
+        });
+    }
+    ensure_current_runtime_process(source)
+}
+
+/// Resolve a stable network-namespace token for a runtime process without
+/// opening `/proc/<pid>/ns/net` (which is ptrace-gated across UIDs). The
+/// kernel-generated TCP table identity is namespace-specific, and the retained
+/// process-birth token plus a second metadata read fail closed across PID reuse
+/// or a concurrent namespace move.
+#[cfg(target_os = "linux")]
+pub(crate) fn runtime_process_network_namespace(
+    container: &str,
+    process: RuntimeProcessIdentity,
+) -> Result<RuntimeNetworkNamespace, ListenerSnapshotError> {
+    let source = RuntimeSource {
+        runtime_id: container.to_string(),
+        process,
+    };
+    ensure_current_runtime_process(&source)?;
+
+    let host_identity = network_table_identity(Path::new("/proc/self/net/tcp"))?;
+    let table_path = PathBuf::from(format!("/proc/{}/net/tcp", process.pid()));
+    let before = network_table_identity(&table_path)?;
+    ensure_current_runtime_process(&source)?;
+    let after = network_table_identity(&table_path)?;
+    if after != before {
+        return Err(ListenerSnapshotError::NetworkNamespaceChanged {
+            container: container.to_string(),
+            pid: process.pid(),
+        });
+    }
+    ensure_current_runtime_process(&source)?;
+    Ok(RuntimeNetworkNamespace {
+        table: before,
+        uses_host_namespace: before == host_identity,
+    })
+}
+
 fn normalize_runtime_id(id: &str) -> &str {
     id.split_once("://")
         .filter(|(scheme, _)| !scheme.is_empty())
@@ -361,11 +442,7 @@ fn network_table_identity_from_metadata(
 ) -> Option<NetworkTableIdentity> {
     use std::os::unix::fs::MetadataExt;
 
-    let identity = NetworkTableIdentity {
-        device: metadata.dev(),
-        inode: metadata.ino(),
-    };
-    (identity.device != 0 && identity.inode != 0).then_some(identity)
+    NetworkNamespaceToken::new(metadata.dev(), metadata.ino()).ok()
 }
 
 /// Strict parser for the kernel-generated `/proc/<pid>/net/tcp{,6}` format.
@@ -639,6 +716,36 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
+    fn network_table_reader_requires_the_exact_table_identity() {
+        let path = std::env::temp_dir().join(format!(
+            "edgepacer-network-table-{}-{}",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("test")
+        ));
+        std::fs::write(
+            &path,
+            "sl local_address rem_address st tx_queue rx_queue tr tm->when retrnsmt uid timeout inode\n",
+        )
+        .unwrap();
+        let identity = network_table_identity(&path).unwrap();
+        let wrong_identity = NetworkNamespaceToken {
+            device: identity.device,
+            inode: identity.inode.saturating_add(1),
+        };
+
+        assert!(matches!(
+            read_network_table(
+                &path,
+                wrong_identity,
+                Instant::now() + std::time::Duration::from_secs(1)
+            ),
+            Err(ListenerSnapshotError::NetworkTableChanged(changed)) if changed == path
+        ));
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
     #[ignore = "requires an initial cgroup-v2 namespace and INET_DIAG_CGROUP_ID"]
     fn live_snapshot_contains_a_current_namespace_listener() {
         let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
@@ -690,10 +797,14 @@ mod tests {
         let script = r#"
 import socket, time
 input()
-s = socket.socket()
-s.bind(('0.0.0.0', 0))
-s.listen()
-print(s.getsockname()[1], flush=True)
+v4 = socket.socket()
+v4.bind(('0.0.0.0', 0))
+v4.listen()
+v6 = socket.socket(socket.AF_INET6)
+v6.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1)
+v6.bind(('::', 0))
+v6.listen()
+print(v4.getsockname()[1], v6.getsockname()[1], flush=True)
 time.sleep(30)
 "#;
         let child = Command::new("unshare")
@@ -728,9 +839,16 @@ time.sleep(30)
         BufReader::new(cleanup.child.stdout.take().unwrap())
             .read_line(&mut line)
             .unwrap();
-        let port = line.trim().parse::<u16>().unwrap();
+        let ports: Vec<u16> = line
+            .split_whitespace()
+            .map(|port| port.parse().unwrap())
+            .collect();
+        assert_eq!(ports.len(), 2);
         let process = RuntimeProcessIdentity::capture(pid).unwrap();
         let expected_cgroup = cgroup_v2::cgroup_id_for_pid(pid, RUNTIME_ID).unwrap();
+        let expected_namespace = runtime_process_network_namespace(RUNTIME_ID, process)
+            .unwrap()
+            .token();
 
         let snapshot = collect(
             &[container(RUNTIME_ID, Some(process))],
@@ -742,13 +860,20 @@ time.sleep(30)
         let generation = state.begin_snapshot(1).unwrap();
         state.apply_snapshot(generation, snapshot, 100_000).unwrap();
 
-        assert_eq!(
-            state.evidence_for_port(port),
-            super::super::listener_state::PortEvidence::Present {
-                socket_cgroups: std::collections::HashSet::new(),
-                foreign_runtime_cgroups: std::collections::HashSet::from([expected_cgroup]),
-            }
-        );
+        for port in ports {
+            assert_eq!(
+                state.evidence_for_port(port),
+                super::super::listener_state::PortEvidence::Present {
+                    socket_cgroups: std::collections::HashSet::new(),
+                    foreign_runtime_candidates: std::collections::HashSet::from([
+                        super::super::listener_state::ForeignRuntimeIdentity {
+                            cgroup_id: expected_cgroup,
+                            network_namespace: expected_namespace,
+                        },
+                    ]),
+                }
+            );
+        }
     }
 
     #[cfg(target_os = "linux")]
