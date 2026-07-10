@@ -24,6 +24,7 @@ use crate::discovery::ports::ListeningPort;
 pub struct PidRouting {
     /// pid → owning target's `log_source_id`.
     by_pid: HashMap<u32, String>,
+    policy_generation: Option<u64>,
 }
 
 // `service_for` (event routing) gets its consumer in the capture-routing slice,
@@ -32,6 +33,40 @@ pub struct PidRouting {
 // accessor surface rather than churn it in and out. `target_pids` is used now.
 #[allow(dead_code)]
 impl PidRouting {
+    /// Construct routing from already-resolved PID ownership. Identical
+    /// duplicate entries collapse; conflicting ownership fails closed so test
+    /// seams and future PID sources cannot silently select config order.
+    pub(crate) fn from_entries<I, S>(entries: I) -> Result<Self, String>
+    where
+        I: IntoIterator<Item = (u32, S)>,
+        S: Into<String>,
+    {
+        let mut by_pid = HashMap::new();
+        for (pid, service) in entries {
+            if pid == 0 {
+                return Err("PID routing cannot contain PID 0".to_string());
+            }
+            let service = service.into();
+            if service.is_empty() {
+                return Err(format!("PID {pid} has an empty log source id"));
+            }
+            if let Some(existing) = by_pid.get(&pid) {
+                if existing != &service {
+                    return Err(format!(
+                        "PID {pid} ambiguously maps to log sources {existing:?} and {service:?}"
+                    ));
+                }
+                continue;
+            }
+            by_pid.insert(pid, service);
+        }
+        let policy_generation = (!by_pid.is_empty()).then_some(1);
+        Ok(Self {
+            by_pid,
+            policy_generation,
+        })
+    }
+
     /// The PIDs to seed into the kernel `TARGET_PIDS` map.
     pub fn target_pids(&self) -> impl Iterator<Item = u32> + '_ {
         self.by_pid.keys().copied()
@@ -41,6 +76,29 @@ impl PidRouting {
     /// not a capture target.
     pub fn service_for(&self, pid: u32) -> Option<&str> {
         self.by_pid.get(&pid).map(String::as_str)
+    }
+
+    pub(crate) fn policy_generation(&self) -> Option<u64> {
+        self.policy_generation
+    }
+
+    pub(crate) fn assign_policy_generation(&mut self, generation: u64) -> Result<(), String> {
+        if self.by_pid.is_empty() {
+            if generation != 0 {
+                return Err("empty PID routing must use policy generation zero".to_string());
+            }
+            self.policy_generation = None;
+        } else {
+            if generation == 0 {
+                return Err("nonempty PID routing requires a policy generation".to_string());
+            }
+            self.policy_generation = Some(generation);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn same_authorization_as(&self, other: &Self) -> bool {
+        self.by_pid == other.by_pid
     }
 
     /// Number of distinct PIDs being captured.
@@ -76,7 +134,11 @@ pub fn resolve_from_ports(census: &[ListeningPort], targets: &[EbpfTargetConfig]
             .or_insert_with(|| owner.log_source_id.clone());
     }
 
-    PidRouting { by_pid }
+    let policy_generation = (!by_pid.is_empty()).then_some(1);
+    PidRouting {
+        by_pid,
+        policy_generation,
+    }
 }
 
 #[cfg(test)]
@@ -181,5 +243,15 @@ mod tests {
         let targets = [target("src-first", &[8080]), target("src-second", &[8080])];
         let routing = resolve_from_ports(&[listening(8080, 1234)], &targets);
         assert_eq!(routing.service_for(1234), Some("src-first"));
+    }
+
+    #[test]
+    fn direct_entries_dedupe_agreement_and_reject_conflict() {
+        let routing = PidRouting::from_entries([(42, "src-a"), (42, "src-a")]).unwrap();
+        assert_eq!(routing.service_for(42), Some("src-a"));
+
+        let error = PidRouting::from_entries([(42, "src-a"), (42, "src-b")]).unwrap_err();
+        assert!(error.contains("ambiguously maps"), "{error}");
+        assert!(PidRouting::from_entries([(0, "src-a")]).is_err());
     }
 }

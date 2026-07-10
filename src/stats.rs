@@ -43,6 +43,8 @@ pub struct StatsReport {
     pub ebpf_build_support: bool,
     #[serde(default)]
     pub ebpf_pids_targeted: usize,
+    #[serde(default)]
+    pub ebpf_cgroups_targeted: usize,
 }
 
 // --- Stream config status ---
@@ -183,9 +185,10 @@ pub async fn run(
             ebpf_has_btf: ebpf.capability.has_btf,
             ebpf_has_cap_bpf: ebpf.capability.has_cap_bpf,
             ebpf_running: ebpf.running,
-            ebpf_last_error: ebpf.last_error.clone(),
+            ebpf_last_error: reported_ebpf_error(&ebpf),
             ebpf_build_support: ebpf.build_support,
             ebpf_pids_targeted: ebpf.pids_targeted,
+            ebpf_cgroups_targeted: ebpf.cgroups_targeted,
         };
 
         // Report to Rails. Only advance the dedup signature once the snapshot is
@@ -201,6 +204,13 @@ pub async fn run(
             }
         }
     }
+}
+
+fn reported_ebpf_error(status: &crate::ebpf::EbpfStatus) -> Option<String> {
+    status
+        .last_error
+        .clone()
+        .or_else(|| status.capability.failure_reason.clone())
 }
 
 async fn collect_stream_status(
@@ -332,6 +342,7 @@ mod tests {
             ebpf_last_error: None,
             ebpf_build_support: false,
             ebpf_pids_targeted: 0,
+            ebpf_cgroups_targeted: 2,
         };
 
         let json = serde_json::to_string(&report).unwrap();
@@ -365,6 +376,7 @@ mod tests {
             !v["ebpf_available"].as_bool().unwrap(),
             "ebpf_available:false should be present"
         );
+        assert_eq!(v["ebpf_cgroups_targeted"], 2);
     }
 
     #[test]
@@ -381,12 +393,48 @@ mod tests {
             ebpf_last_error: None,
             ebpf_build_support: false,
             ebpf_pids_targeted: 0,
+            ebpf_cgroups_targeted: 0,
         };
 
         let json = serde_json::to_string(&report).unwrap();
         assert!(json.contains("\"resource_id\":\"test\""));
         assert!(!json.contains("\"metrics\""));
         assert!(!json.contains("\"stream_status\""));
+    }
+
+    #[test]
+    fn capability_failure_is_reported_when_capture_has_no_runtime_error() {
+        let status = crate::ebpf::EbpfStatus {
+            capability: crate::ebpf::EbpfCapability {
+                failure_reason: Some(
+                    "cgroup v2 unified mode required for eBPF capture scoping".to_string(),
+                ),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        assert_eq!(
+            reported_ebpf_error(&status).as_deref(),
+            Some("cgroup v2 unified mode required for eBPF capture scoping")
+        );
+    }
+
+    #[test]
+    fn runtime_error_takes_precedence_over_capability_failure() {
+        let status = crate::ebpf::EbpfStatus {
+            capability: crate::ebpf::EbpfCapability {
+                failure_reason: Some("capability unavailable".to_string()),
+                ..Default::default()
+            },
+            last_error: Some("listener drain failed".to_string()),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            reported_ebpf_error(&status).as_deref(),
+            Some("listener drain failed")
+        );
     }
 
     #[test]

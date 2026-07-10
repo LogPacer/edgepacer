@@ -1,8 +1,9 @@
 //! Per-connection stream reassembly. The kernel delivers captured bytes as
 //! arbitrary segments (one per `read`/`write`), so a single request or response
 //! can span several segments and several can share one. This layer keys state by
-//! `(pid, fd)`, reassembles each direction's byte stream, detects the protocol
-//! once, and drives the per-protocol parser — advancing past each message
+//! capture generation, policy generation, authorizing scope, actual cgroup,
+//! pid, and fd; reassembles each direction's byte stream; detects the protocol
+//! once; and drives the per-protocol parser — advancing past each message
 //! (head + Content-Length body) so pipelined messages on a kept-alive connection
 //! parse cleanly.
 //!
@@ -30,15 +31,46 @@ const MAX_TRACKED_CONNS: usize = 16_384;
 /// produces these: a slice of bytes seen on `fd`, tagged with its direction.
 #[derive(Debug, Clone)]
 pub struct CapturedSegment {
+    /// Userspace load generation that produced this record. The runner drops
+    /// records from an unloaded BPF program before routing or reassembly.
+    pub capture_generation: u64,
+    /// Atomically selected cgroup or PID authorization-policy generation.
+    pub policy_generation: u64,
     pub pid: u32,
     /// The capturing task's v2 cgroup id — the container/service identity key.
     pub cgroup_id: u64,
+    /// The configured workload anchor that authorized capture. This may be an
+    /// ancestor of `cgroup_id` when the task runs in a nested child cgroup.
+    pub scope_cgroup_id: u64,
     pub fd: u32,
     pub direction: Direction,
     /// When the segment was observed in userspace (unix nanos) — the timing source
     /// for span start + duration until the kernel stamps ktime (a refinement).
     pub timestamp_nano: i64,
     pub bytes: Vec<u8>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) struct CapturedConnectionIdentity {
+    capture_generation: u64,
+    policy_generation: u64,
+    scope_cgroup_id: u64,
+    cgroup_id: u64,
+    pid: u32,
+    fd: u32,
+}
+
+impl CapturedSegment {
+    pub(crate) fn connection_identity(&self) -> CapturedConnectionIdentity {
+        CapturedConnectionIdentity {
+            capture_generation: self.capture_generation,
+            policy_generation: self.policy_generation,
+            scope_cgroup_id: self.scope_cgroup_id,
+            cgroup_id: self.cgroup_id,
+            pid: self.pid,
+            fd: self.fd,
+        }
+    }
 }
 
 /// Outcome of trying to identify a connection's protocol from its inbound prefix.
@@ -236,7 +268,7 @@ fn looks_like_any_request(bytes: &[u8]) -> bool {
         || pulsar::detect_pulsar(bytes).is_some()
 }
 
-/// State for one `(pid, fd)` connection: buffers the inbound prefix until the
+/// State for one captured connection identity: buffers the inbound prefix until the
 /// protocol is recognised, then delegates each direction to the bound parser.
 #[derive(Debug, Default)]
 struct ConnTracker {
@@ -324,11 +356,12 @@ impl ConnTracker {
     }
 }
 
-/// Registry of live connections, keyed `(pid, fd)`. Feed it captured segments;
-/// it returns the request/response records each segment completes.
+/// Registry of live connections, partitioned by the cgroup identity that
+/// authorized and produced each segment. Feed it captured segments; it returns
+/// the request/response records each segment completes.
 #[derive(Debug, Default)]
 pub struct ConnRegistry {
-    conns: HashMap<(u32, u32), ConnTracker>,
+    conns: HashMap<CapturedConnectionIdentity, ConnTracker>,
     dropped_conns: u64,
 }
 
@@ -353,7 +386,7 @@ impl ConnRegistry {
         protocol_hint: Option<&str>,
         flip: bool,
     ) -> Vec<L7Record> {
-        let key = (seg.pid, seg.fd);
+        let key = seg.connection_identity();
         if !self.conns.contains_key(&key) && self.conns.len() >= MAX_TRACKED_CONNS {
             self.dropped_conns += 1;
             return Vec::new();
@@ -372,7 +405,8 @@ impl ConnRegistry {
     /// Evict a connection (called on `close(2)` in the real wiring, and on a
     /// fatal parse error so the slot frees immediately).
     pub fn on_close(&mut self, pid: u32, fd: u32) {
-        self.conns.remove(&(pid, fd));
+        self.conns
+            .retain(|identity, _| identity.pid != pid || identity.fd != fd);
     }
 
     pub fn tracked(&self) -> usize {
@@ -390,13 +424,108 @@ mod tests {
 
     fn seg(pid: u32, fd: u32, direction: Direction, bytes: &[u8]) -> CapturedSegment {
         CapturedSegment {
+            capture_generation: 0,
+            policy_generation: 0,
             pid,
             cgroup_id: 0,
+            scope_cgroup_id: 0,
             fd,
             direction,
             timestamp_nano: 0,
             bytes: bytes.to_vec(),
         }
+    }
+
+    fn scoped_seg(
+        pid: u32,
+        fd: u32,
+        cgroup_id: u64,
+        scope_cgroup_id: u64,
+        direction: Direction,
+        bytes: &[u8],
+    ) -> CapturedSegment {
+        CapturedSegment {
+            capture_generation: 1,
+            policy_generation: 1,
+            pid,
+            cgroup_id,
+            scope_cgroup_id,
+            fd,
+            direction,
+            timestamp_nano: 0,
+            bytes: bytes.to_vec(),
+        }
+    }
+
+    #[test]
+    fn identical_pid_and_fd_cannot_reassemble_across_cgroup_scopes() {
+        let mut reg = ConnRegistry::new();
+        let request = scoped_seg(
+            7,
+            3,
+            101,
+            100,
+            Direction::Inbound,
+            b"GET /scope-a HTTP/1.1\r\n\r\n",
+        );
+        let wrong_scope_response = scoped_seg(
+            7,
+            3,
+            201,
+            200,
+            Direction::Outbound,
+            b"HTTP/1.1 200 OK\r\n\r\n",
+        );
+        let matching_response = scoped_seg(
+            7,
+            3,
+            101,
+            100,
+            Direction::Outbound,
+            b"HTTP/1.1 200 OK\r\n\r\n",
+        );
+
+        assert!(reg.on_segment(&request).is_empty());
+        assert!(reg.on_segment(&wrong_scope_response).is_empty());
+        let records = reg.on_segment(&matching_response);
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].operation, "GET /scope-a");
+    }
+
+    #[test]
+    fn identical_connection_identity_cannot_reassemble_across_policy_generations() {
+        let mut reg = ConnRegistry::new();
+        let request = scoped_seg(
+            7,
+            3,
+            101,
+            100,
+            Direction::Inbound,
+            b"GET /generation-one HTTP/1.1\r\n\r\n",
+        );
+        let mut wrong_generation = scoped_seg(
+            7,
+            3,
+            101,
+            100,
+            Direction::Outbound,
+            b"HTTP/1.1 200 OK\r\n\r\n",
+        );
+        wrong_generation.policy_generation = 2;
+        let matching_response = scoped_seg(
+            7,
+            3,
+            101,
+            100,
+            Direction::Outbound,
+            b"HTTP/1.1 200 OK\r\n\r\n",
+        );
+
+        assert!(reg.on_segment(&request).is_empty());
+        assert!(reg.on_segment(&wrong_generation).is_empty());
+        let records = reg.on_segment(&matching_response);
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].operation, "GET /generation-one");
     }
 
     #[test]

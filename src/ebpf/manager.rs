@@ -3,10 +3,10 @@
 //! `config_hash`, mirroring `trace_proxy_manager.rs`.
 //!
 //! Unlike the trace proxy manager (one proxy per `log_source_id`), eBPF capture
-//! is **one** kernel program serving **many** PIDs, so this manager is a
-//! singleton lifecycle keyed on the whole section's `config_hash`, plus a
-//! per-tick refresh of the kernel `TARGET_PIDS` filter from the live ports
-//! census.
+//! is one kernel program serving many workloads. This manager owns its singleton
+//! lifecycle, refreshes the temporary PID fallback from the live port census,
+//! and atomically replaces the cgroup allow-set built from authoritative
+//! listener and runtime identity.
 //!
 //! The kernel side sits behind [`CaptureProgram`] so the reconcile orchestration
 //! is unit-tested on every platform with a fake; the real aya-backed
@@ -16,6 +16,7 @@
 use tokio::sync::oneshot;
 use tracing::{debug, info};
 
+use super::cgroup_resolver::CgroupRouting;
 use super::pid_resolver::{PidRouting, resolve_from_ports};
 use crate::config::EbpfSectionConfig;
 use crate::discovery::ports::ListeningPort;
@@ -44,6 +45,11 @@ pub trait CaptureProgram {
     /// Make the kernel `TARGET_PIDS` filter reflect exactly `routing`. Called
     /// each tick while running so newly-started and exited PIDs track the census.
     fn set_target_pids(&mut self, routing: &PidRouting) -> Result<(), String>;
+
+    /// Atomically replace the kernel cgroup allow-set with `routing`. Called
+    /// only while running, after userspace has established an authoritative
+    /// workload identity snapshot.
+    fn set_allowed_cgroups(&mut self, routing: &CgroupRouting) -> Result<(), String>;
 
     /// Current listener-drain generation and per-CPU monotonic counts of events
     /// published or lost. This fails if the mandatory drain died.
@@ -117,6 +123,8 @@ pub struct ReconcileOutcome {
 pub struct EbpfManager<P: CaptureProgram> {
     program: P,
     state: ManagerState,
+    active_pid_routing: PidRouting,
+    next_pid_policy_generation: u64,
 }
 
 impl<P: CaptureProgram> EbpfManager<P> {
@@ -124,6 +132,8 @@ impl<P: CaptureProgram> EbpfManager<P> {
         Self {
             program,
             state: ManagerState::Stopped,
+            active_pid_routing: PidRouting::default(),
+            next_pid_policy_generation: 0,
         }
     }
 
@@ -139,6 +149,7 @@ impl<P: CaptureProgram> EbpfManager<P> {
             ReconcileAction::Stop => {
                 self.program.stop();
                 self.state = ManagerState::Stopped;
+                self.active_pid_routing = PidRouting::default();
                 info!("eBPF capture stopped (disabled)");
                 None
             }
@@ -146,6 +157,7 @@ impl<P: CaptureProgram> EbpfManager<P> {
             ReconcileAction::Restart => {
                 self.program.stop();
                 self.state = ManagerState::Stopped;
+                self.active_pid_routing = PidRouting::default();
                 info!("eBPF capture restarting (config changed)");
                 self.start(section).err()
             }
@@ -154,12 +166,32 @@ impl<P: CaptureProgram> EbpfManager<P> {
         let mut routing = PidRouting::default();
         if error.is_none() && matches!(self.state, ManagerState::Running { .. }) {
             routing = resolve_from_ports(census, &section.targets);
-            if let Err(e) = self.program.set_target_pids(&routing) {
+            if !routing.is_empty() {
+                let generation = if routing.same_authorization_as(&self.active_pid_routing) {
+                    self.active_pid_routing
+                        .policy_generation()
+                        .unwrap_or_else(|| self.next_pid_generation())
+                } else {
+                    self.next_pid_generation()
+                };
+                if let Err(e) = routing.assign_policy_generation(generation) {
+                    self.program.stop();
+                    self.state = ManagerState::Stopped;
+                    self.active_pid_routing = PidRouting::default();
+                    routing = PidRouting::default();
+                    error = Some(e);
+                }
+            }
+            if error.is_none()
+                && let Err(e) = self.program.set_target_pids(&routing)
+            {
                 self.program.stop();
                 self.state = ManagerState::Stopped;
+                self.active_pid_routing = PidRouting::default();
                 routing = PidRouting::default();
                 error = Some(e);
-            } else {
+            } else if error.is_none() {
+                self.active_pid_routing = routing.clone();
                 debug!(pids = routing.len(), "refreshed eBPF target PIDs");
             }
         }
@@ -176,6 +208,7 @@ impl<P: CaptureProgram> EbpfManager<P> {
         if matches!(self.state, ManagerState::Running { .. }) {
             self.program.stop();
             self.state = ManagerState::Stopped;
+            self.active_pid_routing = PidRouting::default();
             info!("eBPF capture shut down");
         }
     }
@@ -199,15 +232,36 @@ impl<P: CaptureProgram> EbpfManager<P> {
         self.program.listener_fence(published_counts)
     }
 
+    /// Replace the active cgroup policy while capture is running. A failed map
+    /// update makes the kernel's effective policy uncertain, so fail closed by
+    /// unloading the entire capture program and returning to `Stopped`.
+    pub fn set_allowed_cgroups(&mut self, routing: &CgroupRouting) -> Result<(), String> {
+        if !matches!(self.state, ManagerState::Running { .. }) {
+            return Err("set_allowed_cgroups requested while capture is stopped".to_string());
+        }
+        if let Err(error) = self.program.set_allowed_cgroups(routing) {
+            self.program.stop();
+            self.state = ManagerState::Stopped;
+            return Err(error);
+        }
+        Ok(())
+    }
+
     /// Load + attach, advancing to `Running` only on success — so `running`
     /// never reports true for a program that failed to attach.
     fn start(&mut self, section: &EbpfSectionConfig) -> Result<(), String> {
         self.program.start(section)?;
+        self.active_pid_routing = PidRouting::default();
         self.state = ManagerState::Running {
             config_hash: section.config_hash.clone(),
         };
         info!(config_hash = %section.config_hash, "eBPF capture started");
         Ok(())
+    }
+
+    fn next_pid_generation(&mut self) -> u64 {
+        self.next_pid_policy_generation = self.next_pid_policy_generation.wrapping_add(1).max(1);
+        self.next_pid_policy_generation
     }
 }
 
@@ -215,14 +269,17 @@ impl<P: CaptureProgram> EbpfManager<P> {
 mod tests {
     use super::*;
     use crate::config::EbpfTargetConfig;
+    use crate::ebpf::cgroup_resolver::CgroupAnchor;
 
     #[derive(Default)]
     struct FakeProgram {
         started: usize,
         stopped: usize,
         seeded: Vec<PidRouting>,
+        seeded_cgroups: Vec<CgroupRouting>,
         fail_start: bool,
         fail_seed: bool,
+        fail_cgroup_seed: bool,
     }
 
     impl CaptureProgram for FakeProgram {
@@ -244,6 +301,14 @@ mod tests {
                 return Err("seed failed".to_string());
             }
             self.seeded.push(routing.clone());
+            Ok(())
+        }
+
+        fn set_allowed_cgroups(&mut self, routing: &CgroupRouting) -> Result<(), String> {
+            if self.fail_cgroup_seed {
+                return Err("cgroup seed failed".to_string());
+            }
+            self.seeded_cgroups.push(routing.clone());
             Ok(())
         }
 
@@ -365,6 +430,20 @@ mod tests {
         // Seeded once per tick; the second tick reflects the new census PID.
         assert_eq!(manager.program.seeded.len(), 2);
         assert_eq!(manager.program.seeded[1].service_for(200), Some("src-a"));
+        assert_ne!(
+            manager.program.seeded[0].policy_generation(),
+            manager.program.seeded[1].policy_generation()
+        );
+
+        let stable_generation = manager.program.seeded[1].policy_generation();
+        manager.reconcile(
+            &section(true, "h1", vec![target("src-a", &[8080])]),
+            &[listening(8080, 200)],
+        );
+        assert_eq!(
+            manager.program.seeded[2].policy_generation(),
+            stable_generation
+        );
     }
 
     #[test]
@@ -427,6 +506,68 @@ mod tests {
     fn shutdown_when_stopped_is_a_noop() {
         let mut manager = EbpfManager::new(FakeProgram::default());
         manager.shutdown();
+        assert_eq!(manager.program.stopped, 0);
+    }
+
+    #[test]
+    fn allowed_cgroup_policy_can_be_set_and_cleared_while_running() {
+        let mut manager = EbpfManager::new(FakeProgram::default());
+        manager.reconcile(&section(true, "h1", vec![]), &[]);
+
+        let routing =
+            CgroupRouting::from_entries(7, [(CgroupAnchor { id: 42, level: 3 }, "src-a")]).unwrap();
+        manager.set_allowed_cgroups(&routing).unwrap();
+
+        manager
+            .set_allowed_cgroups(&CgroupRouting::default())
+            .unwrap();
+
+        assert_eq!(manager.program.seeded_cgroups.len(), 2);
+        assert_eq!(
+            manager.program.seeded_cgroups[0].service_for(42),
+            Some("src-a")
+        );
+        assert!(manager.program.seeded_cgroups[1].is_empty());
+        assert!(matches!(manager.state, ManagerState::Running { .. }));
+    }
+
+    #[test]
+    fn allowed_cgroup_seed_failure_unloads_and_restarts_cleanly() {
+        let program = FakeProgram {
+            fail_cgroup_seed: true,
+            ..FakeProgram::default()
+        };
+        let mut manager = EbpfManager::new(program);
+        manager.reconcile(&section(true, "h1", vec![]), &[]);
+
+        let error = manager
+            .set_allowed_cgroups(&CgroupRouting::default())
+            .unwrap_err();
+
+        assert_eq!(error, "cgroup seed failed");
+        assert_eq!(manager.state, ManagerState::Stopped);
+        assert_eq!(manager.program.stopped, 1);
+
+        manager.program.fail_cgroup_seed = false;
+        let retry = manager.reconcile(&section(true, "h1", vec![]), &[]);
+        assert!(retry.running);
+        assert_eq!(manager.program.started, 2);
+        assert_eq!(manager.program.stopped, 1);
+    }
+
+    #[test]
+    fn allowed_cgroup_policy_cannot_be_set_while_stopped() {
+        let mut manager = EbpfManager::new(FakeProgram::default());
+
+        let error = manager
+            .set_allowed_cgroups(&CgroupRouting::default())
+            .unwrap_err();
+
+        assert_eq!(
+            error,
+            "set_allowed_cgroups requested while capture is stopped"
+        );
+        assert!(manager.program.seeded_cgroups.is_empty());
         assert_eq!(manager.program.stopped, 0);
     }
 }

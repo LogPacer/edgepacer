@@ -2,8 +2,9 @@
 //!
 //! Live BPF events are deltas, not an inventory: they cannot recover listeners
 //! that predate program attachment and they do not announce closes. A periodic
-//! authoritative snapshot therefore replaces the ownership set, while events
-//! observed at or after the snapshot's monotonic cut are replayed over it.
+//! authoritative snapshot therefore replaces the ownership set. Live events
+//! lack network-namespace provenance, so they invalidate ownership and force a
+//! fresh snapshot instead of being replayed into the host inventory.
 
 use std::collections::{HashMap, HashSet};
 
@@ -14,18 +15,46 @@ pub struct ListenerAssociation {
     pub cgroup_id: u64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub(crate) struct NetworkNamespaceToken {
+    pub(crate) device: u64,
+    pub(crate) inode: u64,
+}
+
+impl NetworkNamespaceToken {
+    pub(crate) fn new(device: u64, inode: u64) -> Result<Self, String> {
+        if device == 0 || inode == 0 {
+            return Err("network namespace token contains zero".to_string());
+        }
+        Ok(Self { device, inode })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) struct ForeignListenerCandidate {
+    pub(crate) port: u16,
+    pub(crate) cgroup_id: u64,
+    pub(crate) network_namespace: NetworkNamespaceToken,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) struct ForeignRuntimeIdentity {
+    pub(crate) cgroup_id: u64,
+    pub(crate) network_namespace: NetworkNamespaceToken,
+}
+
 #[derive(Debug, Clone)]
 pub struct ListenerSnapshot {
     root_cgroup_id: u64,
     associations: HashSet<ListenerAssociation>,
-    foreign_candidates: HashMap<u16, HashSet<u64>>,
+    foreign_candidates: HashMap<u16, HashSet<ForeignRuntimeIdentity>>,
 }
 
 impl ListenerSnapshot {
     pub fn new(
         root_cgroup_id: u64,
         associations: impl IntoIterator<Item = ListenerAssociation>,
-        foreign_candidates: impl IntoIterator<Item = (u16, u64)>,
+        foreign_candidates: impl IntoIterator<Item = ForeignListenerCandidate>,
     ) -> Result<Self, String> {
         if root_cgroup_id == 0 {
             return Err("root cgroup id is zero".to_string());
@@ -35,13 +64,20 @@ impl ListenerSnapshot {
         for association in &associations {
             validate_association(*association, root_cgroup_id)?;
         }
-        let mut candidates_by_port: HashMap<u16, HashSet<u64>> = HashMap::new();
-        for (port, cgroup_id) in foreign_candidates {
-            validate_candidate(port, cgroup_id, root_cgroup_id)?;
+        let mut candidates_by_port: HashMap<u16, HashSet<ForeignRuntimeIdentity>> = HashMap::new();
+        for candidate in foreign_candidates {
+            validate_candidate(candidate.port, candidate.cgroup_id, root_cgroup_id)?;
+            NetworkNamespaceToken::new(
+                candidate.network_namespace.device,
+                candidate.network_namespace.inode,
+            )?;
             candidates_by_port
-                .entry(port)
+                .entry(candidate.port)
                 .or_default()
-                .insert(cgroup_id);
+                .insert(ForeignRuntimeIdentity {
+                    cgroup_id: candidate.cgroup_id,
+                    network_namespace: candidate.network_namespace,
+                });
         }
 
         Ok(Self {
@@ -54,13 +90,14 @@ impl ListenerSnapshot {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DeltaOutcome {
-    Inserted,
-    AlreadyPresent,
-    Buffered,
+    /// A live listener change has no trustworthy network-namespace provenance,
+    /// so it invalidated previously authoritative ownership.
+    Invalidated,
+    /// The change was observed while ownership was already unavailable. A
+    /// snapshot that started before it must be discarded and retried.
+    Quarantined,
     IgnoredBeforeCut,
     IgnoredInvalid,
-    AtCapacity { should_warn: bool },
-    BufferAtCapacity { should_warn: bool },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -68,36 +105,35 @@ pub enum PortEvidence {
     NotReady,
     Absent,
     Present {
-        /// Socket-creation cgroups observed by sock_diag or live BPF. These are
-        /// exact socket facts, not proof of which cgroup consumes traffic.
+        /// Socket-creation cgroups observed by the current-namespace sock_diag
+        /// snapshot. These are exact socket facts, not proof of which cgroup
+        /// consumes traffic.
         socket_cgroups: HashSet<u64>,
-        /// Runtime cgroups whose foreign network namespace contained the port.
-        /// Target resolution must intersect these candidates with explicit
-        /// runtime/service identity before authorizing anything.
-        foreign_runtime_cgroups: HashSet<u64>,
+        /// Runtime cgroup plus exact foreign-network-namespace tokens that
+        /// contained the port. Target resolution must intersect both with
+        /// current explicit runtime/service identity before authorizing.
+        foreign_runtime_candidates: HashSet<ForeignRuntimeIdentity>,
     },
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct InFlightSnapshot {
     generation: u64,
     cut_ns: u64,
     listener_drop_counts: Vec<u64>,
-    deltas: HashMap<ListenerAssociation, u64>,
-    overflowed: bool,
-    overflow_warning_emitted: bool,
+    unclassified_delta_observed: bool,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct ListenerState {
     owners: HashMap<(u16, u16), HashSet<u64>>,
-    foreign_candidates: HashMap<u16, HashSet<u64>>,
-    foreign_candidate_count: usize,
+    foreign_candidates: HashMap<u16, HashSet<ForeignRuntimeIdentity>>,
     association_count: usize,
-    capacity_warning_emitted: bool,
     root_cgroup_id: Option<u64>,
     applied_cut_ns: u64,
+    applied_generation: Option<u64>,
     applied_drop_counts: Option<Vec<u64>>,
+    authorization_revision: u64,
     ready: bool,
     generation: u64,
     in_flight: Option<InFlightSnapshot>,
@@ -120,6 +156,50 @@ impl ListenerState {
         self.in_flight
             .as_ref()
             .is_some_and(|in_flight| in_flight.generation == generation)
+    }
+
+    /// Generation of the last applied snapshot that remains valid authorization
+    /// evidence. A same-revision replacement snapshot does not create a gap;
+    /// observed listener change or loss clears `ready` and therefore this value.
+    pub fn authorization_generation(&self) -> Option<u64> {
+        if !self.ready {
+            return None;
+        }
+        self.applied_generation
+    }
+
+    /// Revision of the material listener evidence behind the active policy.
+    /// Applying an identical replacement advances its snapshot generation but
+    /// deliberately preserves this revision and the existing kernel policy.
+    pub fn authorization_revision(&self) -> Option<u64> {
+        self.ready.then_some(self.authorization_revision)
+    }
+
+    /// Generation a background resolution result may publish for. Starting a
+    /// newer snapshot keeps the old applied policy available but makes the older
+    /// worker result stale until that replacement is applied and resolved.
+    pub fn publishable_authorization_generation(&self) -> Option<u64> {
+        if self.in_flight.is_some() {
+            return None;
+        }
+        self.authorization_generation()
+    }
+
+    /// Revalidate a background resolver result against the listener snapshot
+    /// and loss vector observed after its final publication fence.
+    pub fn validate_authorization(
+        &mut self,
+        generation: u64,
+        listener_drop_counts: &[u64],
+    ) -> Result<(), String> {
+        if self.publishable_authorization_generation() != Some(generation) {
+            return Err("listener authorization changed while resolving cgroups".to_string());
+        }
+        if self.applied_drop_counts.as_deref() != Some(listener_drop_counts) {
+            self.clear_ownership();
+            return Err("listener discovery lost events while resolving cgroups".to_string());
+        }
+        Ok(())
     }
 
     /// Start a snapshot at `cut_ns`. Returns `None` when another snapshot is
@@ -148,9 +228,7 @@ impl ListenerState {
             generation,
             cut_ns,
             listener_drop_counts,
-            deltas: HashMap::new(),
-            overflowed: false,
-            overflow_warning_emitted: false,
+            unclassified_delta_observed: false,
         });
         Some(generation)
     }
@@ -164,8 +242,6 @@ impl ListenerState {
         &mut self,
         association: ListenerAssociation,
         observed_at_ns: u64,
-        association_limit: usize,
-        delta_limit: usize,
     ) -> DeltaOutcome {
         if observed_at_ns == 0
             || association.port == 0
@@ -176,47 +252,33 @@ impl ListenerState {
             return DeltaOutcome::IgnoredInvalid;
         }
 
-        let mut outcome = if self.ready {
-            if observed_at_ns < self.applied_cut_ns {
-                DeltaOutcome::IgnoredBeforeCut
-            } else {
-                self.insert(association, association_limit)
-            }
-        } else {
-            DeltaOutcome::Buffered
-        };
+        if self.ready && observed_at_ns < self.applied_cut_ns {
+            return DeltaOutcome::IgnoredBeforeCut;
+        }
 
         if let Some(in_flight) = self.in_flight.as_mut()
             && observed_at_ns >= in_flight.cut_ns
         {
-            if let Some(timestamp) = in_flight.deltas.get_mut(&association) {
-                *timestamp = (*timestamp).max(observed_at_ns);
-            } else if in_flight.deltas.len() < delta_limit {
-                in_flight.deltas.insert(association, observed_at_ns);
-            } else {
-                in_flight.overflowed = true;
-                let should_warn = !in_flight.overflow_warning_emitted;
-                in_flight.overflow_warning_emitted = true;
-                outcome = DeltaOutcome::BufferAtCapacity { should_warn };
-            }
+            in_flight.unclassified_delta_observed = true;
         }
 
-        // Once either bounded set drops an association, ownership is no longer
-        // authoritative. Invalidate it in the same call; waiting for the
-        // snapshot worker would leave a partial allow-set usable meanwhile.
-        if matches!(
-            outcome,
-            DeltaOutcome::AtCapacity { .. } | DeltaOutcome::BufferAtCapacity { .. }
-        ) {
+        if self.ready {
+            // Listener events are host-wide but carry no network-namespace
+            // identity. Never merge one into the host sock_diag inventory: an
+            // isolated namespace could otherwise authorize a host target that
+            // happens to use the same port. Treat it only as invalidation and
+            // require the next authoritative snapshot to classify the listener.
             self.clear_ownership();
+            DeltaOutcome::Invalidated
+        } else {
+            DeltaOutcome::Quarantined
         }
-
-        outcome
     }
 
-    /// Replace ownership with an authoritative snapshot and replay every live
-    /// delta at or after its cut. `Ok(false)` means a stale result arrived after
-    /// reset or a newer generation and was ignored.
+    /// Replace ownership with an authoritative snapshot only when no
+    /// namespace-unclassified live listener event occurred after its cut.
+    /// `Ok(false)` means a stale result arrived after reset or a newer
+    /// generation and was ignored.
     pub fn apply_snapshot_with_loss(
         &mut self,
         generation: u64,
@@ -238,9 +300,11 @@ impl ListenerState {
                 in_flight.listener_drop_counts
             ));
         }
-        if in_flight.overflowed {
+        if in_flight.unclassified_delta_observed {
             self.clear_ownership();
-            return Err("listener deltas exceeded the snapshot replay limit".to_string());
+            return Err(
+                "unclassified listener change occurred during snapshot; retry required".to_string(),
+            );
         }
         let snapshot_evidence_count = snapshot
             .associations
@@ -254,25 +318,8 @@ impl ListenerState {
         }
 
         let root_cgroup_id = snapshot.root_cgroup_id;
-        let mut associations = snapshot.associations;
+        let associations = snapshot.associations;
         let foreign_candidates = snapshot.foreign_candidates;
-        for (association, observed_at_ns) in in_flight.deltas {
-            if observed_at_ns < in_flight.cut_ns
-                || validate_association(association, root_cgroup_id).is_err()
-            {
-                continue;
-            }
-            associations.insert(association);
-        }
-        let foreign_candidate_count = candidate_count(&foreign_candidates);
-        let replayed_evidence_count = associations.len().saturating_add(foreign_candidate_count);
-        if replayed_evidence_count > association_limit {
-            self.clear_ownership();
-            return Err(format!(
-                "snapshot plus replay contains {replayed_evidence_count} listener evidence records (limit {association_limit})"
-            ));
-        }
-
         let mut owners: HashMap<(u16, u16), HashSet<u64>> = HashMap::new();
         for association in associations {
             owners
@@ -281,13 +328,22 @@ impl ListenerState {
                 .insert(association.cgroup_id);
         }
 
+        let authorization_is_unchanged = self.ready
+            && self.root_cgroup_id == Some(root_cgroup_id)
+            && self.owners == owners
+            && self.foreign_candidates == foreign_candidates
+            && self.applied_drop_counts.as_ref() == Some(&listener_drop_counts);
+        if !authorization_is_unchanged {
+            self.authorization_revision = self.authorization_revision.wrapping_add(1).max(1);
+        }
+
         self.clear_ownership();
         self.association_count = owners.values().map(HashSet::len).sum();
         self.owners = owners;
         self.foreign_candidates = foreign_candidates;
-        self.foreign_candidate_count = foreign_candidate_count;
         self.root_cgroup_id = Some(root_cgroup_id);
         self.applied_cut_ns = in_flight.cut_ns;
+        self.applied_generation = Some(generation);
         self.applied_drop_counts = Some(listener_drop_counts);
         self.ready = true;
         Ok(true)
@@ -324,6 +380,7 @@ impl ListenerState {
         self.in_flight = None;
         self.root_cgroup_id = None;
         self.applied_cut_ns = 0;
+        self.applied_generation = None;
         self.applied_drop_counts = None;
         self.clear_ownership();
     }
@@ -342,17 +399,17 @@ impl ListenerState {
             .filter(|((_, candidate_port), _)| *candidate_port == port)
             .flat_map(|(_, cgroups)| cgroups.iter().copied())
             .collect();
-        let foreign_runtime_cgroups = self
+        let foreign_runtime_candidates = self
             .foreign_candidates
             .get(&port)
             .cloned()
             .unwrap_or_default();
-        if socket_cgroups.is_empty() && foreign_runtime_cgroups.is_empty() {
+        if socket_cgroups.is_empty() && foreign_runtime_candidates.is_empty() {
             PortEvidence::Absent
         } else {
             PortEvidence::Present {
                 socket_cgroups,
-                foreign_runtime_cgroups,
+                foreign_runtime_candidates,
             }
         }
     }
@@ -365,39 +422,11 @@ impl ListenerState {
         }
     }
 
-    fn insert(&mut self, association: ListenerAssociation, limit: usize) -> DeltaOutcome {
-        let key = (association.family, association.port);
-        if self
-            .owners
-            .get(&key)
-            .is_some_and(|owners| owners.contains(&association.cgroup_id))
-        {
-            return DeltaOutcome::AlreadyPresent;
-        }
-        if self
-            .association_count
-            .saturating_add(self.foreign_candidate_count)
-            >= limit
-        {
-            let should_warn = !self.capacity_warning_emitted;
-            self.capacity_warning_emitted = true;
-            return DeltaOutcome::AtCapacity { should_warn };
-        }
-
-        self.owners
-            .entry(key)
-            .or_default()
-            .insert(association.cgroup_id);
-        self.association_count += 1;
-        DeltaOutcome::Inserted
-    }
-
     fn clear_ownership(&mut self) {
         self.owners.clear();
         self.foreign_candidates.clear();
-        self.foreign_candidate_count = 0;
         self.association_count = 0;
-        self.capacity_warning_emitted = false;
+        self.applied_generation = None;
         self.ready = false;
     }
 }
@@ -423,7 +452,7 @@ fn validate_candidate(port: u16, cgroup_id: u64, root_cgroup_id: u64) -> Result<
     Ok(())
 }
 
-fn candidate_count(candidates: &HashMap<u16, HashSet<u64>>) -> usize {
+fn candidate_count<T>(candidates: &HashMap<u16, HashSet<T>>) -> usize {
     candidates.values().map(HashSet::len).sum()
 }
 
@@ -452,23 +481,28 @@ mod tests {
         }
     }
 
+    fn foreign(port: u16, cgroup_id: u64) -> ForeignListenerCandidate {
+        ForeignListenerCandidate {
+            port,
+            cgroup_id,
+            network_namespace: NetworkNamespaceToken::new(2, cgroup_id.saturating_add(100))
+                .unwrap(),
+        }
+    }
+
     fn snapshot(associations: impl IntoIterator<Item = ListenerAssociation>) -> ListenerSnapshot {
         ListenerSnapshot::new(ROOT, associations, []).unwrap()
     }
 
     #[test]
-    fn first_snapshot_replays_only_deltas_at_or_after_the_cut() {
+    fn pre_cut_change_is_left_to_the_authoritative_snapshot() {
         let mut state = ListenerState::default();
         let generation = state.begin_snapshot(100).unwrap();
         assert!(state.snapshot_in_flight());
 
         assert_eq!(
-            state.record_delta(listener(10, 8080), 99, LIMIT, LIMIT),
-            DeltaOutcome::Buffered
-        );
-        assert_eq!(
-            state.record_delta(listener(20, 9090), 100, LIMIT, LIMIT),
-            DeltaOutcome::Buffered
+            state.record_delta(listener(10, 8080), 99),
+            DeltaOutcome::Quarantined
         );
 
         assert!(
@@ -478,8 +512,25 @@ mod tests {
         );
         assert!(state.is_ready());
         assert!(state.cgroups_for_port(8080).is_empty());
-        assert_eq!(state.cgroups_for_port(9090), HashSet::from([20]));
         assert_eq!(state.cgroups_for_port(3000), HashSet::from([30]));
+    }
+
+    #[test]
+    fn post_cut_unclassified_change_discards_snapshot() {
+        let mut state = ListenerState::default();
+        let generation = state.begin_snapshot(100).unwrap();
+
+        assert_eq!(
+            state.record_delta(listener(20, 9090), 100),
+            DeltaOutcome::Quarantined
+        );
+        let error = state
+            .apply_snapshot(generation, snapshot([listener(30, 3000)]), LIMIT)
+            .unwrap_err();
+
+        assert!(error.contains("unclassified listener change"), "{error}");
+        assert!(!state.is_ready());
+        assert!(state.cgroups_for_port(3000).is_empty());
     }
 
     #[test]
@@ -500,7 +551,32 @@ mod tests {
     }
 
     #[test]
-    fn live_delta_survives_a_periodic_snapshot_race() {
+    fn identical_replacement_preserves_listener_authorization_revision() {
+        let mut state = ListenerState::default();
+        let first = state.begin_snapshot_with_loss(100, vec![7]).unwrap();
+        state
+            .apply_snapshot_with_loss(first, snapshot([listener(10, 8080)]), vec![7], LIMIT)
+            .unwrap();
+        let revision = state.authorization_revision().unwrap();
+
+        let replacement = state.begin_snapshot_with_loss(200, vec![7]).unwrap();
+        assert_eq!(state.authorization_revision(), Some(revision));
+        state
+            .apply_snapshot_with_loss(replacement, snapshot([listener(10, 8080)]), vec![7], LIMIT)
+            .unwrap();
+
+        assert_eq!(state.authorization_revision(), Some(revision));
+        assert_eq!(state.authorization_generation(), Some(replacement));
+
+        let changed = state.begin_snapshot_with_loss(300, vec![7]).unwrap();
+        state
+            .apply_snapshot_with_loss(changed, snapshot([listener(20, 9090)]), vec![7], LIMIT)
+            .unwrap();
+        assert_ne!(state.authorization_revision(), Some(revision));
+    }
+
+    #[test]
+    fn live_delta_invalidates_ready_state_and_periodic_snapshot() {
         let mut state = ListenerState::default();
         let first = state.begin_snapshot(100).unwrap();
         state
@@ -509,14 +585,18 @@ mod tests {
 
         let second = state.begin_snapshot(200).unwrap();
         assert_eq!(
-            state.record_delta(listener(20, 9090), 201, LIMIT, LIMIT),
-            DeltaOutcome::Inserted
+            state.record_delta(listener(20, 9090), 201),
+            DeltaOutcome::Invalidated
         );
-        state
-            .apply_snapshot(second, snapshot([listener(10, 8080)]), LIMIT)
-            .unwrap();
+        assert!(!state.is_ready());
+        assert!(
+            state
+                .apply_snapshot(second, snapshot([listener(10, 8080)]), LIMIT)
+                .is_err()
+        );
 
-        assert_eq!(state.cgroups_for_port(9090), HashSet::from([20]));
+        assert!(state.cgroups_for_port(8080).is_empty());
+        assert!(state.cgroups_for_port(9090).is_empty());
     }
 
     #[test]
@@ -528,7 +608,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(
-            state.record_delta(listener(10, 8080), 99, LIMIT, LIMIT),
+            state.record_delta(listener(10, 8080), 99),
             DeltaOutcome::IgnoredBeforeCut
         );
         assert!(state.cgroups_for_port(8080).is_empty());
@@ -589,16 +669,16 @@ mod tests {
     }
 
     #[test]
-    fn replay_buffer_overflow_fails_closed() {
+    fn repeated_post_cut_changes_keep_snapshot_quarantined() {
         let mut state = ListenerState::default();
         let generation = state.begin_snapshot(100).unwrap();
         assert_eq!(
-            state.record_delta(listener(10, 8080), 101, LIMIT, 1),
-            DeltaOutcome::Buffered
+            state.record_delta(listener(10, 8080), 101),
+            DeltaOutcome::Quarantined
         );
         assert_eq!(
-            state.record_delta(listener(20, 9090), 102, LIMIT, 1),
-            DeltaOutcome::BufferAtCapacity { should_warn: true }
+            state.record_delta(listener(10, 8080), 102),
+            DeltaOutcome::Quarantined
         );
 
         assert!(
@@ -610,58 +690,20 @@ mod tests {
     }
 
     #[test]
-    fn repeated_delta_does_not_exhaust_the_replay_buffer() {
-        let mut state = ListenerState::default();
-        let generation = state.begin_snapshot(100).unwrap();
-        assert_eq!(
-            state.record_delta(listener(10, 8080), 101, LIMIT, 1),
-            DeltaOutcome::Buffered
-        );
-        assert_eq!(
-            state.record_delta(listener(10, 8080), 102, LIMIT, 1),
-            DeltaOutcome::Buffered
-        );
-
-        assert!(
-            state
-                .apply_snapshot(generation, snapshot([]), LIMIT)
-                .unwrap()
-        );
-        assert_eq!(state.cgroups_for_port(8080), HashSet::from([10]));
-    }
-
-    #[test]
-    fn replay_overflow_invalidates_ready_state_immediately() {
+    fn unclassified_live_change_invalidates_ready_state_immediately() {
         let mut state = ListenerState::default();
         let first = state.begin_snapshot(100).unwrap();
         state
             .apply_snapshot(first, snapshot([listener(10, 8080)]), LIMIT)
             .unwrap();
-        state.begin_snapshot(200).unwrap();
 
         assert_eq!(
-            state.record_delta(listener(20, 9090), 201, LIMIT, 0),
-            DeltaOutcome::BufferAtCapacity { should_warn: true }
+            state.record_delta(listener(20, 9090), 101),
+            DeltaOutcome::Invalidated
         );
         assert!(!state.is_ready());
         assert!(state.cgroups_for_port(8080).is_empty());
         assert!(state.cgroups_for_port(9090).is_empty());
-    }
-
-    #[test]
-    fn live_association_overflow_invalidates_ready_state_immediately() {
-        let mut state = ListenerState::default();
-        let first = state.begin_snapshot(100).unwrap();
-        state
-            .apply_snapshot(first, snapshot([listener(10, 8080)]), 1)
-            .unwrap();
-
-        assert_eq!(
-            state.record_delta(listener(20, 9090), 101, 1, LIMIT),
-            DeltaOutcome::AtCapacity { should_warn: true }
-        );
-        assert!(!state.is_ready());
-        assert!(state.cgroups_for_port(8080).is_empty());
     }
 
     #[test]
@@ -699,12 +741,31 @@ mod tests {
     }
 
     #[test]
+    fn kernel_listener_loss_during_cgroup_resolution_invalidates_authorization() {
+        let mut state = ListenerState::default();
+        let generation = state.begin_snapshot_with_loss(100, vec![7]).unwrap();
+        state
+            .apply_snapshot_with_loss(generation, snapshot([listener(10, 8080)]), vec![7], LIMIT)
+            .unwrap();
+
+        assert_eq!(state.authorization_generation(), Some(generation));
+        let error = state.validate_authorization(generation, &[8]).unwrap_err();
+
+        assert!(error.contains("lost events"), "{error}");
+        assert!(!state.is_ready());
+        assert_eq!(state.authorization_generation(), None);
+    }
+
+    #[test]
     fn foreign_candidates_stay_distinct_from_socket_cgroups() {
         let mut state = ListenerState::default();
         let generation = state.begin_snapshot(100).unwrap();
-        let snapshot =
-            ListenerSnapshot::new(ROOT, [listener(10, 8080), listener(20, 9090)], [(8080, 30)])
-                .unwrap();
+        let snapshot = ListenerSnapshot::new(
+            ROOT,
+            [listener(10, 8080), listener(20, 9090)],
+            [foreign(8080, 30)],
+        )
+        .unwrap();
 
         state.apply_snapshot(generation, snapshot, LIMIT).unwrap();
 
@@ -712,101 +773,72 @@ mod tests {
             state.evidence_for_port(8080),
             PortEvidence::Present {
                 socket_cgroups: HashSet::from([10]),
-                foreign_runtime_cgroups: HashSet::from([30]),
+                foreign_runtime_candidates: HashSet::from([ForeignRuntimeIdentity {
+                    cgroup_id: 30,
+                    network_namespace: foreign(8080, 30).network_namespace,
+                }]),
             }
         );
         assert_eq!(
             state.evidence_for_port(9090),
             PortEvidence::Present {
                 socket_cgroups: HashSet::from([20]),
-                foreign_runtime_cgroups: HashSet::new(),
+                foreign_runtime_candidates: HashSet::new(),
             }
         );
     }
 
     #[test]
-    fn live_delta_is_preserved_alongside_foreign_candidates() {
+    fn unclassified_live_delta_cannot_merge_into_snapshot_evidence() {
         let mut state = ListenerState::default();
         let generation = state.begin_snapshot(100).unwrap();
-        let snapshot = ListenerSnapshot::new(ROOT, [], [(8080, 10)]).unwrap();
+        let snapshot = ListenerSnapshot::new(ROOT, [], [foreign(8080, 10)]).unwrap();
         state.apply_snapshot(generation, snapshot, LIMIT).unwrap();
 
         assert_eq!(
-            state.record_delta(listener(30, 8080), 101, LIMIT, LIMIT),
-            DeltaOutcome::Inserted
+            state.record_delta(listener(30, 8080), 101),
+            DeltaOutcome::Invalidated
         );
-        assert_eq!(
-            state.evidence_for_port(8080),
-            PortEvidence::Present {
-                socket_cgroups: HashSet::from([30]),
-                foreign_runtime_cgroups: HashSet::from([10]),
-            }
-        );
+        assert_eq!(state.evidence_for_port(8080), PortEvidence::NotReady);
     }
 
     #[test]
-    fn replacement_snapshot_can_clear_foreign_candidates_and_replay_a_live_delta() {
+    fn replacement_snapshot_rejects_post_cut_unclassified_delta() {
         let mut state = ListenerState::default();
         let first = state.begin_snapshot(100).unwrap();
         state
             .apply_snapshot(
                 first,
-                ListenerSnapshot::new(ROOT, [], [(8080, 10)]).unwrap(),
+                ListenerSnapshot::new(ROOT, [], [foreign(8080, 10)]).unwrap(),
                 LIMIT,
             )
             .unwrap();
 
         let second = state.begin_snapshot(200).unwrap();
         assert_eq!(
-            state.record_delta(listener(30, 8080), 201, LIMIT, LIMIT),
-            DeltaOutcome::Inserted
+            state.record_delta(listener(30, 8080), 201),
+            DeltaOutcome::Invalidated
         );
-        state
-            .apply_snapshot(second, ListenerSnapshot::new(ROOT, [], []).unwrap(), LIMIT)
-            .unwrap();
+        assert!(
+            state
+                .apply_snapshot(second, ListenerSnapshot::new(ROOT, [], []).unwrap(), LIMIT)
+                .is_err()
+        );
 
-        assert_eq!(
-            state.evidence_for_port(8080),
-            PortEvidence::Present {
-                socket_cgroups: HashSet::from([30]),
-                foreign_runtime_cgroups: HashSet::new(),
-            }
-        );
+        assert_eq!(state.evidence_for_port(8080), PortEvidence::NotReady);
     }
 
     #[test]
     fn foreign_candidate_evidence_counts_toward_capacity_and_is_validated() {
-        assert!(ListenerSnapshot::new(ROOT, [], [(0, 10)]).is_err());
-        assert!(ListenerSnapshot::new(ROOT, [], [(8080, 0)]).is_err());
-        assert!(ListenerSnapshot::new(ROOT, [], [(8080, ROOT)]).is_err());
+        assert!(ListenerSnapshot::new(ROOT, [], [foreign(0, 10)]).is_err());
+        assert!(ListenerSnapshot::new(ROOT, [], [foreign(8080, 0)]).is_err());
+        assert!(ListenerSnapshot::new(ROOT, [], [foreign(8080, ROOT)]).is_err());
 
         let mut state = ListenerState::default();
         let generation = state.begin_snapshot(100).unwrap();
-        let snapshot = ListenerSnapshot::new(ROOT, [], [(8080, 10), (9090, 20)]).unwrap();
+        let snapshot =
+            ListenerSnapshot::new(ROOT, [], [foreign(8080, 10), foreign(9090, 20)]).unwrap();
         assert!(state.apply_snapshot(generation, snapshot, 1).is_err());
-        assert!(!state.is_ready());
-    }
-
-    #[test]
-    fn foreign_candidates_reduce_the_remaining_live_association_capacity() {
-        let mut state = ListenerState::default();
-        let generation = state.begin_snapshot(100).unwrap();
-        state
-            .apply_snapshot(
-                generation,
-                ListenerSnapshot::new(ROOT, [], [(8080, 10)]).unwrap(),
-                2,
-            )
-            .unwrap();
-
-        assert_eq!(
-            state.record_delta(listener(20, 9090), 101, 2, LIMIT),
-            DeltaOutcome::Inserted
-        );
-        assert_eq!(
-            state.record_delta(listener(30, 3000), 102, 2, LIMIT),
-            DeltaOutcome::AtCapacity { should_warn: true }
-        );
         assert!(!state.is_ready());
     }
 }

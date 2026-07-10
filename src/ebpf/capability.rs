@@ -26,6 +26,8 @@ pub struct EbpfCapability {
     pub available: bool,
     pub kernel_version: Option<String>,
     pub has_btf: bool,
+    /// The host exposes one unified cgroup-v2 hierarchy at `/sys/fs/cgroup`.
+    pub has_cgroup_v2: bool,
     pub has_cap_bpf: bool,
     /// CAP_PERFMON: needed to attach kprobes/tracepoints when de-privileged.
     /// Informational today (production runs as root); does not gate `available`.
@@ -64,6 +66,8 @@ fn detect_linux() -> EbpfCapability {
         .map(kernel_meets_minimum)
         .unwrap_or(false);
     let has_btf = fs::metadata("/sys/kernel/btf/vmlinux").is_ok();
+    let cgroup_v2 = super::cgroup_v2::validate_environment();
+    let has_cgroup_v2 = cgroup_v2.is_ok();
     let has_cap_bpf = has_effective_capability(CAP_BPF);
     let has_cap_perfmon = has_effective_capability(CAP_PERFMON);
 
@@ -87,6 +91,10 @@ fn detect_linux() -> EbpfCapability {
         ))
     } else if !has_btf {
         Some("BTF not available (/sys/kernel/btf/vmlinux missing)".to_string())
+    } else if let Err(error) = &cgroup_v2 {
+        Some(format!(
+            "cgroup v2 required for eBPF capture scoping: {error}"
+        ))
     } else if !has_cap_bpf {
         Some("CAP_BPF not held (run with CAP_BPF or as root)".to_string())
     } else if !lockdown_ok {
@@ -99,9 +107,10 @@ fn detect_linux() -> EbpfCapability {
     };
 
     EbpfCapability {
-        available: kernel_ok && has_btf && has_cap_bpf && lockdown_ok,
+        available: kernel_ok && has_btf && has_cgroup_v2 && has_cap_bpf && lockdown_ok,
         kernel_version,
         has_btf,
+        has_cgroup_v2,
         has_cap_bpf,
         has_cap_perfmon,
         lockdown,
