@@ -5,7 +5,7 @@
 //! into the configured service name; listener socket cgroups are never copied
 //! into the allow-set.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 
 use edgepacer_ebpf_common::MAX_ALLOWED_CGROUPS;
 
@@ -320,25 +320,32 @@ where
 
         let runtime = resolve_runtime(container)?;
         for target in matching_targets {
-            let listener_is_authoritative =
-                target
-                    .open_ports
-                    .iter()
-                    .any(|port| match state.evidence_for_port(*port) {
+            let listener_is_authoritative = target.open_ports.iter().try_fold(
+                false,
+                |authorized, port| -> Result<bool, String> {
+                    let port_is_authoritative = match state.evidence_for_port(*port) {
                         PortEvidence::Present { socket_cgroups, .. }
                             if runtime.uses_host_network_namespace =>
                         {
-                            !socket_cgroups.is_empty()
+                            // Host-network runtimes share the agent's namespace.
+                            // Require exact socket ownership until a verified
+                            // descendant relation is available; presence alone
+                            // would authorize every opted-in sidecar on the port.
+                            Ok(socket_cgroups.contains(&runtime.anchor.id))
                         }
                         PortEvidence::Present {
                             foreign_runtime_candidates,
                             ..
-                        } => foreign_runtime_candidates.contains(&ForeignRuntimeIdentity {
-                            cgroup_id: runtime.anchor.id,
-                            network_namespace: runtime.network_namespace,
-                        }),
-                        PortEvidence::NotReady | PortEvidence::Absent => false,
-                    });
+                        } => foreign_listener_matches_runtime(
+                            &foreign_runtime_candidates,
+                            &runtime,
+                            *port,
+                        ),
+                        PortEvidence::NotReady | PortEvidence::Absent => Ok(false),
+                    }?;
+                    Ok(authorized || port_is_authoritative)
+                },
+            )?;
             if listener_is_authoritative {
                 entries.push((runtime.anchor, target.log_source_id.clone()));
                 if let Some(attestation) = runtime.attestation.clone() {
@@ -353,6 +360,26 @@ where
     runtime_attestations.dedup();
     routing.runtime_attestations = runtime_attestations;
     Ok(routing)
+}
+
+fn foreign_listener_matches_runtime(
+    candidates: &HashSet<ForeignRuntimeIdentity>,
+    runtime: &ResolvedRuntimeIdentity,
+    port: u16,
+) -> Result<bool, String> {
+    let mut namespace_candidates = candidates
+        .iter()
+        .filter(|candidate| candidate.network_namespace == runtime.network_namespace);
+    let Some(candidate) = namespace_candidates.next() else {
+        return Ok(false);
+    };
+    if namespace_candidates.next().is_some() {
+        return Err(format!(
+            "foreign listener port {port} maps to multiple runtime cgroups in network namespace {:?}",
+            runtime.network_namespace
+        ));
+    }
+    Ok(candidate.cgroup_id == runtime.anchor.id)
 }
 
 #[cfg(test)]
@@ -499,15 +526,21 @@ mod tests {
     }
 
     #[test]
-    fn host_listener_presence_gates_explicit_runtime_anchor_not_socket_owner() {
-        let containers = [container("one", "api", true)];
+    fn host_listener_requires_the_runtime_anchor_to_own_the_socket() {
+        let containers = [
+            container("app", "api", true),
+            container("sidecar", "api", true),
+        ];
         let targets = [target("source", "api", &[8080])];
-        let state = ready_state([(8080, 900)], []);
-        let identities = HashMap::from([("one".to_string(), identity(42, 3, true))]);
+        let state = ready_state([(8080, 42)], []);
+        let identities = HashMap::from([
+            ("app".to_string(), identity(42, 3, true)),
+            ("sidecar".to_string(), identity(43, 3, true)),
+        ]);
 
         let routing = resolve(&containers, &targets, &state, 7, &identities).unwrap();
         assert_eq!(routing.service_for(42), Some("source"));
-        assert_eq!(routing.service_for(900), None);
+        assert_eq!(routing.service_for(43), None);
         assert_eq!(routing.authorization_revision(), Some(7));
     }
 
@@ -527,6 +560,88 @@ mod tests {
         let routing = resolve(&containers, &targets, &state, 7, &identities).unwrap();
         assert_eq!(routing.service_for(42), Some("source"));
         assert_eq!(routing.service_for(43), None);
+    }
+
+    #[test]
+    fn shared_foreign_namespace_with_multiple_cgroups_fails_closed() {
+        let containers = [
+            container("app", "api", true),
+            container("sidecar", "api", true),
+        ];
+        let targets = [target("source", "api", &[8080])];
+        let network_namespace = foreign_namespace(42);
+        let snapshot = ListenerSnapshot::new(
+            1,
+            [],
+            [
+                ForeignListenerCandidate {
+                    port: 8080,
+                    cgroup_id: 42,
+                    network_namespace,
+                },
+                ForeignListenerCandidate {
+                    port: 8080,
+                    cgroup_id: 43,
+                    network_namespace,
+                },
+            ],
+        )
+        .unwrap();
+        let mut state = ListenerState::default();
+        let generation = state.begin_snapshot(1).unwrap();
+        assert!(state.apply_snapshot(generation, snapshot, 100).unwrap());
+
+        let mut app = identity(42, 3, false);
+        app.network_namespace = network_namespace;
+        let mut sidecar = identity(43, 3, false);
+        sidecar.network_namespace = network_namespace;
+        let identities =
+            HashMap::from([("app".to_string(), app), ("sidecar".to_string(), sidecar)]);
+
+        let error = resolve(&containers, &targets, &state, 7, &identities).unwrap_err();
+
+        assert!(error.contains("multiple runtime cgroups"), "{error}");
+    }
+
+    #[test]
+    fn foreign_namespace_ambiguity_is_independent_of_target_port_order() {
+        let containers = [container("app", "api", true)];
+        let network_namespace = foreign_namespace(42);
+        let snapshot = ListenerSnapshot::new(
+            1,
+            [],
+            [
+                ForeignListenerCandidate {
+                    port: 8080,
+                    cgroup_id: 42,
+                    network_namespace,
+                },
+                ForeignListenerCandidate {
+                    port: 9090,
+                    cgroup_id: 42,
+                    network_namespace,
+                },
+                ForeignListenerCandidate {
+                    port: 9090,
+                    cgroup_id: 43,
+                    network_namespace,
+                },
+            ],
+        )
+        .unwrap();
+        let mut state = ListenerState::default();
+        let generation = state.begin_snapshot(1).unwrap();
+        assert!(state.apply_snapshot(generation, snapshot, 100).unwrap());
+
+        let mut app = identity(42, 3, false);
+        app.network_namespace = network_namespace;
+        let identities = HashMap::from([("app".to_string(), app)]);
+
+        for ports in [[8080, 9090], [9090, 8080]] {
+            let targets = [target("source", "api", &ports)];
+            let error = resolve(&containers, &targets, &state, 7, &identities).unwrap_err();
+            assert!(error.contains("multiple runtime cgroups"), "{error}");
+        }
     }
 
     #[test]
@@ -550,7 +665,7 @@ mod tests {
             container("replica-b", "api", true),
         ];
         let targets = [target("source", "api", &[8080])];
-        let state = ready_state([(8080, 900)], []);
+        let state = ready_state([(8080, 42), (8080, 43)], []);
         let identities = HashMap::from([
             ("replica-a".to_string(), identity(42, 3, true)),
             ("replica-b".to_string(), identity(43, 3, true)),
@@ -573,7 +688,7 @@ mod tests {
             container("other", "worker", true),
         ];
         let targets = [target("source", "api", &[8080])];
-        let state = ready_state([(8080, 900)], []);
+        let state = ready_state([(8080, 42)], []);
 
         let routing = resolve_with_runtime_identity(&containers, &targets, &state, 7, |_| {
             panic!("ignored containers must not resolve runtime identity")
@@ -586,7 +701,7 @@ mod tests {
     fn invalid_anchor_depth_fails_closed() {
         let containers = [container("one", "api", true)];
         let targets = [target("source", "api", &[8080])];
-        let state = ready_state([(8080, 900)], []);
+        let state = ready_state([(8080, 42)], []);
         let identities = HashMap::from([("one".to_string(), identity(42, 33, true))]);
 
         let error = resolve(&containers, &targets, &state, 7, &identities).unwrap_err();
@@ -600,7 +715,7 @@ mod tests {
             target("source-a", "api", &[8080]),
             target("source-b", "api", &[8080]),
         ];
-        let state = ready_state([(8080, 900)], []);
+        let state = ready_state([(8080, 42)], []);
         let identities = HashMap::from([("one".to_string(), identity(42, 3, true))]);
 
         let error = resolve(&containers, &targets, &state, 7, &identities).unwrap_err();
@@ -683,7 +798,7 @@ mod tests {
     fn runtime_attestation_rejects_same_process_moved_to_another_cgroup() {
         let container = container("one", "api", true);
         let targets = [target("source", "api", &[8080])];
-        let state = ready_state([(8080, 900)], []);
+        let state = ready_state([(8080, 42)], []);
         let identities = HashMap::from([(
             "one".to_string(),
             attested_identity(&container, 42, 3, true),

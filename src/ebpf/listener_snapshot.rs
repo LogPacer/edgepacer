@@ -220,7 +220,8 @@ pub fn collect(
         // listener exists, but does not expose the listener socket's cgroup or
         // the cgroup that will consume accepted traffic. Preserve every known
         // runtime cgroup as a typed candidate; target resolution must later
-        // intersect it with explicit service identity.
+        // require an unambiguous cgroup within this namespace in addition to
+        // intersecting it with explicit service identity.
         for (_, port) in namespace_ports {
             for cgroup_id in sources.sources.values().copied() {
                 check_deadline(deadline, "expanding runtime namespace evidence")?;
