@@ -12,8 +12,8 @@ use std::sync::Arc;
 
 use logpacer_wire::{
     EbpfEventKind, EventEnvelope, NetworkFlow, RequestSignal, RoutedBatch, WireEbpfBatch,
-    WireEbpfEvent, WireLogBatch, WireLogEvent, WireRequest, WireResponse, routed_batch,
-    wire_ebpf_event, wire_log_event,
+    WireEbpfEvent, WireGraphBatch, WireJsonEvent, WireLogBatch, WireLogEvent, WireRequest,
+    WireResponse, routed_batch, wire_ebpf_event, wire_log_event,
 };
 use prost::Message;
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderValue};
@@ -594,6 +594,40 @@ impl Shipper {
         Ok((encoded, count))
     }
 
+    /// Encode aggregated service-map edges as a `WireGraphBatch` (the graph
+    /// arm). One `WireJsonEvent` per edge; mirrors `encode_entry_json_batch`
+    /// but routes via `RoutedBatch::Payload::Graph` so LogRelay lands them in
+    /// the account graph repo. Pair with `send_with_retry`.
+    pub fn encode_graph_json_batch(
+        &self,
+        json_lines: Vec<Vec<u8>>,
+    ) -> Result<(Vec<u8>, u32), EdgepacerError> {
+        let count = checked_wire_count("service-map edges", json_lines.len())?;
+        let now_ms = unix_epoch_millis_i64();
+
+        let metadata = self.envelope_metadata_bytes();
+        let entries: Vec<WireJsonEvent> = json_lines
+            .into_iter()
+            .map(|body| WireJsonEvent {
+                envelope: Some(EventEnvelope {
+                    source_at_ms: Some(now_ms),
+                    logtime_ms: None,
+                    metadata_json: metadata.clone(),
+                }),
+                entry_json: body,
+                embeds_json: Vec::new(),
+            })
+            .collect();
+
+        let encoded = encode_single_batch(
+            &self.archive_id,
+            &self.repo_id,
+            routed_batch::Payload::Graph(WireGraphBatch { entries }),
+        )?;
+
+        Ok((encoded, count))
+    }
+
     /// Encode network flows as a `WireEbpfBatch` (the typed eBPF arm). Mirrors
     /// `encode_batch` but routes via `RoutedBatch::Payload::Ebpf`, one
     /// `WireEbpfEvent` per flow (`kind = NETWORK_FLOW`). Pair with `send_with_retry`.
@@ -805,6 +839,28 @@ mod tests {
             logs.entries[0].body.as_ref().unwrap(),
             &wire_log_event::Body::RawText("hello world".into())
         );
+    }
+
+    #[test]
+    fn encode_graph_json_batch_routes_to_graph_payload() {
+        let shipper =
+            Shipper::new("http://localhost:8080", "arc_map", "service-map", None).unwrap();
+        let edge =
+            br#"{"ebpf_kind":"service_map_edge","src_service":"web","peer":"10.0.0.5:5432"}"#;
+
+        let (buf, count) = shipper
+            .encode_graph_json_batch(vec![edge.to_vec()])
+            .unwrap();
+        assert_eq!(count, 1);
+
+        let decoded = WireRequest::decode(&buf[..]).unwrap();
+        assert_eq!(decoded.batches[0].archive_id, "arc_map");
+        assert_eq!(decoded.batches[0].repo_id, "service-map");
+        let Some(routed_batch::Payload::Graph(graph)) = &decoded.batches[0].payload else {
+            panic!("expected routed graph payload");
+        };
+        assert_eq!(graph.entries.len(), 1);
+        assert_eq!(graph.entries[0].entry_json, edge.to_vec());
     }
 
     #[test]

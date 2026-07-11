@@ -32,8 +32,20 @@ pub struct EbpfSectionConfig {
     pub network_flows_enabled: bool,
     pub network_cidrs: Vec<String>,
     pub targets: Vec<EbpfTargetConfig>,
+    /// Account-level graph repo aggregated service-map edges ship to, in
+    /// addition to each target's per-service span repo. `None` until the
+    /// control plane provisions it.
+    pub service_map: Option<ServiceMapDestination>,
     /// SHA256 over the whole `ebpf` subtree - drives reconcile/restart.
     pub config_hash: String,
+}
+
+/// The single account-level graph destination for aggregated service-map edges.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ServiceMapDestination {
+    pub archive_id: String,
+    pub repo_id: String,
+    pub subbox_endpoint: String,
 }
 
 /// Default OTLP/HTTP receiver port the server always sends for eBPF.
@@ -71,7 +83,24 @@ pub fn ebpf_section(config: &UnifiedConfig) -> Option<EbpfSectionConfig> {
         network_flows_enabled,
         network_cidrs,
         targets: parse_ebpf_targets(section.get("targets")),
+        service_map: parse_service_map(section.get("service_map")),
         config_hash: compute_checksum(section),
+    })
+}
+
+/// Parse the optional `ebpf.service_map` account graph destination. All three
+/// fields are required when the key is present; a malformed destination is
+/// dropped (edges just aren't shipped) rather than failing the whole section.
+fn parse_service_map(service_map: Option<&serde_json::Value>) -> Option<ServiceMapDestination> {
+    let value = service_map?;
+    let ctx = FieldContext::section("ebpf.service_map");
+    let archive_id = required_config_string::<ArchiveId>(value, "archive_id", ctx)?;
+    let repo_id = required_config_string::<RepoId>(value, "repo_id", ctx)?;
+    let subbox_endpoint = required_config_string::<WireEndpoint>(value, "subbox_endpoint", ctx)?;
+    Some(ServiceMapDestination {
+        archive_id: archive_id.0,
+        repo_id: repo_id.0,
+        subbox_endpoint: subbox_endpoint.0,
     })
 }
 

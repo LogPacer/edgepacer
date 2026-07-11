@@ -341,6 +341,7 @@ mod tests {
             network_flows_enabled: false,
             network_cidrs: Vec::new(),
             targets,
+            service_map: None,
             config_hash: config_hash.to_string(),
         }
     }

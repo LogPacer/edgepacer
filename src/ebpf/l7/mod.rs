@@ -15,6 +15,7 @@ mod cassandra;
 mod clickhouse;
 mod conn;
 mod dns;
+mod edge;
 mod http1;
 mod http2;
 mod kafka;
@@ -36,6 +37,7 @@ mod exports_demo;
 
 pub(crate) use conn::CapturedConnectionIdentity;
 pub use conn::{CapturedSegment, ConnRegistry};
+pub use edge::EdgeAggregator;
 pub use red::RedAggregator;
 pub use span::{SpanContext, mint_id, to_request_signal};
 
