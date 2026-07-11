@@ -250,10 +250,15 @@ async fn record_emit(
 /// Returns (optional_timestamp, line_content).
 fn parse_docker_log_line(raw: &str) -> (Option<&str>, &str) {
     // Docker timestamps are RFC3339Nano, always 30+ chars with 'T' and 'Z'.
+    // Search bytes, not a str slice: byte 35 can fall inside a multibyte char
+    // (log lines are arbitrary UTF-8) and str slicing there panics. The space
+    // is ASCII, so a byte position is always a char boundary.
     if raw.len() > 31
         && raw.as_bytes()[4] == b'-'
         && raw.as_bytes()[10] == b'T'
-        && let Some(space_pos) = raw[..35.min(raw.len())].find(' ')
+        && let Some(space_pos) = raw.as_bytes()[..35.min(raw.len())]
+            .iter()
+            .position(|&b| b == b' ')
     {
         let timestamp = &raw[..space_pos];
         let line = raw[space_pos + 1..].trim_end();
@@ -296,6 +301,20 @@ mod tests {
         let (ts, line) = parse_docker_log_line(raw);
         assert!(ts.is_none());
         assert_eq!(line, "just a plain log line");
+    }
+
+    #[test]
+    fn parse_docker_line_multibyte_at_probe_boundary_does_not_panic() {
+        // Passes the cheap date-shape guard, has no space in the first 35
+        // bytes, and the second emoji spans bytes 32..36 — the old str slice
+        // at ..35 panicked inside it (seen live: docker_stream.rs:256 on a
+        // U+FE0F in a container log).
+        let raw = "2026-07-11T00:00:00.00000000🙂🙂🙂";
+        assert_eq!(raw.as_bytes()[4], b'-');
+        assert_eq!(raw.as_bytes()[10], b'T');
+        let (ts, line) = parse_docker_log_line(raw);
+        assert!(ts.is_none());
+        assert_eq!(line, raw);
     }
 
     #[test]
