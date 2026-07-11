@@ -27,16 +27,15 @@ const SYSTEMD_SHOW_PROPERTIES: [&str; 5] =
 // Linux assigns this fixed inode to the initial PID namespace. See
 // include/linux/proc_ns.h (PROC_PID_INIT_INO).
 const INITIAL_PID_NAMESPACE_INO: u64 = 0xEFFF_FFFC;
+// Same for the initial network namespace (PROC_NET_INIT_INO). Checking our own
+// ns inode against it proves host-netns membership without touching
+// /proc/1/ns/net, whose stat is ptrace-gated (init is non-dumpable) — the
+// exact capability this resolver exists to avoid.
+const INITIAL_NET_NAMESPACE_INO: u64 = 0xEFFF_FFF9;
 #[cfg(all(target_os = "linux", feature = "ebpf"))]
 const SYSTEMCTL_SHOW_TIMEOUT: Duration = Duration::from_secs(2);
 #[cfg(all(target_os = "linux", feature = "ebpf"))]
 const SYSTEMCTL_POLL_INTERVAL: Duration = Duration::from_millis(10);
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct NamespaceIdentity {
-    device: u64,
-    inode: u64,
-}
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) struct SystemdUnitIdentity {
@@ -76,8 +75,7 @@ fn validate_configured_unit(unit: &str) -> Result<(), String> {
 fn validate_host_systemd_context(
     uses_initial_cgroup_namespace: bool,
     pid_namespace_inode: u64,
-    current_network_namespace: NamespaceIdentity,
-    init_network_namespace: NamespaceIdentity,
+    net_namespace_inode: u64,
     init_comm: &str,
 ) -> Result<(), String> {
     if !uses_initial_cgroup_namespace {
@@ -88,11 +86,10 @@ fn validate_host_systemd_context(
             "systemd cgroup targeting requires the initial PID namespace (found inode {pid_namespace_inode})"
         ));
     }
-    if current_network_namespace != init_network_namespace {
-        return Err(
-            "systemd cgroup targeting requires EdgePacer and host PID 1 to share the network namespace"
-                .to_string(),
-        );
+    if net_namespace_inode != INITIAL_NET_NAMESPACE_INO {
+        return Err(format!(
+            "systemd cgroup targeting requires the initial network namespace (found inode {net_namespace_inode})"
+        ));
     }
     if init_comm.trim() != "systemd" {
         return Err(format!(
@@ -103,30 +100,25 @@ fn validate_host_systemd_context(
 }
 
 #[cfg(all(target_os = "linux", feature = "ebpf"))]
-fn namespace_identity(path: &Path) -> Result<NamespaceIdentity, String> {
+fn namespace_inode(path: &Path) -> Result<u64, String> {
     let metadata = std::fs::metadata(path)
         .map_err(|error| format!("failed to inspect namespace {}: {error}", path.display()))?;
-    Ok(NamespaceIdentity {
-        device: metadata.dev(),
-        inode: metadata.ino(),
-    })
+    Ok(metadata.ino())
 }
 
 #[cfg(all(target_os = "linux", feature = "ebpf"))]
 fn require_host_systemd_context() -> Result<(), String> {
     let uses_initial_cgroup_namespace = cgroup_v2::uses_initial_cgroup_namespace()
         .map_err(|error| format!("failed to verify systemd cgroup namespace: {error}"))?;
-    let pid_namespace_inode = namespace_identity(Path::new("/proc/self/ns/pid"))?.inode;
-    let current_network_namespace = namespace_identity(Path::new("/proc/self/ns/net"))?;
-    let init_network_namespace = namespace_identity(Path::new("/proc/1/ns/net"))?;
+    let pid_namespace_inode = namespace_inode(Path::new("/proc/self/ns/pid"))?;
+    let net_namespace_inode = namespace_inode(Path::new("/proc/self/ns/net"))?;
     let init_comm = std::fs::read_to_string("/proc/1/comm")
         .map_err(|error| format!("failed to identify host PID 1: {error}"))?;
 
     validate_host_systemd_context(
         uses_initial_cgroup_namespace,
         pid_namespace_inode,
-        current_network_namespace,
-        init_network_namespace,
+        net_namespace_inode,
         &init_comm,
     )
 }
@@ -878,51 +870,43 @@ mod tests {
 
     #[test]
     fn systemd_targeting_requires_host_pid_cgroup_and_network_namespaces() {
-        let host_net = NamespaceIdentity {
-            device: 4,
-            inode: 40,
-        };
         assert!(
             validate_host_systemd_context(
                 true,
                 INITIAL_PID_NAMESPACE_INO,
-                host_net,
-                host_net,
+                INITIAL_NET_NAMESPACE_INO,
                 "systemd\n",
             )
             .is_ok()
         );
 
-        for (label, initial_cgroup, pid_inode, current_net, init_comm) in [
+        for (label, initial_cgroup, pid_inode, net_inode, init_comm) in [
             (
                 "private cgroup",
                 false,
                 INITIAL_PID_NAMESPACE_INO,
-                host_net,
+                INITIAL_NET_NAMESPACE_INO,
                 "systemd\n",
             ),
             (
                 "private pid",
                 true,
                 INITIAL_PID_NAMESPACE_INO + 1,
-                host_net,
+                INITIAL_NET_NAMESPACE_INO,
                 "systemd\n",
             ),
             (
                 "private network",
                 true,
                 INITIAL_PID_NAMESPACE_INO,
-                NamespaceIdentity {
-                    device: 4,
-                    inode: 41,
-                },
+                INITIAL_NET_NAMESPACE_INO + 1,
                 "systemd\n",
             ),
             (
                 "non-systemd init",
                 true,
                 INITIAL_PID_NAMESPACE_INO,
-                host_net,
+                INITIAL_NET_NAMESPACE_INO,
                 "tini\n",
             ),
         ] {
@@ -930,8 +914,7 @@ mod tests {
                 validate_host_systemd_context(
                     initial_cgroup,
                     pid_inode,
-                    current_net,
-                    host_net,
+                    net_inode,
                     init_comm,
                 )
                 .is_err(),
