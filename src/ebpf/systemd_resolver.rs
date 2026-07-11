@@ -27,11 +27,14 @@ const SYSTEMD_SHOW_PROPERTIES: [&str; 5] =
 // Linux assigns this fixed inode to the initial PID namespace. See
 // include/linux/proc_ns.h (PROC_PID_INIT_INO).
 const INITIAL_PID_NAMESPACE_INO: u64 = 0xEFFF_FFFC;
-// Same for the initial network namespace (PROC_NET_INIT_INO). Checking our own
-// ns inode against it proves host-netns membership without touching
-// /proc/1/ns/net, whose stat is ptrace-gated (init is non-dumpable) — the
-// exact capability this resolver exists to avoid.
-const INITIAL_NET_NAMESPACE_INO: u64 = 0xEFFF_FFF9;
+// Same idea for the initial network namespace, but the net ns has NO
+// proc_ns.h constant — init_net takes the FIRST dynamically allocated ns
+// inum, 0xF0000000, deterministic since Linux 3.8 because init_net registers
+// before any other netns can exist (verified 4026531840 on the 6.8 fleet).
+// Checking our own ns inode against it proves host-netns membership without
+// touching /proc/1/ns/net, whose stat is ptrace-gated (init is non-dumpable)
+// — the exact capability this resolver exists to avoid.
+const INITIAL_NET_NAMESPACE_INO: u64 = 0xF000_0000;
 #[cfg(all(target_os = "linux", feature = "ebpf"))]
 const SYSTEMCTL_SHOW_TIMEOUT: Duration = Duration::from_secs(2);
 #[cfg(all(target_os = "linux", feature = "ebpf"))]
