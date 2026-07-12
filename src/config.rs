@@ -23,7 +23,7 @@ mod trace_proxy;
 pub use app::{AppConfig, Cli};
 pub use buffer::BufferTuning;
 pub use cadence::{effective_poll_interval, effective_stats_interval, stats_reporting_enabled};
-pub use ebpf::{EbpfSectionConfig, EbpfTargetConfig, ebpf_section};
+pub use ebpf::{EbpfSectionConfig, EbpfTargetConfig, ServiceMapDestination, ebpf_section};
 pub use logs::{
     CollectDiagnostic, CollectStreamConfig, FileSourceFormat, LogStreamConfig, MultilineConfig,
     ResolvedCollectStreams, all_collect_streams, resolve_collect_streams,
