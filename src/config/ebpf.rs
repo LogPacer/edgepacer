@@ -32,8 +32,20 @@ pub struct EbpfSectionConfig {
     pub network_flows_enabled: bool,
     pub network_cidrs: Vec<String>,
     pub targets: Vec<EbpfTargetConfig>,
+    /// Account-level graph repo aggregated service-map edges ship to, in
+    /// addition to each target's per-service span repo. `None` until the
+    /// control plane provisions it.
+    pub service_map: Option<ServiceMapDestination>,
     /// SHA256 over the whole `ebpf` subtree - drives reconcile/restart.
     pub config_hash: String,
+}
+
+/// The single account-level graph destination for aggregated service-map edges.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ServiceMapDestination {
+    pub archive_id: String,
+    pub repo_id: String,
+    pub subbox_endpoint: String,
 }
 
 /// Default OTLP/HTTP receiver port the server always sends for eBPF.
@@ -71,7 +83,40 @@ pub fn ebpf_section(config: &UnifiedConfig) -> Option<EbpfSectionConfig> {
         network_flows_enabled,
         network_cidrs,
         targets: parse_ebpf_targets(section.get("targets")),
-        config_hash: compute_checksum(section),
+        service_map: parse_service_map(section.get("service_map")),
+        // config_hash drives kernel capture restart, so it must cover only
+        // capture-relevant fields. service_map is a userspace ship destination —
+        // provisioning it must NOT restart capture — so hash the section without it.
+        config_hash: compute_checksum(&section_without_service_map(section)),
+    })
+}
+
+/// The ebpf section with the userspace-only `service_map` key removed, for the
+/// capture-restart checksum. Returns the section unchanged when the key is absent.
+fn section_without_service_map(section: &serde_json::Value) -> serde_json::Value {
+    match section.as_object() {
+        Some(map) if map.contains_key("service_map") => {
+            let mut trimmed = map.clone();
+            trimmed.remove("service_map");
+            serde_json::Value::Object(trimmed)
+        }
+        _ => section.clone(),
+    }
+}
+
+/// Parse the optional `ebpf.service_map` account graph destination. All three
+/// fields are required when the key is present; a malformed destination is
+/// dropped (edges just aren't shipped) rather than failing the whole section.
+fn parse_service_map(service_map: Option<&serde_json::Value>) -> Option<ServiceMapDestination> {
+    let value = service_map?;
+    let ctx = FieldContext::section("ebpf.service_map");
+    let archive_id = required_config_string::<ArchiveId>(value, "archive_id", ctx)?;
+    let repo_id = required_config_string::<RepoId>(value, "repo_id", ctx)?;
+    let subbox_endpoint = required_config_string::<WireEndpoint>(value, "subbox_endpoint", ctx)?;
+    Some(ServiceMapDestination {
+        archive_id: archive_id.0,
+        repo_id: repo_id.0,
+        subbox_endpoint: subbox_endpoint.0,
     })
 }
 
@@ -188,6 +233,27 @@ mod tests {
             .unwrap()
             .config_hash;
         assert_ne!(disabled, enabled);
+    }
+
+    #[test]
+    fn service_map_does_not_change_the_capture_config_hash() {
+        // Provisioning the account graph repo must not restart kernel capture.
+        let base = ebpf_section(&unified(json!({ "ebpf": { "enabled": true } })))
+            .unwrap()
+            .config_hash;
+        let with_map = ebpf_section(&unified(json!({
+            "ebpf": {
+                "enabled": true,
+                "service_map": {
+                    "archive_id": "arc_1",
+                    "repo_id": "service-map",
+                    "subbox_endpoint": "https://s/v1/logpacer-wire"
+                }
+            }
+        })))
+        .unwrap();
+        assert_eq!(base, with_map.config_hash);
+        assert!(with_map.service_map.is_some());
     }
 
     #[test]

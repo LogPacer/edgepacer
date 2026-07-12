@@ -914,13 +914,8 @@ mod tests {
             ),
         ] {
             assert!(
-                validate_host_systemd_context(
-                    initial_cgroup,
-                    pid_inode,
-                    net_inode,
-                    init_comm,
-                )
-                .is_err(),
+                validate_host_systemd_context(initial_cgroup, pid_inode, net_inode, init_comm,)
+                    .is_err(),
                 "accepted {label} context"
             );
         }

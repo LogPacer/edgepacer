@@ -59,6 +59,9 @@ const L7_WRITE: (&str, &[(&str, &str)]) = (
         ("syscalls", "sys_enter_sendto"),
     ],
 );
+// hyper-class runtimes send framed HTTP responses via writev — without this
+// hook the response half of every pair is invisible and no record completes.
+const L7_WRITEV: (&str, &[(&str, &str)]) = ("l7_io_writev", &[("syscalls", "sys_enter_writev")]);
 const L7_READ_ENTER: (&str, &[(&str, &str)]) = (
     "l7_io_read_enter",
     &[
@@ -291,6 +294,7 @@ impl CaptureProgram for AyaCaptureProgram {
         // L7 socket capture (APM): tap both directions of targeted PIDs' socket
         // I/O. Always-on for now; gating on per-target `protocols` is a refinement.
         attach_tracepoint_multi(&mut ebpf, L7_WRITE.0, L7_WRITE.1)?;
+        attach_tracepoint_multi(&mut ebpf, L7_WRITEV.0, L7_WRITEV.1)?;
         attach_tracepoint_multi(&mut ebpf, L7_READ_ENTER.0, L7_READ_ENTER.1)?;
         attach_tracepoint_multi(&mut ebpf, L7_READ_EXIT.0, L7_READ_EXIT.1)?;
         let l7_events = ebpf

@@ -28,18 +28,18 @@ use super::capture::{
 };
 use super::cgroup_resolver::{self, CgroupRouting};
 use super::l7::{
-    CapturedConnectionIdentity, CapturedSegment, ConnRegistry, RedAggregator, SpanContext, mint_id,
-    to_request_signal,
+    CapturedConnectionIdentity, CapturedSegment, ConnRegistry, EdgeAggregator, RedAggregator,
+    SpanContext, mint_id, to_request_signal,
 };
 use super::listener_snapshot;
 use super::listener_state::{DeltaOutcome, ListenerAssociation, ListenerSnapshot, ListenerState};
 use super::manager::{EbpfManager, ListenerObservation};
 use super::pid_resolver::PidRouting;
 use super::socket_port;
-use crate::config::{self, EbpfTargetConfig, SharedConfig};
+use crate::config::{self, EbpfTargetConfig, ServiceMapDestination, SharedConfig};
 use crate::discovery::SharedDiscoveryCache;
 use crate::discovery::ports::discover_ports;
-use crate::shipper::Shipper;
+use crate::shipper::{Shipper, unix_epoch_millis_i64};
 use crate::streaming_actor::{StreamHandle, spawn_streaming_actor};
 use crate::streaming_pipeline::{StreamingDeliveryPipeline, StreamingPipelineConfig};
 
@@ -82,6 +82,13 @@ struct TargetDelivery {
     archive_id: String,
     repo_id: String,
     subbox_endpoint: String,
+}
+
+/// The single account-level graph shipper aggregated edges go to, plus the
+/// destination it was built from so a directive change rebuilds it.
+struct ServiceMapDelivery {
+    shipper: Arc<Shipper>,
+    dest: ServiceMapDestination,
 }
 
 struct ListenerSnapshotResult {
@@ -176,6 +183,11 @@ pub async fn run(
     let mut l7_conns = ConnRegistry::new();
     let mut pending_spans: HashMap<String, Vec<RequestSignal>> = HashMap::new();
     let mut l7_red = RedAggregator::new();
+    // Service-map edges aggregated across ALL services on this host, shipped to
+    // the one account-level graph repo (`section.service_map`), not per-target.
+    let mut l7_edges = EdgeAggregator::new();
+    let mut service_map: Option<ServiceMapDelivery> = None;
+    let mut edge_window_start_ms = unix_epoch_millis_i64();
     let mut span_seq: u64 = 0;
     // Per-(pid, fd) port→protocol hint, resolved once via /proc and cached so the
     // binary parsers bind by port instead of their weak byte signatures.
@@ -226,6 +238,8 @@ pub async fn run(
                     pending_flows.clear();
                     pending_spans.clear();
                     l7_red = RedAggregator::new();
+                    l7_edges = EdgeAggregator::new();
+                    service_map = None;
                     l7_conns = ConnRegistry::new();
                     port_hints.clear();
                     listener_state.reset();
@@ -404,10 +418,26 @@ pub async fn run(
                 } else {
                     stop_all_deliveries(&mut deliveries);
                 }
+                // The account graph destination is one shipper, rebuilt only when
+                // the directive changes it. Dropped when absent/disabled.
+                service_map = reconcile_service_map(
+                    service_map,
+                    section.enabled.then_some(section.service_map.as_ref()).flatten(),
+                    identity,
+                );
 
                 flush_flows(&mut pending_flows, &deliveries);
                 flush_spans(&mut pending_spans, &deliveries);
                 flush_red(&mut l7_red, &deliveries);
+                let edge_window_end_ms = unix_epoch_millis_i64();
+                flush_edges(
+                    &mut l7_edges,
+                    service_map.as_ref(),
+                    identity,
+                    edge_window_start_ms,
+                    edge_window_end_ms,
+                );
+                edge_window_start_ms = edge_window_end_ms;
 
                 let mut guard = status.write().await;
                 guard.running = outcome.running;
@@ -1015,6 +1045,7 @@ pub async fn run(
                 let peer = resolved.as_ref().map(|r| r.peer.clone());
                 for record in l7_conns.on_segment_hinted(&seg, proto, flip) {
                     l7_red.observe(service, &record);
+                    l7_edges.observe(service, peer.as_deref(), &record);
                     span_seq = span_seq.wrapping_add(1);
                     let ctx = SpanContext {
                         service_name: service.to_string(),
@@ -1581,6 +1612,76 @@ fn flush_red(agg: &mut RedAggregator, deliveries: &HashMap<String, TargetDeliver
             }
         });
     }
+}
+
+/// Rebuild the account graph shipper when the directive's destination changes;
+/// keep it while unchanged; drop it when absent. Returns the new state.
+fn reconcile_service_map(
+    current: Option<ServiceMapDelivery>,
+    desired: Option<&ServiceMapDestination>,
+    identity: &crate::identity::AgentIdentity,
+) -> Option<ServiceMapDelivery> {
+    match desired {
+        None => None,
+        Some(dest) => {
+            if let Some(existing) = &current
+                && &existing.dest == dest
+            {
+                return current;
+            }
+            match Shipper::new(
+                &dest.subbox_endpoint,
+                &dest.archive_id,
+                &dest.repo_id,
+                Some(identity.clone()),
+            ) {
+                Ok(shipper) => Some(ServiceMapDelivery {
+                    shipper: Arc::new(shipper),
+                    dest: dest.clone(),
+                }),
+                Err(e) => {
+                    warn!(error = %e, "eBPF service-map: shipper build failed; edges not shipped this window");
+                    None
+                }
+            }
+        }
+    }
+}
+
+/// Ship the service-map edges accumulated this window to the one account graph
+/// repo (best-effort; edges are re-derivable, never back-pressure the kernel).
+/// Drains the aggregator regardless — a missing destination just discards them.
+fn flush_edges(
+    agg: &mut EdgeAggregator,
+    service_map: Option<&ServiceMapDelivery>,
+    identity: &crate::identity::AgentIdentity,
+    window_start_ms: i64,
+    window_end_ms: i64,
+) {
+    let edges = agg.drain();
+    if edges.is_empty() {
+        return;
+    }
+    let Some(delivery) = service_map else {
+        return;
+    };
+    let host = identity.current();
+    let entries: Vec<Vec<u8>> = edges
+        .iter()
+        .map(|edge| edge.to_json(&host, window_start_ms, window_end_ms))
+        .collect();
+    let shipper = delivery.shipper.clone();
+    tokio::spawn(async move {
+        match shipper.encode_graph_json_batch(entries) {
+            Ok((encoded, count)) => match shipper.send_with_retry(&encoded).await {
+                Ok(_) => debug!(edges = count, "eBPF service-map: shipped edge batch"),
+                Err(e) => {
+                    warn!(error = %e, "eBPF service-map: edge batch ship failed (best-effort)")
+                }
+            },
+            Err(e) => warn!(error = %e, "eBPF service-map: edge batch encode failed"),
+        }
+    });
 }
 
 /// Create/rebuild/drop per-target delivery so `deliveries` matches `targets`.

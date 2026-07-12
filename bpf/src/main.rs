@@ -644,6 +644,53 @@ fn try_l7_write(ctx: &TracePointContext) -> Result<(), i64> {
     emit_l7(scope, pid, fd as u32, L7_DIR_OUTBOUND, buf, count)
 }
 
+/// Outbound: authorized `writev(2)`. hyper-class runtimes emit framed HTTP
+/// responses through vectored writes, which the `write`/`sendto` hook never
+/// sees — without this the response half of every pair is invisible and no
+/// L7 record ever completes (#99). Captures the first iovec segment (status
+/// line + headers); multi-iovec reassembly is the known refinement.
+#[tracepoint]
+pub fn l7_io_writev(ctx: TracePointContext) -> u32 {
+    match try_l7_writev(&ctx) {
+        Ok(()) => 0,
+        Err(_) => 1,
+    }
+}
+
+fn try_l7_writev(ctx: &TracePointContext) -> Result<(), i64> {
+    let pid = ctx.tgid();
+    let Some(scope) = capture_scope(pid) else {
+        return Ok(());
+    };
+    // sys_enter_writev args: fd @ 16, const struct iovec *vec @ 24, unsigned long vlen @ 32.
+    let fd: u64 = unsafe { ctx.read_at(16).map_err(|_| 1_i64)? };
+    let vec: u64 = unsafe { ctx.read_at(24).map_err(|_| 1_i64)? };
+    let vlen: u64 = unsafe { ctx.read_at(32).map_err(|_| 1_i64)? };
+    if vlen == 0 {
+        return Ok(());
+    }
+
+    // Read the first iovec { void *iov_base; size_t iov_len } (16 bytes on 64-bit).
+    let mut iov = [0u8; 16];
+    if unsafe { bpf_probe_read_user_buf(vec as *const u8, &mut iov) }.is_err() {
+        return Ok(());
+    }
+    let iov_base = u64::from_ne_bytes([
+        iov[0], iov[1], iov[2], iov[3], iov[4], iov[5], iov[6], iov[7],
+    ]);
+    let iov_len = u64::from_ne_bytes([
+        iov[8], iov[9], iov[10], iov[11], iov[12], iov[13], iov[14], iov[15],
+    ]);
+    emit_l7(
+        scope,
+        pid,
+        fd as u32,
+        L7_DIR_OUTBOUND,
+        iov_base as *const u8,
+        iov_len,
+    )
+}
+
 /// Inbound enter: `read(2)` / `recvfrom(2)` (fd@16, buf@24). Stash the buffer
 /// pointer; the byte count is only known at the exit return value.
 #[tracepoint]
