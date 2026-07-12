@@ -78,6 +78,11 @@ struct TargetDelivery {
     actor: JoinHandle<()>,
     /// Ships `WireEbpfBatch` (flows) to this target's repo.
     flow_shipper: Arc<Shipper>,
+    /// Whether to ship raw L1 write-capture lines to this repo. True only for
+    /// raw-log targets (no declared protocols); an L7/protocol target wants
+    /// parsed request signals, not the binary write() bytes of its own I/O,
+    /// which are pure noise (e.g. logrelay's WAL/protobuf frames).
+    captures_raw_lines: bool,
     // Routing identity, to rebuild the pipeline when a target's repo changes.
     archive_id: String,
     repo_id: String,
@@ -462,6 +467,12 @@ pub async fn run(
                 let Some(delivery) = deliveries.get(service) else {
                     continue; // no pipeline yet for this service
                 };
+                // An L7/protocol target ships parsed request signals, not the
+                // raw write() bytes of its own binary I/O — drop the L1 line so
+                // the repo isn't flooded with the target's WAL/protobuf noise.
+                if !delivery.captures_raw_lines {
+                    continue;
+                }
                 // try_enqueue: the eBPF capture loop must never stall behind
                 // a slow pipeline — drop with a warning instead.
                 if !delivery.handle.try_enqueue(line.bytes, now_ns()) {
@@ -1798,6 +1809,7 @@ fn create_delivery(
         handle,
         actor,
         flow_shipper,
+        captures_raw_lines: target.protocols.is_empty(),
         archive_id: target.archive_id.clone(),
         repo_id: target.repo_id.clone(),
         subbox_endpoint: target.subbox_endpoint.clone(),
