@@ -133,6 +133,25 @@ pub struct L7Record {
     pub attributes: Vec<(String, String)>,
 }
 
+impl L7Record {
+    /// The peer endpoint the parsed protocol itself named — an explicit
+    /// `peer.address` if a parser set one, else the HTTP `Host` / `:authority`.
+    ///
+    /// This is the service-map fallback for connections whose socket peer can't
+    /// be read back from `/proc`: the fd readlink is ptrace-gated for cross-uid
+    /// targets, and TLS segments carry an `SSL*`-derived pseudo-fd that never
+    /// resolves. Without a fallback, every such record is silently dropped from
+    /// the edge aggregator and the account service map stays empty.
+    pub fn peer_hint(&self) -> Option<&str> {
+        ["peer.address", "http.host"].into_iter().find_map(|key| {
+            self.attributes
+                .iter()
+                .find(|(k, _)| k == key)
+                .map(|(_, v)| v.as_str())
+        })
+    }
+}
+
 /// Per-direction reassembly buffer: captured bytes plus how many body bytes still
 /// need to be dropped before the next message head can be parsed. A shared
 /// reassembly primitive for the framed parsers (HTTP/1 Content-Length bodies,
@@ -181,4 +200,44 @@ pub(crate) trait L7Parser: Send + std::fmt::Debug {
     fn take_records(&mut self) -> Vec<L7Record>;
     /// True once the stream is unrecoverable garbage — drop the connection.
     fn is_dead(&self) -> bool;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn record_with(attributes: Vec<(String, String)>) -> L7Record {
+        L7Record {
+            protocol: Protocol::Http1,
+            operation: "GET /x".to_string(),
+            status_code: 200,
+            error: false,
+            start_unix_nano: 0,
+            duration_nano: 0,
+            attributes,
+        }
+    }
+
+    #[test]
+    fn peer_hint_uses_the_http_host() {
+        let record = record_with(vec![
+            ("http.target".to_string(), "/x".to_string()),
+            ("http.host".to_string(), "127.0.0.1:8080".to_string()),
+        ]);
+        assert_eq!(record.peer_hint(), Some("127.0.0.1:8080"));
+    }
+
+    #[test]
+    fn peer_hint_prefers_an_explicit_peer_address() {
+        let record = record_with(vec![
+            ("http.host".to_string(), "api.internal".to_string()),
+            ("peer.address".to_string(), "10.0.0.5:5432".to_string()),
+        ]);
+        assert_eq!(record.peer_hint(), Some("10.0.0.5:5432"));
+    }
+
+    #[test]
+    fn peer_hint_is_none_when_the_record_names_no_peer() {
+        assert_eq!(record_with(Vec::new()).peer_hint(), None);
+    }
 }

@@ -63,6 +63,11 @@ struct EdgeStat {
 #[derive(Debug, Default)]
 pub struct EdgeAggregator {
     edges: HashMap<(String, String, String), EdgeStat>,
+    /// Records folded in this window — with `records_without_peer`, the
+    /// drop-point telemetry for "why is the service map empty?" (#102).
+    records_seen: u64,
+    /// Records dropped this window because no peer endpoint could be named.
+    records_without_peer: u64,
 }
 
 impl EdgeAggregator {
@@ -72,9 +77,12 @@ impl EdgeAggregator {
 
     /// Fold one completed request into its `(src_service, peer, protocol)` edge.
     /// A record with no resolved peer can't be an edge — it's dropped (the deep
-    /// span still ships to the per-target repo).
+    /// span still ships to the per-target repo). A loopback peer
+    /// (`127.0.0.1:PORT`) is a valid edge endpoint like any other.
     pub fn observe(&mut self, src_service: &str, peer: Option<&str>, record: &L7Record) {
+        self.records_seen += 1;
         let Some(peer) = peer else {
+            self.records_without_peer += 1;
             return;
         };
         let key = (
@@ -92,8 +100,20 @@ impl EdgeAggregator {
         }
     }
 
+    /// Records folded in since the last drain (edges + peerless drops).
+    pub fn records_seen(&self) -> u64 {
+        self.records_seen
+    }
+
+    /// Records dropped since the last drain because they named no peer.
+    pub fn records_without_peer(&self) -> u64 {
+        self.records_without_peer
+    }
+
     /// Snapshot and reset — call each flush tick.
     pub fn drain(&mut self) -> Vec<EdgeEntry> {
+        self.records_seen = 0;
+        self.records_without_peer = 0;
         let edges = std::mem::take(&mut self.edges);
         edges
             .into_iter()
@@ -174,6 +194,58 @@ mod tests {
         let mut agg = EdgeAggregator::new();
         agg.observe("web", None, &record(1_000_000, false));
         assert!(agg.drain().is_empty());
+    }
+
+    #[test]
+    fn loopback_peers_are_valid_edge_endpoints() {
+        // Regression for #102: a loopback target (logrelay on 127.0.0.1:8080)
+        // must produce an edge like any other peer, never be dropped.
+        let mut agg = EdgeAggregator::new();
+        agg.observe(
+            "logrelay",
+            Some("127.0.0.1:8080"),
+            &record(1_000_000, false),
+        );
+
+        let edges = agg.drain();
+        assert_eq!(edges.len(), 1);
+        assert_eq!(edges[0].peer, "127.0.0.1:8080");
+        assert_eq!(edges[0].count, 1);
+    }
+
+    #[test]
+    fn attribute_derived_peers_produce_edges() {
+        // Regression for #102: when the socket peer is unresolvable (cross-uid
+        // /proc readlink, TLS pseudo-fd), the runner falls back to the peer the
+        // record itself named — that fallback must land as a normal edge.
+        let mut rec = record(1_000_000, false);
+        rec.attributes
+            .push(("http.host".to_string(), "127.0.0.1:8080".to_string()));
+        let peer = rec.peer_hint().map(str::to_string);
+
+        let mut agg = EdgeAggregator::new();
+        agg.observe("web", peer.as_deref(), &rec);
+        agg.observe("web", peer.as_deref(), &rec);
+
+        let edges = agg.drain();
+        assert_eq!(edges.len(), 1);
+        assert_eq!(edges[0].peer, "127.0.0.1:8080");
+        assert_eq!(edges[0].protocol, "http");
+        assert_eq!(edges[0].count, 2);
+    }
+
+    #[test]
+    fn window_counters_track_seen_and_peerless_records_until_drain() {
+        let mut agg = EdgeAggregator::new();
+        agg.observe("web", Some("10.0.0.5:5432"), &record(1_000_000, false));
+        agg.observe("web", None, &record(1_000_000, false));
+        agg.observe("web", None, &record(1_000_000, false));
+        assert_eq!(agg.records_seen(), 3);
+        assert_eq!(agg.records_without_peer(), 2);
+
+        agg.drain();
+        assert_eq!(agg.records_seen(), 0, "drain resets the window counters");
+        assert_eq!(agg.records_without_peer(), 0);
     }
 
     #[test]
