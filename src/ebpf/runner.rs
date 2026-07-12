@@ -1042,8 +1042,16 @@ pub async fn run(
                     None => (None, false),
                 };
                 // The connection's peer endpoint — the service-map edge's other node.
-                let peer = resolved.as_ref().map(|r| r.peer.clone());
+                let socket_peer = resolved.as_ref().map(|r| r.peer.clone());
                 for record in l7_conns.on_segment_hinted(&seg, proto, flip) {
+                    // Socket resolution fails for every cross-uid target (the
+                    // /proc fd readlink is ptrace-gated) and for TLS pseudo-fds,
+                    // so fall back to the peer the parsed protocol itself named
+                    // (HTTP Host / :authority) — else the edge aggregator drops
+                    // the record and the account service map stays empty (#102).
+                    let peer = socket_peer
+                        .clone()
+                        .or_else(|| record.peer_hint().map(str::to_string));
                     l7_red.observe(service, &record);
                     l7_edges.observe(service, peer.as_deref(), &record);
                     span_seq = span_seq.wrapping_add(1);
@@ -1658,7 +1666,19 @@ fn flush_edges(
     window_start_ms: i64,
     window_end_ms: i64,
 ) {
+    let records_seen = agg.records_seen();
+    let records_without_peer = agg.records_without_peer();
     let edges = agg.drain();
+    // Drop-point telemetry (#102): logs even when zero edges survived, so an
+    // empty service map is diagnosable as "no records" vs "no resolvable peers".
+    if records_seen > 0 {
+        debug!(
+            records_seen,
+            records_without_peer,
+            edges = edges.len(),
+            "eBPF service-map: edge window aggregated"
+        );
+    }
     if edges.is_empty() {
         return;
     }
