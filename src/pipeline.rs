@@ -66,6 +66,14 @@ struct TailedLine {
     source_len: u64,
 }
 
+/// The exact Docker json-file payload the wire ships for a raw line — the
+/// wrapper-stripped bytes. Exposed so the sampler's parity test can assert its
+/// extraction equals the shipping path's byte-for-byte.
+#[cfg(test)]
+pub(crate) fn docker_json_wire_payload(raw: Vec<u8>) -> Vec<u8> {
+    docker_json_payload_line(raw).payload
+}
+
 impl LogTailer {
     fn read_lines(&mut self, max_lines: usize) -> std::io::Result<Vec<TailedLine>> {
         match self {

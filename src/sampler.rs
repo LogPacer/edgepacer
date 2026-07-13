@@ -17,8 +17,10 @@ use serde::Deserialize;
 use tokio::sync::watch;
 use tracing::{debug, info, warn};
 
+use crate::config::{self, MultilineConfig, StreamAccessMethod};
 use crate::discovery::SharedDiscoveryCache;
 use crate::discovery::cache::AccessMethod;
+use crate::entry_assembler::assemble_batch;
 use crate::journal;
 use crate::sender::Client;
 
@@ -39,6 +41,26 @@ pub struct SampleRequestIdentifier {
 
 /// Default sample line count when Rails doesn't specify bounds.
 const DEFAULT_MAX_LINES: usize = 1000;
+
+/// Resolved sampling bounds for one request.
+///
+/// `min_lines` is Rails' desired floor: we never withhold a short sample, but we
+/// keep the field (Rails owns the sufficiency policy) instead of silently
+/// dropping it, and log when a sample lands under the floor.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct SampleBounds {
+    min_lines: Option<usize>,
+    max_lines: usize,
+}
+
+/// Map a wire request's optional bounds to the concrete bounds used for reading.
+/// `min_lines` is preserved verbatim; `max_lines` falls back to the default.
+fn sample_bounds(req: &SampleRequestIdentifier) -> SampleBounds {
+    SampleBounds {
+        min_lines: req.min_lines,
+        max_lines: req.max_lines.unwrap_or(DEFAULT_MAX_LINES),
+    }
+}
 pub const DEFAULT_POLL_INTERVAL: Duration = Duration::from_secs(90);
 const SAMPLE_FETCH_BACKOFF_MAX: Duration = Duration::from_secs(300);
 
@@ -63,6 +85,7 @@ struct SampleCycleSummary {
 pub async fn run(
     client: &Client,
     discovery_cache: SharedDiscoveryCache,
+    shared_config: config::SharedConfig,
     poll_interval: Duration,
     mut shutdown: watch::Receiver<bool>,
 ) {
@@ -110,6 +133,11 @@ pub async fn run(
 
         debug!(count = identifiers.len(), "sample requests received");
 
+        // Snapshot the active config once per cycle so per-source multiline
+        // resolution mirrors the shipping pipeline without holding the config
+        // lock across the network uploads below.
+        let unified = shared_config.read().await.clone();
+
         // Step 2: Upload samples for each identifier.
         let mut uploaded = 0usize;
         let mut empty = 0usize;
@@ -119,9 +147,14 @@ pub async fn run(
         let mut unreadable_reasons = BTreeMap::new();
 
         for req in &identifiers {
-            let max_lines = req.max_lines.unwrap_or(DEFAULT_MAX_LINES);
-            match read_sample_lines_for_identifier(&req.identifier, max_lines, &discovery_cache)
-                .await
+            let bounds = sample_bounds(req);
+            match read_sample_lines_for_identifier(
+                &req.identifier,
+                bounds,
+                &discovery_cache,
+                unified.as_ref(),
+            )
+            .await
             {
                 Ok(lines) if lines.is_empty() => {
                     empty += 1;
@@ -140,6 +173,16 @@ pub async fn run(
                 }
                 Ok(lines) => {
                     let line_count = lines.len();
+                    if let Some(min_lines) = bounds.min_lines
+                        && line_count < min_lines
+                    {
+                        debug!(
+                            identifier = %req.identifier,
+                            line_count,
+                            min_lines,
+                            "sample under requested floor; uploading available lines (Rails owns sufficiency)"
+                        );
+                    }
                     match client.upload_sample(&req.identifier, &lines).await {
                         Ok(resp) => {
                             uploaded += 1;
@@ -234,30 +277,144 @@ pub async fn run(
 
 async fn read_sample_lines_for_identifier(
     identifier: &str,
-    max_lines: usize,
+    bounds: SampleBounds,
     discovery_cache: &SharedDiscoveryCache,
+    unified: Option<&config::UnifiedConfig>,
 ) -> Result<Vec<String>, String> {
-    let resolved = {
+    let max_lines = bounds.max_lines;
+
+    // Resolve the access method and the source's multiline config under a single
+    // read guard, so the sampler's extraction matches the shipping pipeline's.
+    let (resolved, multiline) = {
         let cache = discovery_cache.read().await;
-        cache.resolve_access_method(identifier, "")
+        let resolved = cache.resolve_access_method(identifier, "");
+        let multiline = match (&resolved, unified) {
+            (Some((access_method, locator)), Some(config)) => {
+                resolve_multiline(config, &cache, access_method.clone(), locator)
+            }
+            _ => None,
+        };
+        (resolved, multiline)
     };
 
-    match resolved {
-        Some((AccessMethod::File | AccessMethod::Kubernetes, locator)) => {
-            read_file_lines(&locator, max_lines)
-        }
-        Some((AccessMethod::DockerJsonFile, locator)) => {
-            read_docker_json_file_lines(&locator, max_lines)
-        }
-        Some((AccessMethod::Journald, unit)) => journal::sample_unit_lines(&unit, max_lines),
+    // The sampler is one shape for every source: the shared reader seam, then
+    // the same optional multiline assembler the shipper composes, then the tail
+    // window (`finalize_sample`) — so the window covers whole assembled entries.
+    // File-backed readers return every extracted line; streaming readers
+    // (journald/docker/event-log) cap at the source since their history is not
+    // rewindable, and the final tail is then a no-op for them.
+    let lines = match resolved {
+        Some((AccessMethod::File, locator)) => read_file_lines(&locator)?,
+        Some((AccessMethod::Kubernetes, locator)) => read_kubernetes_lines(&locator)?,
+        Some((AccessMethod::DockerJsonFile, locator)) => read_docker_json_file_lines(&locator)?,
+        Some((AccessMethod::Journald, unit)) => journal::sample_unit_lines(&unit, max_lines)?,
         Some((AccessMethod::DockerApi, container_id)) => {
-            read_docker_lines(&container_id, max_lines).await
+            read_docker_lines(&container_id, max_lines).await?
         }
         Some((AccessMethod::WindowsEventLog, channel)) => {
-            crate::windows_event_log::sample_channel_lines(&channel, max_lines).await
+            crate::windows_event_log::sample_channel_lines(&channel, max_lines).await?
         }
-        None => read_sample_lines(identifier, max_lines),
+        None => read_sample_lines(identifier, max_lines)?,
+    };
+
+    Ok(finalize_sample(lines, multiline.as_ref(), max_lines))
+}
+
+/// Resolve the source's multiline configuration from the active collect config,
+/// matching the collect directive that resolves to the same access method and
+/// locator the pipeline would tail. Returns `None` when the source is not being
+/// collected (the common sample-before-collect case) or has no multiline set.
+fn resolve_multiline(
+    config: &config::UnifiedConfig,
+    cache: &crate::discovery::cache::DiscoveryCache,
+    access_method: AccessMethod,
+    locator: &str,
+) -> Option<MultilineConfig> {
+    let streams = config::all_collect_streams(config);
+    let resolved = config::resolve_collect_streams(&streams, cache);
+
+    match access_method {
+        AccessMethod::File | AccessMethod::DockerJsonFile | AccessMethod::Kubernetes => resolved
+            .file_streams
+            .into_iter()
+            .find(|stream| stream.path == locator)
+            .and_then(|stream| stream.multiline),
+        AccessMethod::DockerApi => {
+            resolved
+                .streaming_sources
+                .into_iter()
+                .find_map(|stream| match stream.access_method {
+                    StreamAccessMethod::DockerApi { container_id } if container_id == locator => {
+                        stream.multiline
+                    }
+                    _ => None,
+                })
+        }
+        AccessMethod::Journald => {
+            resolved
+                .streaming_sources
+                .into_iter()
+                .find_map(|stream| match stream.access_method {
+                    StreamAccessMethod::Journald { unit } if unit == locator => stream.multiline,
+                    _ => None,
+                })
+        }
+        AccessMethod::WindowsEventLog => None,
     }
+}
+
+/// Compose the multiline assembler stage on top of the reader output, then take
+/// the tail window — the sampler's counterpart to how the shipper assembles a
+/// source's lines before shipping.
+///
+/// Assembly runs before the tail so the window covers whole assembled entries,
+/// never a fragment split at the window edge. When `multiline` is `None` the
+/// lines are untouched, so a non-multiline source (the negative-control plain
+/// file among them) is byte-identical to a plain last-`max_lines` read. A bad
+/// multiline pattern would also stop the shipping pipeline, so dropping the
+/// sample there keeps the two paths consistent.
+fn finalize_sample(
+    lines: Vec<String>,
+    multiline: Option<&MultilineConfig>,
+    max_lines: usize,
+) -> Vec<String> {
+    let assembled = match multiline {
+        None => lines,
+        Some(config) => {
+            let bytes: Vec<Vec<u8>> = lines.into_iter().map(String::into_bytes).collect();
+            match assemble_batch(bytes, Some(config)) {
+                Ok(events) => events
+                    .into_iter()
+                    .map(|event| String::from_utf8_lossy(&event).into_owned())
+                    .collect(),
+                Err(error) => {
+                    warn!(%error, "invalid sample multiline pattern; skipping assembly");
+                    return Vec::new();
+                }
+            }
+        }
+    };
+
+    let start = assembled.len().saturating_sub(max_lines);
+    assembled[start..].to_vec()
+}
+
+/// Read the assembled CRI messages from a Kubernetes container log directory,
+/// reusing the streaming tailer's parse + partial reassembly so samples equal
+/// the bare messages shipped on the wire (not raw CRI lines).
+fn read_kubernetes_lines(dir: &str) -> Result<Vec<String>, String> {
+    let raw = crate::container_reader::sample_lines(Path::new(dir)).map_err(|e| {
+        if e.kind() == std::io::ErrorKind::NotFound {
+            format!("file not found: {dir}")
+        } else {
+            format!("failed to open {dir}: {e}")
+        }
+    })?;
+
+    Ok(raw
+        .into_iter()
+        .map(|line| String::from_utf8_lossy(&line).into_owned())
+        .collect())
 }
 
 /// Read up to `max_lines` of sample content for a raw identifier fallback.
@@ -275,7 +432,11 @@ fn read_sample_lines(path: &str, max_lines: usize) -> Result<Vec<String>, String
         return journal::sample_unit_lines(path, max_lines);
     }
 
-    read_file_lines(path, max_lines)
+    // Raw fallback with no resolved source has no multiline config, so it owns
+    // its own tail window here rather than deferring to `finalize_sample`.
+    let mut lines = read_file_lines(path)?;
+    let start = lines.len().saturating_sub(max_lines);
+    Ok(lines.split_off(start))
 }
 
 fn sample_error_reason(error: &str) -> &'static str {
@@ -311,12 +472,16 @@ async fn read_docker_lines(container_id: &str, max_lines: usize) -> Result<Vec<S
         Err(error) => return Err(format!("docker connect failed: {error}")),
     };
 
+    // `timestamps: true` + `parse_docker_log_line` mirrors the shipping path
+    // (`docker_stream`) exactly: strip the RFC3339 prefix and only trailing
+    // whitespace. The old sampler used `timestamps: false` + a full `trim`,
+    // which diverged from the bytes actually shipped.
     let options = LogsOptions {
         follow: false,
         stdout: true,
         stderr: true,
         tail: max_lines.to_string(),
-        timestamps: false,
+        timestamps: true,
         ..Default::default()
     };
 
@@ -328,37 +493,55 @@ async fn read_docker_lines(container_id: &str, max_lines: usize) -> Result<Vec<S
             .map_err(|error| format!("docker logs failed for {container_id}: {error}"))?
             .to_string();
 
-        lines.extend(
-            raw.lines()
-                .map(str::trim)
-                .filter(|line| !line.is_empty())
-                .map(str::to_string),
-        );
+        let (_, line) = crate::docker_stream::parse_docker_log_line(&raw);
+        if line.is_empty() {
+            continue;
+        }
+        lines.push(line.to_string());
     }
 
     let start = lines.len().saturating_sub(max_lines);
     Ok(lines[start..].to_vec())
 }
 
-/// Read up to `max_lines` from a file for sampling.
+/// Read every non-empty line from a file for sampling.
 ///
-/// Reads from the END of the file (most recent lines are most useful for
-/// format detection). Falls back to reading from start if the file is small.
-fn read_file_lines(path: &str, max_lines: usize) -> Result<Vec<String>, String> {
-    read_file_lines_with(path, max_lines, |line| line.to_string())
+/// Reader seam only — no tail window. The caller composes the optional multiline
+/// assembler and then takes the tail (`finalize_sample`), so an assembled entry
+/// is never split at the window edge.
+fn read_file_lines(path: &str) -> Result<Vec<String>, String> {
+    read_file_lines_with(path, |line| line.to_string())
 }
 
-fn read_docker_json_file_lines(path: &str, max_lines: usize) -> Result<Vec<String>, String> {
-    read_file_lines_with(path, max_lines, |line| {
-        crate::cri::parse_docker_json_line(line.as_bytes())
-            .map(|(payload, _)| String::from_utf8_lossy(&payload).into_owned())
-            .unwrap_or_else(|| line.to_string())
-    })
+fn read_docker_json_file_lines(path: &str) -> Result<Vec<String>, String> {
+    // Count lines that are NOT Docker-wrapped and reach the sample raw. A raw
+    // line here can misclassify a plaintext app as JSON downstream, so it is a
+    // signal worth surfacing rather than silently swallowing.
+    let raw_fallbacks = std::cell::Cell::new(0usize);
+    let lines = read_file_lines_with(path, |line| {
+        match crate::cri::parse_docker_json_line(line.as_bytes()) {
+            Some((payload, _)) => String::from_utf8_lossy(&payload).into_owned(),
+            None => {
+                raw_fallbacks.set(raw_fallbacks.get() + 1);
+                line.to_string()
+            }
+        }
+    })?;
+
+    let raw_fallbacks = raw_fallbacks.get();
+    if raw_fallbacks > 0 {
+        warn!(
+            path,
+            raw_fallbacks,
+            "docker json-file sample contained raw (non-Docker-wrapped) lines; a plaintext app here can be misclassified as JSON"
+        );
+    }
+
+    Ok(lines)
 }
 
 fn read_file_lines_with(
     path: &str,
-    max_lines: usize,
     transform: impl Fn(&str) -> String,
 ) -> Result<Vec<String>, String> {
     let file_path = Path::new(path);
@@ -369,16 +552,12 @@ fn read_file_lines_with(
     let file = std::fs::File::open(file_path).map_err(|e| format!("failed to open {path}: {e}"))?;
 
     let reader = BufReader::new(file);
-    let all_lines: Vec<String> = reader
+    Ok(reader
         .lines()
         .map_while(Result::ok)
         .map(|line| transform(&line))
         .filter(|l| !l.trim().is_empty())
-        .collect();
-
-    // Take the last N lines (most recent).
-    let start = all_lines.len().saturating_sub(max_lines);
-    Ok(all_lines[start..].to_vec())
+        .collect())
 }
 
 fn sample_fetch_retry_delay(failures: u32, poll_interval: Duration) -> Duration {
@@ -429,9 +608,160 @@ mod tests {
         )
         .unwrap();
 
-        let lines = read_docker_json_file_lines(path.to_str().unwrap(), 5).unwrap();
+        let lines = read_docker_json_file_lines(path.to_str().unwrap()).unwrap();
 
         assert_eq!(lines, vec!["first", r#"{"level":"INFO","msg":"second"}"#]);
+    }
+
+    /// Kill-test extension: the docker json-file sample must strip the wrapper
+    /// to exactly the bytes the shipping pipeline ships (`docker_json_wire_payload`).
+    #[test]
+    fn kt_docker_json_sample_matches_wire_payload() {
+        let raw_lines = [
+            r#"{"log":"plain line\n","stream":"stdout","time":"2026-07-04T23:35:08Z"}"#,
+            r#"{"log":"{\"level\":\"INFO\",\"msg\":\"structured\"}\n","stream":"stderr","time":"2026-07-04T23:35:09Z"}"#,
+        ];
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("container-json.log");
+        std::fs::write(&path, format!("{}\n{}\n", raw_lines[0], raw_lines[1])).unwrap();
+
+        let sample = read_docker_json_file_lines(path.to_str().unwrap()).unwrap();
+
+        let wire: Vec<String> = raw_lines
+            .iter()
+            .map(|raw| {
+                let payload = crate::pipeline::docker_json_wire_payload(raw.as_bytes().to_vec());
+                String::from_utf8_lossy(&payload).into_owned()
+            })
+            .collect();
+
+        assert_eq!(sample, wire, "sample payload must equal the wire payload");
+    }
+
+    #[test]
+    fn finalize_sample_without_multiline_is_byte_identical() {
+        // Negative control: a plain source with no multiline config is untouched
+        // (the whole batch fits inside the window).
+        let lines = vec![
+            "2026-07-13 first".to_string(),
+            "    indented body".to_string(),
+            "2026-07-13 second".to_string(),
+        ];
+        assert_eq!(finalize_sample(lines.clone(), None, 1000), lines);
+    }
+
+    /// Drive the shipper's assembler (`EntryAssembler`, the component both the
+    /// streaming wrapper and the pipeline wrap) over `lines`, exactly as the wire
+    /// does. The multiline kill-test asserts the sample against THIS, not against
+    /// hand-written strings, so any drift in joining semantics is caught.
+    fn shipper_assembled(cfg: &MultilineConfig, lines: &[String]) -> Vec<String> {
+        use crate::entry_assembler::{DEFAULT_TIMEOUT, EntryAssembler, LineContext};
+
+        let mut asm =
+            EntryAssembler::new(&cfg.start_pattern, cfg.max_lines as usize, DEFAULT_TIMEOUT)
+                .unwrap();
+        let mut events = Vec::new();
+        for (i, line) in lines.iter().enumerate() {
+            let ctx = LineContext {
+                start_offset: i as u64,
+                end_offset: i as u64 + 1,
+                inode: 0,
+            };
+            if let Some((event, _)) = asm.process(line.clone().into_bytes(), ctx) {
+                events.push(String::from_utf8_lossy(&event).into_owned());
+            }
+        }
+        if let Some((event, _)) = asm.flush() {
+            events.push(String::from_utf8_lossy(&event).into_owned());
+        }
+        events
+    }
+
+    /// Kill-test: a source with multiline config yields assembled entries in the
+    /// sample, byte-identical to what the shipper's assembler produces for the
+    /// same reader lines. Before the fix the sampler had no assembly, so the
+    /// sample shipped the raw split lines the analyzer chokes on.
+    #[test]
+    fn kt_multiline_source_samples_assembled_entries() {
+        let cfg = MultilineConfig {
+            start_pattern: r"^\d{4}-\d{2}-\d{2}".to_string(),
+            max_lines: 500,
+            timeout_secs: 5,
+        };
+        let lines = vec![
+            "2026-07-13 INFO request received".to_string(),
+            "    header: value".to_string(),
+            "    body line".to_string(),
+            "2026-07-13 INFO request done".to_string(),
+        ];
+
+        let sample = finalize_sample(lines.clone(), Some(&cfg), 1000);
+
+        assert_eq!(sample, shipper_assembled(&cfg, &lines));
+    }
+
+    /// The tail window covers whole assembled entries: assembly runs before the
+    /// tail, so a `max_lines` cap keeps the last N complete events — never the
+    /// last N raw lines that would split an event at the window edge.
+    #[test]
+    fn finalize_sample_tails_assembled_entries_not_raw_lines() {
+        let cfg = MultilineConfig {
+            start_pattern: r"^\d{4}-\d{2}-\d{2}".to_string(),
+            max_lines: 500,
+            timeout_secs: 5,
+        };
+        // Three events, each a header plus one continuation line.
+        let lines = vec![
+            "2026-07-13 one".to_string(),
+            "    body one".to_string(),
+            "2026-07-13 two".to_string(),
+            "    body two".to_string(),
+            "2026-07-13 three".to_string(),
+            "    body three".to_string(),
+        ];
+
+        let sample = finalize_sample(lines, Some(&cfg), 2);
+
+        assert_eq!(
+            sample,
+            vec![
+                "2026-07-13 two\n    body two".to_string(),
+                "2026-07-13 three\n    body three".to_string(),
+            ],
+            "tail keeps the last 2 complete events, not the last 2 raw lines"
+        );
+    }
+
+    #[test]
+    fn sample_bounds_round_trips_min_lines() {
+        // min_lines used to be deserialized and never read; it must now reach the
+        // sampling call verbatim, with max defaulting when Rails omits it.
+        let with_both = SampleRequestIdentifier {
+            identifier: "x".to_string(),
+            min_lines: Some(25),
+            max_lines: Some(400),
+        };
+        assert_eq!(
+            sample_bounds(&with_both),
+            SampleBounds {
+                min_lines: Some(25),
+                max_lines: 400,
+            }
+        );
+
+        let min_only = SampleRequestIdentifier {
+            identifier: "y".to_string(),
+            min_lines: Some(10),
+            max_lines: None,
+        };
+        assert_eq!(
+            sample_bounds(&min_only),
+            SampleBounds {
+                min_lines: Some(10),
+                max_lines: DEFAULT_MAX_LINES,
+            }
+        );
     }
 
     #[test]

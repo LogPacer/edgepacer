@@ -74,17 +74,9 @@ impl ContainerReader {
                         raw.pop();
                     }
 
-                    let (message, _, is_partial, is_cri) = cri::parse_line(&raw);
-                    if is_cri && is_partial {
-                        self.partial_buffer.extend_from_slice(&message);
+                    let Some(mut out) = cri::reassemble_partial(&raw, &mut self.partial_buffer)
+                    else {
                         continue;
-                    }
-
-                    let mut out = if self.partial_buffer.is_empty() {
-                        message
-                    } else {
-                        self.partial_buffer.extend_from_slice(&message);
-                        std::mem::take(&mut self.partial_buffer)
                     };
 
                     if out.len() > DEFAULT_MAX_LINE_BYTES {
@@ -222,6 +214,52 @@ fn inode_of(_meta: &std::fs::Metadata) -> u64 {
     0
 }
 
+/// Read all assembled CRI messages from a container log directory for sampling.
+///
+/// Batch, read-only counterpart to [`ContainerReader::read_lines`]: it reuses
+/// the exact same [`cri::reassemble_partial`] parse + `P`/`F` reassembly and the
+/// same oversized-line truncation, so a sampled message is byte-identical to the
+/// bare message the streaming tailer ships on the wire. Reads the active
+/// (highest-numbered) log file from the start; a dangling partial at EOF is left
+/// unemitted, matching the wire.
+///
+/// This is the reader seam only — it does not apply a tail window. The sampler
+/// composes the optional multiline assembler on top and then takes the tail, so
+/// the window covers whole assembled entries, matching the shipping pipeline.
+pub fn sample_lines(container_dir: &Path) -> io::Result<Vec<Vec<u8>>> {
+    let active = find_highest_log_file(container_dir)?;
+    let file = File::open(container_dir.join(&active))?;
+    let mut reader = BufReader::new(file);
+    let mut partial_buffer = Vec::new();
+    let mut lines = Vec::new();
+
+    loop {
+        let mut raw = Vec::new();
+        match reader.read_until(b'\n', &mut raw) {
+            Ok(0) => break,
+            Ok(_) => {
+                if raw.last() == Some(&b'\n') {
+                    raw.pop();
+                }
+                if raw.last() == Some(&b'\r') {
+                    raw.pop();
+                }
+
+                if let Some(mut out) = cri::reassemble_partial(&raw, &mut partial_buffer) {
+                    if out.len() > DEFAULT_MAX_LINE_BYTES {
+                        out.truncate(DEFAULT_MAX_LINE_BYTES);
+                    }
+                    lines.push(out);
+                }
+            }
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        }
+    }
+
+    Ok(lines)
+}
+
 /// Whether `path` looks like a K8s container log directory under /var/log/pods/.
 pub fn is_kubernetes_log_path(path: &Path) -> bool {
     let Some(s) = path.to_str() else {
@@ -236,6 +274,59 @@ pub fn is_kubernetes_log_path(path: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Kill-test: a Kubernetes sample must be byte-identical to the bare
+    /// messages the streaming tailer ships — CRI prefix stripped and `P`/`F`
+    /// partials reassembled. On the pre-fix sampler (raw `read_file_lines`) the
+    /// sample kept the CRI timestamp/stream/flag prefix and split partials, so
+    /// this comparison failed.
+    #[test]
+    fn kt_k8s_sample_lines_equal_wire_messages() {
+        use std::io::Write;
+
+        let dir = tempfile::tempdir().unwrap();
+        let log_path = dir.path().join("0.log");
+        std::fs::write(&log_path, b"").unwrap();
+
+        // Open the wire reader first (it seeks to end), then append the fixture
+        // so read_lines observes exactly what sample_lines reads from the start.
+        let mut wire_reader = ContainerReader::open(dir.path()).unwrap();
+
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&log_path)
+            .unwrap();
+        writeln!(
+            f,
+            "2026-07-13T10:30:45.000000000Z stdout F plain message one"
+        )
+        .unwrap();
+        writeln!(f, "2026-07-13T10:30:45.100000000Z stdout P Hello, ").unwrap();
+        writeln!(f, "2026-07-13T10:30:45.200000000Z stdout F world").unwrap();
+        writeln!(
+            f,
+            "2026-07-13T10:30:45.300000000Z stdout F {{\"level\":\"info\",\"msg\":\"json body\"}}"
+        )
+        .unwrap();
+        f.flush().unwrap();
+
+        let wire_messages = wire_reader.read_lines(100).unwrap();
+        let sample_messages = sample_lines(dir.path()).unwrap();
+
+        assert_eq!(
+            wire_messages, sample_messages,
+            "k8s sample must equal the wire's bare CRI-parsed messages"
+        );
+        assert_eq!(
+            sample_messages,
+            vec![
+                b"plain message one".to_vec(),
+                b"Hello, world".to_vec(),
+                br#"{"level":"info","msg":"json body"}"#.to_vec(),
+            ],
+            "partials reassembled, prefixes stripped, JSON body starts with '{{'"
+        );
+    }
 
     #[test]
     fn reads_cri_lines_from_active_log() {

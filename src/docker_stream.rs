@@ -248,7 +248,11 @@ async fn record_emit(
 ///
 /// Docker log format with timestamps: "2026-04-05T10:30:00.123456789Z actual log line"
 /// Returns (optional_timestamp, line_content).
-fn parse_docker_log_line(raw: &str) -> (Option<&str>, &str) {
+///
+/// Shared with the sampler (`sampler::read_docker_lines`) so a sampled Docker
+/// API line strips the timestamp and trailing whitespace exactly as the wire
+/// does — no divergent trimming.
+pub(crate) fn parse_docker_log_line(raw: &str) -> (Option<&str>, &str) {
     // Docker timestamps are RFC3339Nano, always 30+ chars with 'T' and 'Z'.
     // Search bytes, not a str slice: byte 35 can fall inside a multibyte char
     // (log lines are arbitrary UTF-8) and str slicing there panics. The space

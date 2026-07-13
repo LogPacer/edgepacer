@@ -29,6 +29,50 @@ use std::time::{Duration, Instant};
 
 use regex::Regex;
 
+use crate::config::MultilineConfig;
+
+/// Assemble a batch of already-extracted lines into multi-line events, matching
+/// the streaming wire path.
+///
+/// This is the batch counterpart of the streaming `StreamingEntryAssembler`: it
+/// drives the same [`EntryAssembler`], so the joined event bytes are identical
+/// to what the wire ships for the same input. Used by the sampler, whose input
+/// is a finite batch rather than a live stream — every line is fed through
+/// `process`, then `flush` drains the final in-progress event. There are no idle
+/// timeouts in a batch, so `timeout_secs` is irrelevant here.
+///
+/// When `multiline` is `None`, the lines pass through unchanged (each line is
+/// its own event), so a non-multiline source's bytes are untouched.
+pub fn assemble_batch(
+    lines: Vec<Vec<u8>>,
+    multiline: Option<&MultilineConfig>,
+) -> Result<Vec<Vec<u8>>, regex::Error> {
+    let Some(cfg) = multiline else {
+        return Ok(lines);
+    };
+
+    let timeout = Duration::from_secs(u64::from(cfg.timeout_secs.max(1)));
+    let mut assembler = EntryAssembler::new(&cfg.start_pattern, cfg.max_lines as usize, timeout)?;
+
+    let mut events = Vec::new();
+    for (offset, line) in lines.into_iter().enumerate() {
+        let start = offset as u64;
+        let ctx = LineContext {
+            start_offset: start,
+            end_offset: start + 1,
+            inode: 0,
+        };
+        if let Some((event, _)) = assembler.process(line, ctx) {
+            events.push(event);
+        }
+    }
+    if let Some((event, _)) = assembler.flush() {
+        events.push(event);
+    }
+
+    Ok(events)
+}
+
 /// Default max-lines cap for an assembled event. Matches Go (`entry_assembler.go:114`).
 pub const DEFAULT_MAX_LINES: usize = 500;
 
@@ -391,6 +435,59 @@ mod tests {
     #[test]
     fn invalid_regex_is_rejected() {
         assert!(EntryAssembler::new("[unclosed", 500, DEFAULT_TIMEOUT).is_err());
+    }
+
+    #[test]
+    fn assemble_batch_without_multiline_passes_lines_through() {
+        let lines = vec![b"one".to_vec(), b"two".to_vec(), b"three".to_vec()];
+        let out = assemble_batch(lines.clone(), None).unwrap();
+        assert_eq!(out, lines, "no multiline config leaves bytes untouched");
+    }
+
+    /// Kill-test: the batch assembler used by the sampler must produce the exact
+    /// same events as driving the streaming `EntryAssembler` line-by-line — that
+    /// is the assembler the wire uses, so this proves sample==wire for multiline.
+    #[test]
+    fn assemble_batch_matches_streaming_assembler() {
+        let cfg = MultilineConfig {
+            start_pattern: r"^\d{4}-\d{2}-\d{2}".to_string(),
+            max_lines: 500,
+            timeout_secs: 5,
+        };
+        let lines = vec![
+            b"2026-07-13 INFO starting up".to_vec(),
+            b"    with a continuation".to_vec(),
+            b"    and another".to_vec(),
+            b"2026-07-13 ERROR boom".to_vec(),
+            b"    stack frame 1".to_vec(),
+        ];
+
+        // Wire reference: drive EntryAssembler directly, exactly like the
+        // streaming path, then flush the trailing event.
+        let mut wire =
+            EntryAssembler::new(&cfg.start_pattern, cfg.max_lines as usize, DEFAULT_TIMEOUT)
+                .unwrap();
+        let mut wire_events = Vec::new();
+        for (i, line) in lines.iter().enumerate() {
+            let ctx = ctx(i as u64, i as u64 + 1);
+            if let Some((event, _)) = wire.process(line.clone(), ctx) {
+                wire_events.push(event);
+            }
+        }
+        if let Some((event, _)) = wire.flush() {
+            wire_events.push(event);
+        }
+
+        let batch_events = assemble_batch(lines, Some(&cfg)).unwrap();
+
+        assert_eq!(batch_events, wire_events);
+        assert_eq!(
+            batch_events,
+            vec![
+                b"2026-07-13 INFO starting up\n    with a continuation\n    and another".to_vec(),
+                b"2026-07-13 ERROR boom\n    stack frame 1".to_vec(),
+            ]
+        );
     }
 
     #[test]
