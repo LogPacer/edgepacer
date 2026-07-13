@@ -12,7 +12,6 @@ use tracing::info;
 
 use crate::streaming_actor::StreamHandle;
 use crate::streaming_checkpoint::StreamingCheckpoint;
-use crate::streaming_multiline::{StreamingEmit, StreamingEntryAssembler};
 
 use super::StreamEntry;
 
@@ -21,36 +20,13 @@ fn open_journal() -> Result<Journal, String> {
 }
 
 fn message_from_entry(entry: &sdjournal::EntryOwned) -> Option<String> {
-    let bytes = entry.get("MESSAGE")?;
-    let message = String::from_utf8_lossy(bytes).into_owned();
-    if message.trim().is_empty() {
-        None
-    } else {
-        Some(message)
-    }
+    super::decode_message(entry.get("MESSAGE")?)
 }
 
-fn entry_to_stream(entry: &sdjournal::LiveEntry) -> Result<StreamEntry, String> {
-    let message_bytes = entry
-        .get("MESSAGE")
-        .ok_or_else(|| "entry missing MESSAGE".to_string())?;
-    let message = String::from_utf8_lossy(message_bytes).into_owned();
-    if message.trim().is_empty() {
-        return Err("empty MESSAGE".into());
-    }
-
-    let cursor = entry
-        .cursor()
-        .map_err(|e| format!("entry cursor: {e}"))?
-        .to_string();
-
-    let timestamp_ns = (entry.realtime_usec() as i64) * 1_000;
-
-    Ok(StreamEntry {
-        message,
-        cursor,
-        timestamp_ns,
-    })
+fn entry_to_stream(entry: &sdjournal::LiveEntry) -> Option<StreamEntry> {
+    let message_bytes = entry.get("MESSAGE")?;
+    let cursor = entry.cursor().ok()?.to_string();
+    super::normalize_entry(message_bytes, entry.realtime_usec(), Some(cursor))
 }
 
 /// Sample the most recent lines for a unit using sdjournal.
@@ -137,7 +113,7 @@ pub fn stream_unit_blocking(
 
         match subscription.recv_timeout(Duration::from_millis(500)) {
             Ok(Ok(entry)) => {
-                if let Ok(stream_entry) = entry_to_stream(&entry)
+                if let Some(stream_entry) = entry_to_stream(&entry)
                     && tx.blocking_send(Ok(stream_entry)).is_err()
                 {
                     break;
@@ -157,74 +133,6 @@ pub fn stream_unit_blocking(
 
     drop(subscription);
     let _ = engine.join();
-}
-
-/// Enqueue one journal entry via the pipeline actor. Backpressure is the
-/// bounded channel — the await suspends until the actor has room. Returns
-/// `false` when the actor is gone and the stream should stop.
-pub async fn enqueue_stream_entry(
-    handle: &StreamHandle,
-    source_id: &str,
-    entries_processed: &mut u64,
-    last_cursor: &mut Option<String>,
-    checkpoint_interval: u64,
-    assembler: &mut StreamingEntryAssembler,
-    entry: StreamEntry,
-) -> bool {
-    let checkpoint = StreamingCheckpoint::journald(source_id, &entry.cursor);
-    match assembler
-        .process_line(
-            handle,
-            entry.message.into_bytes(),
-            entry.timestamp_ns,
-            Some(checkpoint),
-        )
-        .await
-    {
-        Ok(emit) => {
-            record_emit(
-                handle,
-                source_id,
-                entries_processed,
-                last_cursor,
-                checkpoint_interval,
-                emit,
-            )
-            .await
-        }
-        Err(_) => false,
-    }
-}
-
-pub async fn record_emit(
-    handle: &StreamHandle,
-    source_id: &str,
-    entries_processed: &mut u64,
-    last_cursor: &mut Option<String>,
-    checkpoint_interval: u64,
-    emit: Option<StreamingEmit>,
-) -> bool {
-    let Some(emit) = emit else {
-        return true;
-    };
-
-    *entries_processed += 1;
-
-    if let Some(checkpoint) = emit.checkpoint
-        && let Some(cursor) = checkpoint.journald_cursor()
-    {
-        *last_cursor = Some(cursor.to_string());
-    }
-
-    if entries_processed.is_multiple_of(checkpoint_interval)
-        && let Some(cursor) = last_cursor.as_deref()
-        && !handle
-            .set_checkpoint(StreamingCheckpoint::journald(source_id, cursor))
-            .await
-    {
-        return false;
-    }
-    true
 }
 
 pub async fn finalize_stream(

@@ -7,17 +7,31 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
 use tokio::sync::watch;
 use tokio::time::MissedTickBehavior;
-use tracing::{debug, error, info, warn};
+use tracing::{error, info, warn};
 
 use crate::config::MultilineConfig;
 use crate::streaming_actor::StreamHandle;
 use crate::streaming_checkpoint::StreamingCheckpoint;
-use crate::streaming_multiline::{StreamingEmit, StreamingEntryAssembler};
+use crate::streaming_multiline::StreamingEntryAssembler;
 
-const CHECKPOINT_INTERVAL: u64 = 100;
 const ASSEMBLER_CHECK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
 
+/// Raw fields of one journal entry as parsed from journalctl's JSON output,
+/// before normalization. Mirrors what the native backend reads from sdjournal:
+/// cursor, MESSAGE bytes, and the entry's own realtime timestamp.
+pub(crate) struct ParsedEntry {
+    pub cursor: Option<String>,
+    pub message_bytes: Vec<u8>,
+    pub realtime_usec: Option<u64>,
+}
+
 /// Pull the most recent `max_lines` from journald for a systemd unit via journalctl.
+///
+/// Uses `--output=json` (not `--output=cat`) so each entry is one JSON object on
+/// one physical line: a multi-line MESSAGE stays a single sample entry, matching
+/// the native backend's one-string-per-entry behavior. Extraction goes through
+/// the same seam as streaming, so a non-UTF8 MESSAGE is recovered rather than
+/// dropped.
 pub fn sample_unit_lines(unit: &str, max_lines: usize) -> Result<Vec<String>, String> {
     let output = std::process::Command::new("journalctl")
         .args([
@@ -26,7 +40,7 @@ pub fn sample_unit_lines(unit: &str, max_lines: usize) -> Result<Vec<String>, St
             "-n",
             &max_lines.to_string(),
             "--no-pager",
-            "--output=cat",
+            "--output=json",
         ])
         .output()
         .map_err(|e| format!("journalctl spawn failed for {unit}: {e}"))?;
@@ -39,13 +53,19 @@ pub fn sample_unit_lines(unit: &str, max_lines: usize) -> Result<Vec<String>, St
         ));
     }
 
-    let lines: Vec<String> = String::from_utf8_lossy(&output.stdout)
-        .lines()
-        .filter(|l| !l.trim().is_empty())
-        .map(String::from)
-        .collect();
+    Ok(extract_sample_lines(&String::from_utf8_lossy(
+        &output.stdout,
+    )))
+}
 
-    Ok(lines)
+/// Turn journalctl `--output=json` stdout into one message string per entry,
+/// dropping blanks with the shared predicate. One entry → one string (embedded
+/// newlines preserved), so `-n max_lines` bounds entries, not physical lines.
+fn extract_sample_lines(stdout: &str) -> Vec<String> {
+    stdout
+        .lines()
+        .filter_map(|line| super::decode_message(&parse_journald_json(line).message_bytes))
+        .collect()
 }
 
 /// Stream logs from a systemd unit via journalctl into the streaming pipeline.
@@ -122,42 +142,31 @@ pub async fn stream_unit_logs(
             line_result = reader.next_line() => {
                 match line_result {
                     Ok(Some(line)) => {
-                        let (cursor, message) = parse_journald_json(&line);
-                        if message.is_empty() {
+                        let parsed = parse_journald_json(&line);
+                        // Malformed lines (no JSON, thus no timestamp) fall back to
+                        // now(); every real journalctl JSON entry carries its own
+                        // __REALTIME_TIMESTAMP and keeps its historical time.
+                        let realtime_usec = parsed.realtime_usec.unwrap_or_else(now_usec);
+                        let Some(entry) = super::normalize_entry(
+                            &parsed.message_bytes,
+                            realtime_usec,
+                            parsed.cursor,
+                        ) else {
                             continue;
-                        }
+                        };
 
-                        let now_ns = SystemTime::now()
-                            .duration_since(UNIX_EPOCH)
-                            .unwrap_or_default()
-                            .as_nanos() as i64;
-
-                        let checkpoint = cursor
-                            .as_deref()
-                            .map(|cursor| StreamingCheckpoint::journald(source_id, cursor));
-
-                        match assembler
-                            .process_line(handle, message.into_bytes(), now_ns, checkpoint)
-                            .await
+                        if !super::enqueue_stream_entry(
+                            handle,
+                            source_id,
+                            &mut entries_processed,
+                            &mut last_cursor,
+                            &mut assembler,
+                            entry,
+                        )
+                        .await
                         {
-                            Ok(emit) => {
-                                if !record_emit(
-                                    handle,
-                                    unit,
-                                    source_id,
-                                    &mut entries_processed,
-                                    &mut last_cursor,
-                                    emit,
-                                )
-                                .await
-                                {
-                                    break;
-                                }
-                            }
-                            Err(_) => {
-                                warn!(unit, "streaming pipeline actor gone, stopping journald stream");
-                                break;
-                            }
+                            warn!(unit, "streaming pipeline actor gone, stopping journald stream");
+                            break;
                         }
                     }
                     Ok(None) => {
@@ -173,9 +182,8 @@ pub async fn stream_unit_logs(
             _ = assembler_tick.tick() => {
                 match assembler.check_timeout(handle).await {
                     Ok(emit) => {
-                        if !record_emit(
+                        if !super::record_emit(
                             handle,
-                            unit,
                             source_id,
                             &mut entries_processed,
                             &mut last_cursor,
@@ -183,6 +191,7 @@ pub async fn stream_unit_logs(
                         )
                         .await
                         {
+                            warn!(unit, "streaming pipeline actor gone, stopping journald stream");
                             break;
                         }
                     }
@@ -201,9 +210,8 @@ pub async fn stream_unit_logs(
 
     match assembler.flush(handle).await {
         Ok(emit) => {
-            if !record_emit(
+            if !super::record_emit(
                 handle,
-                unit,
                 source_id,
                 &mut entries_processed,
                 &mut last_cursor,
@@ -240,66 +248,60 @@ pub async fn stream_unit_logs(
     );
 }
 
-async fn record_emit(
-    handle: &StreamHandle,
-    unit: &str,
-    source_id: &str,
-    entries_processed: &mut u64,
-    last_cursor: &mut Option<String>,
-    emit: Option<StreamingEmit>,
-) -> bool {
-    let Some(emit) = emit else {
-        return true;
-    };
-
-    *entries_processed += 1;
-
-    if let Some(checkpoint) = emit.checkpoint
-        && let Some(cursor) = checkpoint.journald_cursor()
-    {
-        *last_cursor = Some(cursor.to_string());
-    }
-
-    if entries_processed.is_multiple_of(CHECKPOINT_INTERVAL) {
-        if let Some(cursor) = last_cursor.as_deref()
-            && !handle
-                .set_checkpoint(StreamingCheckpoint::journald(source_id, cursor))
-                .await
-        {
-            warn!(
-                unit,
-                "streaming pipeline actor gone, stopping journald stream"
-            );
-            return false;
-        }
-        debug!(
-            unit,
-            entries = *entries_processed,
-            "journald stream progress"
-        );
-    }
-
-    true
+fn now_usec() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_micros() as u64
 }
 
-/// Parse a journald JSON entry to extract `__CURSOR` and `MESSAGE`.
-pub(crate) fn parse_journald_json(line: &str) -> (Option<String>, String) {
+/// Parse one journalctl `--output=json` line into the raw fields the shared
+/// normalizer consumes: `__CURSOR`, `MESSAGE`, and `__REALTIME_TIMESTAMP`
+/// (microseconds since the epoch, emitted as a string). A line that is not
+/// valid JSON is treated as a raw message with no cursor or timestamp.
+pub(crate) fn parse_journald_json(line: &str) -> ParsedEntry {
     let Ok(obj) = serde_json::from_str::<serde_json::Value>(line) else {
-        return (None, line.to_string());
+        return ParsedEntry {
+            cursor: None,
+            message_bytes: line.as_bytes().to_vec(),
+            realtime_usec: None,
+        };
     };
 
     let cursor = obj
         .get("__CURSOR")
         .and_then(|v| v.as_str())
-        .map(|s| s.to_string());
+        .map(str::to_string);
 
-    let message = obj
+    let message_bytes = obj
         .get("MESSAGE")
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .to_string();
+        .map(message_field_bytes)
+        .unwrap_or_default();
 
-    (cursor, message)
+    let realtime_usec = obj
+        .get("__REALTIME_TIMESTAMP")
+        .and_then(|v| v.as_str())
+        .and_then(|s| s.parse::<u64>().ok());
+
+    ParsedEntry {
+        cursor,
+        message_bytes,
+        realtime_usec,
+    }
+}
+
+/// Recover MESSAGE bytes from either shape systemd's JSON export uses: a string
+/// when the payload is valid UTF-8, or an array of byte-valued integers when it
+/// is not. The normalizer then applies `from_utf8_lossy`, exactly as native does.
+fn message_field_bytes(value: &serde_json::Value) -> Vec<u8> {
+    match value {
+        serde_json::Value::String(s) => s.as_bytes().to_vec(),
+        serde_json::Value::Array(items) => items
+            .iter()
+            .filter_map(|item| item.as_u64().and_then(|n| u8::try_from(n).ok()))
+            .collect(),
+        _ => Vec::new(),
+    }
 }
 
 #[cfg(test)]
@@ -308,25 +310,60 @@ mod tests {
 
     #[test]
     fn parse_valid_journald_json() {
-        let line = r#"{"__CURSOR":"s=abc123;i=1","MESSAGE":"hello world","PRIORITY":"6","_SYSTEMD_UNIT":"nginx.service"}"#;
-        let (cursor, message) = parse_journald_json(line);
-        assert_eq!(cursor, Some("s=abc123;i=1".to_string()));
-        assert_eq!(message, "hello world");
+        let line = r#"{"__CURSOR":"s=abc123;i=1","MESSAGE":"hello world","__REALTIME_TIMESTAMP":"1600000000000000","PRIORITY":"6","_SYSTEMD_UNIT":"nginx.service"}"#;
+        let parsed = parse_journald_json(line);
+        assert_eq!(parsed.cursor, Some("s=abc123;i=1".to_string()));
+        assert_eq!(parsed.message_bytes, b"hello world");
+        assert_eq!(parsed.realtime_usec, Some(1_600_000_000_000_000));
     }
 
     #[test]
     fn parse_json_without_cursor() {
         let line = r#"{"MESSAGE":"no cursor here"}"#;
-        let (cursor, message) = parse_journald_json(line);
-        assert!(cursor.is_none());
-        assert_eq!(message, "no cursor here");
+        let parsed = parse_journald_json(line);
+        assert!(parsed.cursor.is_none());
+        assert_eq!(parsed.message_bytes, b"no cursor here");
+        assert!(parsed.realtime_usec.is_none());
     }
 
     #[test]
     fn parse_invalid_json_returns_raw() {
         let line = "not json at all";
-        let (cursor, message) = parse_journald_json(line);
-        assert!(cursor.is_none());
-        assert_eq!(message, "not json at all");
+        let parsed = parse_journald_json(line);
+        assert!(parsed.cursor.is_none());
+        assert_eq!(parsed.message_bytes, b"not json at all");
+        assert!(parsed.realtime_usec.is_none());
+    }
+
+    #[test]
+    fn parse_binary_message_as_byte_array() {
+        // systemd emits a non-UTF8 MESSAGE as an array of ints, not a string.
+        let line = r#"{"__CURSOR":"s=x;i=1","MESSAGE":[104,105,255,33]}"#;
+        let parsed = parse_journald_json(line);
+        assert_eq!(parsed.message_bytes, vec![104, 105, 255, 33]);
+    }
+
+    #[test]
+    fn sample_multiline_entry_counts_as_one_line() {
+        // Two journalctl JSON entries; the first MESSAGE spans three lines.
+        // Native returns one string per entry — the fallback sample must too,
+        // so `-n max_lines` bounds entries, not physical lines.
+        let stdout = concat!(
+            r#"{"__CURSOR":"s=x;i=1","MESSAGE":"line1\nline2\nline3"}"#,
+            "\n",
+            r#"{"__CURSOR":"s=x;i=2","MESSAGE":"single"}"#,
+            "\n",
+        );
+        let lines = extract_sample_lines(stdout);
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0], "line1\nline2\nline3");
+        assert_eq!(lines[1], "single");
+    }
+
+    #[test]
+    fn sample_drops_blank_message_entries() {
+        let stdout = concat!(r#"{"MESSAGE":"kept"}"#, "\n", r#"{"MESSAGE":"   "}"#, "\n",);
+        let lines = extract_sample_lines(stdout);
+        assert_eq!(lines, vec!["kept".to_string()]);
     }
 }
