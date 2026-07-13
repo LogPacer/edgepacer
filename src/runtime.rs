@@ -294,6 +294,7 @@ impl AgentTasks {
         let sampler = spawn_sampler(
             sampler_client,
             discovery_cache,
+            shared_config.clone(),
             sampler::DEFAULT_POLL_INTERVAL,
             shutdown.subscribe(),
         );
@@ -517,11 +518,19 @@ fn spawn_ebpf_manager(
 fn spawn_sampler(
     client: sender::Client,
     discovery_cache: discovery::SharedDiscoveryCache,
+    shared_config: config::SharedConfig,
     fallback_poll_interval: Duration,
     shutdown: watch::Receiver<bool>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
-        sampler::run(&client, discovery_cache, fallback_poll_interval, shutdown).await;
+        sampler::run(
+            &client,
+            discovery_cache,
+            shared_config,
+            fallback_poll_interval,
+            shutdown,
+        )
+        .await;
     })
 }
 
