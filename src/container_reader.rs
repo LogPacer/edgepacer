@@ -214,8 +214,7 @@ fn inode_of(_meta: &std::fs::Metadata) -> u64 {
     0
 }
 
-/// Read the last `max_lines` assembled CRI messages from a container log
-/// directory for sampling.
+/// Read all assembled CRI messages from a container log directory for sampling.
 ///
 /// Batch, read-only counterpart to [`ContainerReader::read_lines`]: it reuses
 /// the exact same [`cri::reassemble_partial`] parse + `P`/`F` reassembly and the
@@ -223,7 +222,11 @@ fn inode_of(_meta: &std::fs::Metadata) -> u64 {
 /// bare message the streaming tailer ships on the wire. Reads the active
 /// (highest-numbered) log file from the start; a dangling partial at EOF is left
 /// unemitted, matching the wire.
-pub fn sample_lines(container_dir: &Path, max_lines: usize) -> io::Result<Vec<Vec<u8>>> {
+///
+/// This is the reader seam only — it does not apply a tail window. The sampler
+/// composes the optional multiline assembler on top and then takes the tail, so
+/// the window covers whole assembled entries, matching the shipping pipeline.
+pub fn sample_lines(container_dir: &Path) -> io::Result<Vec<Vec<u8>>> {
     let active = find_highest_log_file(container_dir)?;
     let file = File::open(container_dir.join(&active))?;
     let mut reader = BufReader::new(file);
@@ -254,8 +257,7 @@ pub fn sample_lines(container_dir: &Path, max_lines: usize) -> io::Result<Vec<Ve
         }
     }
 
-    let start = lines.len().saturating_sub(max_lines);
-    Ok(lines[start..].to_vec())
+    Ok(lines)
 }
 
 /// Whether `path` looks like a K8s container log directory under /var/log/pods/.
@@ -309,7 +311,7 @@ mod tests {
         f.flush().unwrap();
 
         let wire_messages = wire_reader.read_lines(100).unwrap();
-        let sample_messages = sample_lines(dir.path(), 100).unwrap();
+        let sample_messages = sample_lines(dir.path()).unwrap();
 
         assert_eq!(
             wire_messages, sample_messages,

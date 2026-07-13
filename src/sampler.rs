@@ -297,14 +297,16 @@ async fn read_sample_lines_for_identifier(
         (resolved, multiline)
     };
 
-    // Stage 1: per-access-method line/payload extraction, shared with the wire
-    // path. Stage 2 (multiline assembly) is applied uniformly in `finalize`.
-    let extracted = match resolved {
-        Some((AccessMethod::File, locator)) => read_file_lines(&locator, max_lines)?,
-        Some((AccessMethod::Kubernetes, locator)) => read_kubernetes_lines(&locator, max_lines)?,
-        Some((AccessMethod::DockerJsonFile, locator)) => {
-            read_docker_json_file_lines(&locator, max_lines)?
-        }
+    // The sampler is one shape for every source: the shared reader seam, then
+    // the same optional multiline assembler the shipper composes, then the tail
+    // window (`finalize_sample`) — so the window covers whole assembled entries.
+    // File-backed readers return every extracted line; streaming readers
+    // (journald/docker/event-log) cap at the source since their history is not
+    // rewindable, and the final tail is then a no-op for them.
+    let lines = match resolved {
+        Some((AccessMethod::File, locator)) => read_file_lines(&locator)?,
+        Some((AccessMethod::Kubernetes, locator)) => read_kubernetes_lines(&locator)?,
+        Some((AccessMethod::DockerJsonFile, locator)) => read_docker_json_file_lines(&locator)?,
         Some((AccessMethod::Journald, unit)) => journal::sample_unit_lines(&unit, max_lines)?,
         Some((AccessMethod::DockerApi, container_id)) => {
             read_docker_lines(&container_id, max_lines).await?
@@ -315,7 +317,7 @@ async fn read_sample_lines_for_identifier(
         None => read_sample_lines(identifier, max_lines)?,
     };
 
-    Ok(finalize_sample(extracted, multiline.as_ref()))
+    Ok(finalize_sample(lines, multiline.as_ref(), max_lines))
 }
 
 /// Resolve the source's multiline configuration from the active collect config,
@@ -361,35 +363,47 @@ fn resolve_multiline(
     }
 }
 
-/// Stage 2 of extraction: assemble multi-line events exactly as the wire does.
+/// Compose the multiline assembler stage on top of the reader output, then take
+/// the tail window — the sampler's counterpart to how the shipper assembles a
+/// source's lines before shipping.
 ///
-/// When `multiline` is `None` the lines pass through byte-for-byte, so a
-/// non-multiline source (the negative-control plain file among them) is
-/// untouched. A bad multiline pattern would also stop the shipping pipeline, so
-/// dropping the sample there keeps the two paths consistent.
-fn finalize_sample(lines: Vec<String>, multiline: Option<&MultilineConfig>) -> Vec<String> {
-    let Some(config) = multiline else {
-        return lines;
+/// Assembly runs before the tail so the window covers whole assembled entries,
+/// never a fragment split at the window edge. When `multiline` is `None` the
+/// lines are untouched, so a non-multiline source (the negative-control plain
+/// file among them) is byte-identical to a plain last-`max_lines` read. A bad
+/// multiline pattern would also stop the shipping pipeline, so dropping the
+/// sample there keeps the two paths consistent.
+fn finalize_sample(
+    lines: Vec<String>,
+    multiline: Option<&MultilineConfig>,
+    max_lines: usize,
+) -> Vec<String> {
+    let assembled = match multiline {
+        None => lines,
+        Some(config) => {
+            let bytes: Vec<Vec<u8>> = lines.into_iter().map(String::into_bytes).collect();
+            match assemble_batch(bytes, Some(config)) {
+                Ok(events) => events
+                    .into_iter()
+                    .map(|event| String::from_utf8_lossy(&event).into_owned())
+                    .collect(),
+                Err(error) => {
+                    warn!(%error, "invalid sample multiline pattern; skipping assembly");
+                    return Vec::new();
+                }
+            }
+        }
     };
 
-    let bytes: Vec<Vec<u8>> = lines.into_iter().map(String::into_bytes).collect();
-    match assemble_batch(bytes, Some(config)) {
-        Ok(events) => events
-            .into_iter()
-            .map(|event| String::from_utf8_lossy(&event).into_owned())
-            .collect(),
-        Err(error) => {
-            warn!(%error, "invalid sample multiline pattern; skipping assembly");
-            Vec::new()
-        }
-    }
+    let start = assembled.len().saturating_sub(max_lines);
+    assembled[start..].to_vec()
 }
 
-/// Read the last `max_lines` assembled CRI messages from a Kubernetes container
-/// log directory, reusing the streaming tailer's parse + partial reassembly so
-/// samples equal the bare messages shipped on the wire (not raw CRI lines).
-fn read_kubernetes_lines(dir: &str, max_lines: usize) -> Result<Vec<String>, String> {
-    let raw = crate::container_reader::sample_lines(Path::new(dir), max_lines).map_err(|e| {
+/// Read the assembled CRI messages from a Kubernetes container log directory,
+/// reusing the streaming tailer's parse + partial reassembly so samples equal
+/// the bare messages shipped on the wire (not raw CRI lines).
+fn read_kubernetes_lines(dir: &str) -> Result<Vec<String>, String> {
+    let raw = crate::container_reader::sample_lines(Path::new(dir)).map_err(|e| {
         if e.kind() == std::io::ErrorKind::NotFound {
             format!("file not found: {dir}")
         } else {
@@ -418,7 +432,11 @@ fn read_sample_lines(path: &str, max_lines: usize) -> Result<Vec<String>, String
         return journal::sample_unit_lines(path, max_lines);
     }
 
-    read_file_lines(path, max_lines)
+    // Raw fallback with no resolved source has no multiline config, so it owns
+    // its own tail window here rather than deferring to `finalize_sample`.
+    let mut lines = read_file_lines(path)?;
+    let start = lines.len().saturating_sub(max_lines);
+    Ok(lines.split_off(start))
 }
 
 fn sample_error_reason(error: &str) -> &'static str {
@@ -486,31 +504,29 @@ async fn read_docker_lines(container_id: &str, max_lines: usize) -> Result<Vec<S
     Ok(lines[start..].to_vec())
 }
 
-/// Read up to `max_lines` from a file for sampling.
+/// Read every non-empty line from a file for sampling.
 ///
-/// Reads from the END of the file (most recent lines are most useful for
-/// format detection). Falls back to reading from start if the file is small.
-fn read_file_lines(path: &str, max_lines: usize) -> Result<Vec<String>, String> {
-    read_file_lines_with(path, max_lines, |line| line.to_string())
+/// Reader seam only — no tail window. The caller composes the optional multiline
+/// assembler and then takes the tail (`finalize_sample`), so an assembled entry
+/// is never split at the window edge.
+fn read_file_lines(path: &str) -> Result<Vec<String>, String> {
+    read_file_lines_with(path, |line| line.to_string())
 }
 
-fn read_docker_json_file_lines(path: &str, max_lines: usize) -> Result<Vec<String>, String> {
+fn read_docker_json_file_lines(path: &str) -> Result<Vec<String>, String> {
     // Count lines that are NOT Docker-wrapped and reach the sample raw. A raw
     // line here can misclassify a plaintext app as JSON downstream, so it is a
     // signal worth surfacing rather than silently swallowing.
     let raw_fallbacks = std::cell::Cell::new(0usize);
-    let lines =
-        read_file_lines_with(
-            path,
-            max_lines,
-            |line| match crate::cri::parse_docker_json_line(line.as_bytes()) {
-                Some((payload, _)) => String::from_utf8_lossy(&payload).into_owned(),
-                None => {
-                    raw_fallbacks.set(raw_fallbacks.get() + 1);
-                    line.to_string()
-                }
-            },
-        )?;
+    let lines = read_file_lines_with(path, |line| {
+        match crate::cri::parse_docker_json_line(line.as_bytes()) {
+            Some((payload, _)) => String::from_utf8_lossy(&payload).into_owned(),
+            None => {
+                raw_fallbacks.set(raw_fallbacks.get() + 1);
+                line.to_string()
+            }
+        }
+    })?;
 
     let raw_fallbacks = raw_fallbacks.get();
     if raw_fallbacks > 0 {
@@ -526,7 +542,6 @@ fn read_docker_json_file_lines(path: &str, max_lines: usize) -> Result<Vec<Strin
 
 fn read_file_lines_with(
     path: &str,
-    max_lines: usize,
     transform: impl Fn(&str) -> String,
 ) -> Result<Vec<String>, String> {
     let file_path = Path::new(path);
@@ -537,16 +552,12 @@ fn read_file_lines_with(
     let file = std::fs::File::open(file_path).map_err(|e| format!("failed to open {path}: {e}"))?;
 
     let reader = BufReader::new(file);
-    let all_lines: Vec<String> = reader
+    Ok(reader
         .lines()
         .map_while(Result::ok)
         .map(|line| transform(&line))
         .filter(|l| !l.trim().is_empty())
-        .collect();
-
-    // Take the last N lines (most recent).
-    let start = all_lines.len().saturating_sub(max_lines);
-    Ok(all_lines[start..].to_vec())
+        .collect())
 }
 
 fn sample_fetch_retry_delay(failures: u32, poll_interval: Duration) -> Duration {
@@ -597,7 +608,7 @@ mod tests {
         )
         .unwrap();
 
-        let lines = read_docker_json_file_lines(path.to_str().unwrap(), 5).unwrap();
+        let lines = read_docker_json_file_lines(path.to_str().unwrap()).unwrap();
 
         assert_eq!(lines, vec!["first", r#"{"level":"INFO","msg":"second"}"#]);
     }
@@ -615,7 +626,7 @@ mod tests {
         let path = dir.path().join("container-json.log");
         std::fs::write(&path, format!("{}\n{}\n", raw_lines[0], raw_lines[1])).unwrap();
 
-        let sample = read_docker_json_file_lines(path.to_str().unwrap(), 5).unwrap();
+        let sample = read_docker_json_file_lines(path.to_str().unwrap()).unwrap();
 
         let wire: Vec<String> = raw_lines
             .iter()
@@ -630,18 +641,47 @@ mod tests {
 
     #[test]
     fn finalize_sample_without_multiline_is_byte_identical() {
-        // Negative control: a plain source with no multiline config is untouched.
+        // Negative control: a plain source with no multiline config is untouched
+        // (the whole batch fits inside the window).
         let lines = vec![
             "2026-07-13 first".to_string(),
             "    indented body".to_string(),
             "2026-07-13 second".to_string(),
         ];
-        assert_eq!(finalize_sample(lines.clone(), None), lines);
+        assert_eq!(finalize_sample(lines.clone(), None, 1000), lines);
+    }
+
+    /// Drive the shipper's assembler (`EntryAssembler`, the component both the
+    /// streaming wrapper and the pipeline wrap) over `lines`, exactly as the wire
+    /// does. The multiline kill-test asserts the sample against THIS, not against
+    /// hand-written strings, so any drift in joining semantics is caught.
+    fn shipper_assembled(cfg: &MultilineConfig, lines: &[String]) -> Vec<String> {
+        use crate::entry_assembler::{DEFAULT_TIMEOUT, EntryAssembler, LineContext};
+
+        let mut asm =
+            EntryAssembler::new(&cfg.start_pattern, cfg.max_lines as usize, DEFAULT_TIMEOUT)
+                .unwrap();
+        let mut events = Vec::new();
+        for (i, line) in lines.iter().enumerate() {
+            let ctx = LineContext {
+                start_offset: i as u64,
+                end_offset: i as u64 + 1,
+                inode: 0,
+            };
+            if let Some((event, _)) = asm.process(line.clone().into_bytes(), ctx) {
+                events.push(String::from_utf8_lossy(&event).into_owned());
+            }
+        }
+        if let Some((event, _)) = asm.flush() {
+            events.push(String::from_utf8_lossy(&event).into_owned());
+        }
+        events
     }
 
     /// Kill-test: a source with multiline config yields assembled entries in the
-    /// sample, matching the wire. Before the fix the sampler had no assembly, so
-    /// the sample shipped the raw split lines the analyzer chokes on.
+    /// sample, byte-identical to what the shipper's assembler produces for the
+    /// same reader lines. Before the fix the sampler had no assembly, so the
+    /// sample shipped the raw split lines the analyzer chokes on.
     #[test]
     fn kt_multiline_source_samples_assembled_entries() {
         let cfg = MultilineConfig {
@@ -656,14 +696,40 @@ mod tests {
             "2026-07-13 INFO request done".to_string(),
         ];
 
-        let assembled = finalize_sample(lines, Some(&cfg));
+        let sample = finalize_sample(lines.clone(), Some(&cfg), 1000);
+
+        assert_eq!(sample, shipper_assembled(&cfg, &lines));
+    }
+
+    /// The tail window covers whole assembled entries: assembly runs before the
+    /// tail, so a `max_lines` cap keeps the last N complete events — never the
+    /// last N raw lines that would split an event at the window edge.
+    #[test]
+    fn finalize_sample_tails_assembled_entries_not_raw_lines() {
+        let cfg = MultilineConfig {
+            start_pattern: r"^\d{4}-\d{2}-\d{2}".to_string(),
+            max_lines: 500,
+            timeout_secs: 5,
+        };
+        // Three events, each a header plus one continuation line.
+        let lines = vec![
+            "2026-07-13 one".to_string(),
+            "    body one".to_string(),
+            "2026-07-13 two".to_string(),
+            "    body two".to_string(),
+            "2026-07-13 three".to_string(),
+            "    body three".to_string(),
+        ];
+
+        let sample = finalize_sample(lines, Some(&cfg), 2);
 
         assert_eq!(
-            assembled,
+            sample,
             vec![
-                "2026-07-13 INFO request received\n    header: value\n    body line".to_string(),
-                "2026-07-13 INFO request done".to_string(),
-            ]
+                "2026-07-13 two\n    body two".to_string(),
+                "2026-07-13 three\n    body three".to_string(),
+            ],
+            "tail keeps the last 2 complete events, not the last 2 raw lines"
         );
     }
 
