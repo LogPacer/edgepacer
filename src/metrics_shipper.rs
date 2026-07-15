@@ -366,23 +366,35 @@ pub async fn run(
                 // same directory.
                 pipelines.clear();
                 pipelines = open_pipelines(&streams, &identity, data_dir, counters.clone());
-                if streams.is_empty() {
-                    info!("no metrics streams configured, metrics shipper idle");
-                } else if pipelines.is_empty() {
-                    warn!("no metrics pipelines could be created");
-                } else {
-                    info!(
-                        count = pipelines.len(),
-                        "metrics streams changed, pipelines rebuilt"
-                    );
-                }
-                active_streams = streams;
-
-                let collect_interval = active_streams
+                let collect_interval = streams
                     .iter()
                     .map(|cfg| cfg.send_interval_secs)
                     .min()
                     .unwrap_or(DEFAULT_SEND_INTERVAL_SECS);
+                if pipelines.len() == streams.len() {
+                    if streams.is_empty() {
+                        info!("no metrics streams configured, metrics shipper idle");
+                    } else {
+                        info!(
+                            count = pipelines.len(),
+                            "metrics streams changed, pipelines rebuilt"
+                        );
+                    }
+                    active_streams = streams;
+                } else {
+                    // A stream failed to open. Run nothing and record nothing
+                    // as active: a partial set would desync the streams ==
+                    // active skip, and an active set that never materialized
+                    // would mask the retry on the next config change.
+                    warn!(
+                        opened = pipelines.len(),
+                        wanted = streams.len(),
+                        "metrics pipelines could not be created, will retry on config change"
+                    );
+                    pipelines.clear();
+                    active_streams.clear();
+                }
+
                 // A fresh interval fires immediately — the first snapshot
                 // reaches the rebuilt pipelines without waiting a full period.
                 collect_tick = tokio::time::interval(Duration::from_secs(collect_interval));
@@ -615,19 +627,21 @@ mod tests {
         assert_eq!(message, "one metrics snapshot rejected");
     }
 
+    fn metrics_section(endpoint: &str) -> serde_json::Value {
+        serde_json::json!({
+            "metrics-1": {
+                "subbox_endpoint": endpoint,
+                "archive_id": "arc_1",
+                "repo_id": "repo_1",
+                "collection_interval_secs": 1,
+                "send_interval_secs": 1
+            }
+        })
+    }
+
     fn metrics_unified_config(endpoint: &str) -> crate::config::UnifiedConfig {
         crate::config::UnifiedConfig::new(
-            serde_json::json!({
-                "metrics": {
-                    "metrics-1": {
-                        "subbox_endpoint": endpoint,
-                        "archive_id": "arc_1",
-                        "repo_id": "repo_1",
-                        "collection_interval_secs": 1,
-                        "send_interval_secs": 1
-                    }
-                }
-            }),
+            serde_json::json!({"metrics": metrics_section(endpoint)}),
             "etag".into(),
         )
     }
@@ -697,6 +711,53 @@ mod tests {
         *shared.write().await = Some(metrics_unified_config(&format!("{}/wire", server_b.uri())));
 
         wait_for_request(&server_b, "new endpoint after the config change").await;
+
+        shutdown_tx.send(true).unwrap();
+        handle.await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn run_retries_failed_pipeline_open_on_next_config_change() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let server = MockServer::start().await;
+        mount_wire_ok(&server).await;
+
+        // An unwritable buffer root makes every pipeline open fail — the
+        // transient-failure stand-in.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o555)).unwrap();
+
+        let endpoint = format!("{}/wire", server.uri());
+        let shared: SharedConfig = Arc::new(tokio::sync::RwLock::new(Some(
+            metrics_unified_config(&endpoint),
+        )));
+        let (shutdown_tx, handle) = spawn_run(shared.clone(), dir.path().to_path_buf());
+
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(
+            server
+                .received_requests()
+                .await
+                .unwrap_or_default()
+                .is_empty(),
+            "open should have failed on the unwritable buffer root"
+        );
+
+        // The cause clears, and a config lands whose METRICS streams are
+        // identical — only an unrelated section differs. The failed open must
+        // be retried, not skipped as already-active.
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+        *shared.write().await = Some(crate::config::UnifiedConfig::new(
+            serde_json::json!({
+                "metrics": metrics_section(&endpoint),
+                "discovery": {"enabled": true}
+            }),
+            "etag-2".into(),
+        ));
+
+        wait_for_request(&server, "retry after a transient open failure").await;
 
         shutdown_tx.send(true).unwrap();
         handle.await.unwrap();
