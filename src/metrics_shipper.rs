@@ -306,7 +306,20 @@ fn open_pipelines(
         .collect()
 }
 
+/// How often to check the shared config for changes (mirrors the trace proxy
+/// manager's cadence).
+const CONFIG_POLL_INTERVAL: Duration = Duration::from_secs(2);
+
+/// Collect cadence before any stream is configured.
+const DEFAULT_SEND_INTERVAL_SECS: u64 = 10;
+
 /// Run the metrics loop — collects host metrics, buffers durably, drains to LogRelay.
+///
+/// Watches the shared config and rebuilds its pipelines whenever the extracted
+/// metrics streams change (endpoint move, source added/removed, interval
+/// tuned) — mirroring the trace proxy manager. Buffers are durable per-source
+/// sqlite, so snapshots pending at swap time survive and drain to the new
+/// destination.
 pub async fn run(
     shared_config: SharedConfig,
     identity: AgentIdentity,
@@ -314,58 +327,70 @@ pub async fn run(
     counters: Arc<AgentCounters>,
     mut shutdown: watch::Receiver<bool>,
 ) {
-    let configs = loop {
-        let streams = {
-            let guard = shared_config.read().await;
-            guard.as_ref().map(config::all_metrics_streams)
-        };
-
-        match streams {
-            Some(s) if !s.is_empty() => break s,
-            Some(_) => {
-                info!("no metrics streams configured, metrics shipper idle");
-                return;
-            }
-            None => {
-                tokio::select! {
-                    _ = tokio::time::sleep(Duration::from_secs(2)) => continue,
-                    _ = shutdown.changed() => return,
-                }
-            }
-        }
-    };
-
-    info!(
-        count = configs.len(),
-        "metrics pipeline starting for {} stream(s)",
-        configs.len()
-    );
-
     let mut collector = MetricsCollector::new();
     let _ = collector.collect();
     let start_time = Instant::now();
 
-    let mut pipelines = open_pipelines(&configs, &identity, data_dir, counters.clone());
-    if pipelines.is_empty() {
-        warn!("no metrics pipelines could be created");
-        return;
-    }
-
-    let collect_interval = configs
-        .iter()
-        .map(|cfg| cfg.send_interval_secs)
-        .min()
-        .unwrap_or(10);
-
     let pipeline_config = MetricsPipelineConfig::default();
-    let mut collect_tick = tokio::time::interval(Duration::from_secs(collect_interval));
+    let mut pipelines: Vec<MetricsPipeline> = Vec::new();
+    let mut active_streams: Vec<MetricsStreamConfig> = Vec::new();
+    let mut last_checksum = String::new();
+
+    let mut config_tick = tokio::time::interval(CONFIG_POLL_INTERVAL);
+    let mut collect_tick = tokio::time::interval(Duration::from_secs(DEFAULT_SEND_INTERVAL_SECS));
     let mut drain_tick = tokio::time::interval(pipeline_config.drain_interval);
-    collect_tick.tick().await;
-    drain_tick.tick().await;
+
+    info!("metrics shipper started, watching for config changes");
 
     loop {
         tokio::select! {
+            _ = config_tick.tick() => {
+                let streams = {
+                    let guard = shared_config.read().await;
+                    match guard.as_ref() {
+                        Some(unified) if unified.checksum != last_checksum => {
+                            last_checksum = unified.checksum.clone();
+                            Some(config::all_metrics_streams(unified))
+                        }
+                        _ => None,
+                    }
+                };
+                let Some(mut streams) = streams else { continue };
+                streams.sort_by(|a, b| a.metric_source_id.cmp(&b.metric_source_id));
+                if streams == active_streams {
+                    continue;
+                }
+
+                // Drop the old pipelines before reopening: each holds its
+                // source's durable buffer, and the replacement reopens the
+                // same directory.
+                pipelines.clear();
+                pipelines = open_pipelines(&streams, &identity, data_dir, counters.clone());
+                if streams.is_empty() {
+                    info!("no metrics streams configured, metrics shipper idle");
+                } else if pipelines.is_empty() {
+                    warn!("no metrics pipelines could be created");
+                } else {
+                    info!(
+                        count = pipelines.len(),
+                        "metrics streams changed, pipelines rebuilt"
+                    );
+                }
+                active_streams = streams;
+
+                let collect_interval = active_streams
+                    .iter()
+                    .map(|cfg| cfg.send_interval_secs)
+                    .min()
+                    .unwrap_or(DEFAULT_SEND_INTERVAL_SECS);
+                // A fresh interval fires immediately — the first snapshot
+                // reaches the rebuilt pipelines without waiting a full period.
+                collect_tick = tokio::time::interval(Duration::from_secs(collect_interval));
+            }
             _ = collect_tick.tick() => {
+                if pipelines.is_empty() {
+                    continue;
+                }
                 // One snapshot carries both series: host_* (the machine) and
                 // agent_* (edgepacer's own footprint), explicitly prefixed.
                 let host = collector.collect();
@@ -588,6 +613,114 @@ mod tests {
         assert_eq!(accepted, 1);
         assert_eq!(rejected, 1);
         assert_eq!(message, "one metrics snapshot rejected");
+    }
+
+    fn metrics_unified_config(endpoint: &str) -> crate::config::UnifiedConfig {
+        crate::config::UnifiedConfig::new(
+            serde_json::json!({
+                "metrics": {
+                    "metrics-1": {
+                        "subbox_endpoint": endpoint,
+                        "archive_id": "arc_1",
+                        "repo_id": "repo_1",
+                        "collection_interval_secs": 1,
+                        "send_interval_secs": 1
+                    }
+                }
+            }),
+            "etag".into(),
+        )
+    }
+
+    async fn mount_wire_ok(server: &MockServer) {
+        Mock::given(method("POST"))
+            .and(path("/wire"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_raw(encoded_wire_response(1, 0, ""), "application/x-protobuf"),
+            )
+            .mount(server)
+            .await;
+    }
+
+    async fn wait_for_request(server: &MockServer, context: &str) {
+        for _ in 0..100 {
+            if !server
+                .received_requests()
+                .await
+                .unwrap_or_default()
+                .is_empty()
+            {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        panic!("no wire request arrived: {context}");
+    }
+
+    fn spawn_run(
+        shared: SharedConfig,
+        data_dir: std::path::PathBuf,
+    ) -> (watch::Sender<bool>, tokio::task::JoinHandle<()>) {
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let handle = tokio::spawn(async move {
+            run(
+                shared,
+                crate::identity::AgentIdentity::new("agent-1".into()),
+                &data_dir,
+                AgentCounters::new(),
+                shutdown_rx,
+            )
+            .await;
+        });
+        (shutdown_tx, handle)
+    }
+
+    #[tokio::test]
+    async fn run_rebuilds_pipelines_when_stream_config_changes() {
+        let server_a = MockServer::start().await;
+        let server_b = MockServer::start().await;
+        mount_wire_ok(&server_a).await;
+        mount_wire_ok(&server_b).await;
+
+        let dir = tempfile::tempdir().unwrap();
+        let shared: SharedConfig = Arc::new(tokio::sync::RwLock::new(Some(
+            metrics_unified_config(&format!("{}/wire", server_a.uri())),
+        )));
+        let (shutdown_tx, handle) = spawn_run(shared.clone(), dir.path().to_path_buf());
+
+        wait_for_request(&server_a, "initial endpoint before the config change").await;
+
+        // The subbox moves: same stream, new endpoint. The shipper must pick
+        // it up without a restart — this exact staleness shipped metrics into
+        // a dead endpoint for hours in local dev.
+        *shared.write().await = Some(metrics_unified_config(&format!("{}/wire", server_b.uri())));
+
+        wait_for_request(&server_b, "new endpoint after the config change").await;
+
+        shutdown_tx.send(true).unwrap();
+        handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn run_starts_shipping_when_metrics_appear_after_startup() {
+        let server = MockServer::start().await;
+        mount_wire_ok(&server).await;
+
+        let dir = tempfile::tempdir().unwrap();
+        // Config present but no metrics section — the shipper must idle and
+        // keep watching, not exit for the process lifetime.
+        let shared: SharedConfig = Arc::new(tokio::sync::RwLock::new(Some(
+            crate::config::UnifiedConfig::new(serde_json::json!({}), "etag".into()),
+        )));
+        let (shutdown_tx, handle) = spawn_run(shared.clone(), dir.path().to_path_buf());
+
+        *shared.write().await = Some(metrics_unified_config(&format!("{}/wire", server.uri())));
+
+        wait_for_request(&server, "metrics enabled after startup").await;
+
+        shutdown_tx.send(true).unwrap();
+        handle.await.unwrap();
     }
 
     #[tokio::test]
