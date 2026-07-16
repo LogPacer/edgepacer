@@ -5,7 +5,9 @@ use super::fields::{
 };
 
 /// A metrics stream extracted from unified config - enough to drive metrics shipping.
-#[derive(Debug, Clone)]
+/// `PartialEq` is the reconcile seam: the shipper rebuilds its pipelines when
+/// the extracted streams no longer equal the ones it is running.
+#[derive(Debug, Clone, PartialEq)]
 pub struct MetricsStreamConfig {
     pub metric_source_id: String,
     pub subbox_endpoint: String,
