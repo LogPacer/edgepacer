@@ -90,6 +90,18 @@ enum SizeClass {
     NearCap,
 }
 
+impl SizeClass {
+    const ALL: [Self; 3] = [Self::Tiny, Self::Median, Self::NearCap];
+
+    fn target_bytes(self) -> Option<usize> {
+        match self {
+            Self::Tiny => None,
+            Self::Median => Some(MEDIAN_TARGET_BYTES),
+            Self::NearCap => Some(NEAR_CAP_TARGET_BYTES),
+        }
+    }
+}
+
 struct CorpusCase {
     signal: SignalKind,
     size: SizeClass,
@@ -405,27 +417,15 @@ fn validate_raw_acceptance(case: &CorpusCase, response: WireResponse) -> Result<
 fn build_corpus() -> Result<Vec<CorpusCase>> {
     let mut corpus = Vec::with_capacity(12);
     for signal in SignalKind::ALL {
-        corpus.push(build_case(signal, SizeClass::Tiny, None)?);
-        corpus.push(build_case(
-            signal,
-            SizeClass::Median,
-            Some(MEDIAN_TARGET_BYTES),
-        )?);
-        corpus.push(build_case(
-            signal,
-            SizeClass::NearCap,
-            Some(NEAR_CAP_TARGET_BYTES),
-        )?);
+        for size in SizeClass::ALL {
+            corpus.push(build_case(signal, size)?);
+        }
     }
     Ok(corpus)
 }
 
-fn build_case(
-    signal: SignalKind,
-    size: SizeClass,
-    target_bytes: Option<usize>,
-) -> Result<CorpusCase> {
-    let records = match target_bytes {
+fn build_case(signal: SignalKind, size: SizeClass) -> Result<CorpusCase> {
+    let records = match size.target_bytes() {
         None => 1,
         Some(target) => {
             let sample_records = 128;
@@ -704,7 +704,7 @@ mod tests {
             counters.clone(),
         )
         .unwrap();
-        let case = build_case(SignalKind::Log, SizeClass::Tiny, None).unwrap();
+        let case = build_case(SignalKind::Log, SizeClass::Tiny).unwrap();
 
         assert!(send_gzip(&shipper, &counters, &case).await.is_err());
         assert_eq!(server.received_requests().await.unwrap().len(), 1);
