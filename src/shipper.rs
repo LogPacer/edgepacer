@@ -24,12 +24,16 @@ use prost::Message;
 use reqwest::header::{AUTHORIZATION, CONTENT_ENCODING, CONTENT_TYPE, HeaderValue};
 use std::io::Write;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use tokio::sync::Semaphore;
 use tracing::{debug, error, warn};
 
 /// Estimated per-entry wire overhead (envelope + metadata + protobuf framing)
 /// added to each line when byte-capping a batch. Deliberately generous so the
 /// cap under-fills rather than over-fills relative to the receiver's limit.
 const ENTRY_WIRE_OVERHEAD: usize = 128;
+/// Keep gzip from consuming both cores or multiplying near-cap body allocations
+/// when independent signal drains align on the smallest rollout hosts.
+static WIRE_GZIP_SEMAPHORE: Semaphore = Semaphore::const_new(1);
 
 pub(crate) fn checked_wire_count(field: &'static str, len: usize) -> Result<u32, EdgepacerError> {
     u32::try_from(len).map_err(|_| EdgepacerError::WireCountTooLarge { field, len })
@@ -178,7 +182,6 @@ pub(crate) struct WireTransportPolicy {
     read_error: &'static str,
     decode_error: &'static str,
     payload_too_large: PayloadTooLargeMode,
-    count_rejected_bytes: bool,
 }
 
 impl WireTransportPolicy {
@@ -191,7 +194,6 @@ impl WireTransportPolicy {
             read_error: "failed to read response",
             decode_error: "failed to decode response",
             payload_too_large: PayloadTooLargeMode::PreserveForShrink,
-            count_rejected_bytes: true,
         }
     }
 
@@ -204,7 +206,6 @@ impl WireTransportPolicy {
             read_error: "failed to read metrics response",
             decode_error: "failed to decode metrics response",
             payload_too_large: PayloadTooLargeMode::ClassifyAsHttpStatus,
-            count_rejected_bytes: false,
         }
     }
 
@@ -217,7 +218,6 @@ impl WireTransportPolicy {
             read_error: "failed to read traces response",
             decode_error: "failed to decode traces response",
             payload_too_large: PayloadTooLargeMode::ClassifyAsHttpStatus,
-            count_rejected_bytes: false,
         }
     }
 }
@@ -269,16 +269,17 @@ impl WireTransport {
         retry_policy: RetryPolicy,
         policy: WireTransportPolicy,
     ) -> Result<ShipResult, EdgepacerError> {
-        let compressed = Bytes::from(crate::common::run_blocking(|| gzip_wire_body(encoded))?);
-        let compressed_len = compressed.len();
+        let compressed = {
+            let _permit = WIRE_GZIP_SEMAPHORE.acquire().await.map_err(|error| {
+                EdgepacerError::Other(anyhow::anyhow!("wire gzip semaphore closed: {error}"))
+            })?;
+            Bytes::from(crate::common::run_blocking(|| gzip_wire_body(encoded))?)
+        };
         let mut attempt = 0u32;
         loop {
             attempt += 1;
             match self.send_request(&compressed, policy).await {
-                Ok(result) => {
-                    self.record_sent_bytes(compressed_len, &result, policy);
-                    return Ok(result);
-                }
+                Ok(result) => return Ok(result),
                 Err(e) if e.is_retryable() => {
                     if let Some(delay) = retry_policy.delay_for(attempt) {
                         warn!(
@@ -295,15 +296,6 @@ impl WireTransport {
                 }
                 Err(e) => return Err(e),
             }
-        }
-    }
-
-    fn record_sent_bytes(&self, body_len: usize, result: &ShipResult, policy: WireTransportPolicy) {
-        let Some(counters) = &self.counters else {
-            return;
-        };
-        if matches!(result, ShipResult::Accepted { .. }) || policy.count_rejected_bytes {
-            counters.add_bytes_sent(body_len as u64);
         }
     }
 
@@ -336,6 +328,9 @@ impl WireTransport {
             .await
             .map_err(|e| EdgepacerError::Retryable(format!("{}: {e}", policy.request_error)))?;
 
+        if let Some(counters) = &self.counters {
+            counters.add_bytes_sent(compressed.len() as u64);
+        }
         let status = resp.status();
 
         // Upload token missing/expired/rejected at the gate → refresh + retry.
@@ -1081,24 +1076,70 @@ mod tests {
         );
     }
 
-    #[test]
-    fn rejected_body_accounting_preserves_transport_policy() {
+    #[tokio::test]
+    async fn retries_reuse_gzip_body_and_count_each_response() {
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/wire"))
+            .respond_with(ResponseTemplate::new(503))
+            .up_to_n_times(1)
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/wire"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_raw(
+                    WireResponse {
+                        accepted: 1,
+                        rejected: 0,
+                        error_message: String::new(),
+                    }
+                    .encode_to_vec(),
+                    "application/x-protobuf",
+                ),
+            )
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
         let counters = AgentCounters::new();
-        let transport = WireTransport::new("http://relay/wire", "repo_test")
-            .unwrap()
-            .with_counters(counters.clone());
-        let rejected = ShipResult::Rejected {
-            accepted: 0,
-            rejected: 1,
-            message: "rejected".into(),
-        };
+        let shipper = Shipper::with_counters(
+            &format!("{}/wire", mock_server.uri()),
+            "arc_test",
+            "repo_test",
+            None,
+            counters.clone(),
+        )
+        .unwrap();
+        let encoded = vec![b'a'; 4096];
 
-        transport.record_sent_bytes(123, &rejected, WireTransportPolicy::log_batches());
-        assert_eq!(counters.snapshot().bytes_sent, 123);
+        let result = shipper
+            .send_with_retry_policy(
+                &encoded,
+                RetryPolicy {
+                    initial_delay: Duration::from_millis(1),
+                    max_delay: Duration::from_millis(1),
+                    max_attempts: 2,
+                },
+            )
+            .await
+            .unwrap();
 
-        transport.record_sent_bytes(456, &rejected, WireTransportPolicy::metrics_batches());
-        transport.record_sent_bytes(789, &rejected, WireTransportPolicy::traces_batches());
-        assert_eq!(counters.snapshot().bytes_sent, 123);
+        assert!(matches!(result, ShipResult::Accepted { count: 1 }));
+        let requests = mock_server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0].body, requests[1].body);
+        for request in &requests {
+            assert_eq!(crate::test_support::gunzip_wire_body(request), encoded);
+        }
+        assert_eq!(
+            counters.snapshot().bytes_sent,
+            requests
+                .iter()
+                .map(|request| request.body.len() as u64)
+                .sum::<u64>()
+        );
     }
 
     #[test]

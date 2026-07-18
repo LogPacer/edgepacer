@@ -155,6 +155,26 @@ pub async fn run(
     status: SharedEbpfStatus,
     data_dir: &Path,
     identity: &crate::identity::AgentIdentity,
+    shutdown: watch::Receiver<bool>,
+) {
+    run_with_counters(
+        shared_config,
+        discovery_cache,
+        status,
+        data_dir,
+        identity,
+        AgentCounters::new(),
+        shutdown,
+    )
+    .await;
+}
+
+pub async fn run_with_counters(
+    shared_config: SharedConfig,
+    discovery_cache: SharedDiscoveryCache,
+    status: SharedEbpfStatus,
+    data_dir: &Path,
+    identity: &crate::identity::AgentIdentity,
     counters: Arc<AgentCounters>,
     mut shutdown: watch::Receiver<bool>,
 ) {

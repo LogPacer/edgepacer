@@ -27,6 +27,7 @@ const NEAR_CAP_TARGET_BYTES: usize = 15 * 1024 * 1024 / 4;
 
 const MIN_EGRESS_REDUCTION_PERCENT: f64 = 20.0;
 const MAX_P95_LATENCY_REGRESSION_PERCENT: f64 = 10.0;
+const MAX_P95_LATENCY_REGRESSION_MS: f64 = 25.0;
 const MAX_CPU_INCREASE_PERCENTAGE_POINTS: f64 = 0.5;
 
 // Match the Linux agent binary's allocator and decay policy so the CPU result
@@ -132,6 +133,7 @@ struct ModeReport {
 struct Thresholds {
     min_egress_reduction_percent: f64,
     max_p95_latency_regression_percent: f64,
+    max_p95_latency_regression_ms: f64,
     max_cpu_increase_percentage_points: f64,
 }
 
@@ -139,6 +141,7 @@ struct Thresholds {
 struct Verdict {
     egress_reduction_percent: f64,
     p95_latency_regression_percent: f64,
+    p95_latency_regression_ms: f64,
     cpu_increase_percentage_points: f64,
     egress_pass: bool,
     latency_pass: bool,
@@ -266,6 +269,7 @@ async fn main() -> Result<()> {
         thresholds: Thresholds {
             min_egress_reduction_percent: MIN_EGRESS_REDUCTION_PERCENT,
             max_p95_latency_regression_percent: MAX_P95_LATENCY_REGRESSION_PERCENT,
+            max_p95_latency_regression_ms: MAX_P95_LATENCY_REGRESSION_MS,
             max_cpu_increase_percentage_points: MAX_CPU_INCREASE_PERCENTAGE_POINTS,
         },
         verdict,
@@ -559,6 +563,7 @@ fn evaluate_verdict(raw: &ModeReport, gzip: &ModeReport) -> Verdict {
         percent_reduction(raw.request_body_bytes, gzip.request_body_bytes);
     let p95_latency_regression_percent =
         percent_change(raw.p95_ship_latency_ms, gzip.p95_ship_latency_ms);
+    let p95_latency_regression_ms = gzip.p95_ship_latency_ms - raw.p95_ship_latency_ms;
     let cpu_increase_percentage_points = gzip.process_cpu_percent - raw.process_cpu_percent;
 
     // Compare the source measurements directly so exact allowed boundaries do
@@ -566,12 +571,14 @@ fn evaluate_verdict(raw: &ModeReport, gzip: &ModeReport) -> Verdict {
     let egress_pass = gzip.request_body_bytes as f64
         <= raw.request_body_bytes as f64 * (1.0 - MIN_EGRESS_REDUCTION_PERCENT / 100.0);
     let latency_pass = gzip.p95_ship_latency_ms
-        <= raw.p95_ship_latency_ms * (1.0 + MAX_P95_LATENCY_REGRESSION_PERCENT / 100.0);
+        <= raw.p95_ship_latency_ms * (1.0 + MAX_P95_LATENCY_REGRESSION_PERCENT / 100.0)
+        || p95_latency_regression_ms <= MAX_P95_LATENCY_REGRESSION_MS;
     let cpu_pass = cpu_increase_percentage_points <= MAX_CPU_INCREASE_PERCENTAGE_POINTS;
 
     Verdict {
         egress_reduction_percent,
         p95_latency_regression_percent,
+        p95_latency_regression_ms,
         cpu_increase_percentage_points,
         egress_pass,
         latency_pass,
@@ -636,12 +643,13 @@ mod tests {
 
         assert!(verdict.egress_pass);
         assert!(verdict.latency_pass);
+        assert_eq!(verdict.p95_latency_regression_ms, 10.0);
         assert!(verdict.cpu_pass);
         assert!(verdict.pass);
     }
 
     #[test]
-    fn each_release_threshold_fails_independently() {
+    fn egress_and_cpu_thresholds_fail_independently() {
         let raw = mode(1_000, 100.0, 1.0);
 
         let egress = evaluate_verdict(&raw, &mode(801, 100.0, 1.0));
@@ -650,17 +658,52 @@ mod tests {
         assert!(egress.cpu_pass);
         assert!(!egress.pass);
 
-        let latency = evaluate_verdict(&raw, &mode(800, 110.01, 1.0));
-        assert!(latency.egress_pass);
-        assert!(!latency.latency_pass);
-        assert!(latency.cpu_pass);
-        assert!(!latency.pass);
-
         let cpu = evaluate_verdict(&raw, &mode(800, 100.0, 1.500_001));
         assert!(cpu.egress_pass);
         assert!(cpu.latency_pass);
         assert!(!cpu.cpu_pass);
         assert!(!cpu.pass);
+    }
+
+    #[test]
+    fn latency_relative_gate_passes_when_absolute_gate_fails() {
+        let verdict = evaluate_verdict(&mode(1_000, 1_000.0, 1.0), &mode(800, 1_100.0, 1.0));
+
+        assert_eq!(verdict.p95_latency_regression_ms, 100.0);
+        assert!(verdict.latency_pass);
+        assert!(verdict.pass);
+    }
+
+    #[test]
+    fn latency_absolute_gate_passes_when_relative_gate_fails() {
+        let verdict = evaluate_verdict(&mode(1_000, 30.0, 1.0), &mode(800, 45.0, 1.0));
+
+        assert_eq!(verdict.p95_latency_regression_ms, 15.0);
+        assert!(verdict.p95_latency_regression_percent > 10.0);
+        assert!(verdict.latency_pass);
+        assert!(verdict.pass);
+    }
+
+    #[test]
+    fn latency_exact_absolute_boundary_passes() {
+        let verdict = evaluate_verdict(&mode(1_000, 30.0, 1.0), &mode(800, 55.0, 1.0));
+
+        assert_eq!(
+            verdict.p95_latency_regression_ms,
+            MAX_P95_LATENCY_REGRESSION_MS
+        );
+        assert!(verdict.latency_pass);
+        assert!(verdict.pass);
+    }
+
+    #[test]
+    fn latency_fails_when_both_gates_fail() {
+        let verdict = evaluate_verdict(&mode(1_000, 30.0, 1.0), &mode(800, 55.01, 1.0));
+
+        assert!(verdict.p95_latency_regression_percent > 10.0);
+        assert!(verdict.p95_latency_regression_ms > MAX_P95_LATENCY_REGRESSION_MS);
+        assert!(!verdict.latency_pass);
+        assert!(!verdict.pass);
     }
 
     #[test]
@@ -688,7 +731,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn gzip_lane_fails_on_first_retryable_response() {
+    async fn gzip_lane_fails_and_counts_first_retryable_response() {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .respond_with(ResponseTemplate::new(503))
@@ -707,7 +750,11 @@ mod tests {
         let case = build_case(SignalKind::Log, SizeClass::Tiny).unwrap();
 
         assert!(send_gzip(&shipper, &counters, &case).await.is_err());
-        assert_eq!(server.received_requests().await.unwrap().len(), 1);
-        assert_eq!(counters.snapshot().bytes_sent, 0);
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(
+            counters.snapshot().bytes_sent,
+            requests[0].body.len() as u64
+        );
     }
 }

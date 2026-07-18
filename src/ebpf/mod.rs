@@ -59,7 +59,7 @@ mod runner;
 
 pub use capability::{EbpfCapability, detect};
 #[cfg(all(target_os = "linux", feature = "ebpf"))]
-pub use runner::run;
+pub use runner::{run, run_with_counters};
 
 use std::sync::Arc;
 

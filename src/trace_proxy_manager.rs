@@ -26,17 +26,22 @@ pub struct TraceProxyManager {
     proxies: HashMap<String, ManagedProxy>,
     data_dir: PathBuf,
     resource_id: String,
-    counters: Arc<AgentCounters>,
+    counters: Option<Arc<AgentCounters>>,
 }
 
 impl TraceProxyManager {
-    pub fn new(data_dir: &Path, resource_id: String, counters: Arc<AgentCounters>) -> Self {
+    pub fn new(data_dir: &Path, resource_id: String) -> Self {
         Self {
             proxies: HashMap::new(),
             data_dir: data_dir.to_path_buf(),
             resource_id,
-            counters,
+            counters: None,
         }
+    }
+
+    pub fn with_counters(mut self, counters: Arc<AgentCounters>) -> Self {
+        self.counters = Some(counters);
+        self
     }
 
     /// Reconcile running proxies against desired config.
@@ -105,7 +110,11 @@ impl TraceProxyManager {
             buffer_max_mb: DEFAULT_TRACE_BUFFER_MAX_MB,
         };
 
-        TraceProxy::new(proxy_config).with_counters(self.counters.clone())
+        let proxy = TraceProxy::new(proxy_config);
+        match &self.counters {
+            Some(counters) => proxy.with_counters(counters.clone()),
+            None => proxy,
+        }
     }
 
     async fn start_proxy(&mut self, cfg: &TraceProxyStreamConfig) {
@@ -156,10 +165,26 @@ pub async fn run(
     shared_config: SharedConfig,
     data_dir: &Path,
     resource_id: String,
+    shutdown: watch::Receiver<bool>,
+) {
+    run_with_counters(
+        shared_config,
+        data_dir,
+        resource_id,
+        AgentCounters::new(),
+        shutdown,
+    )
+    .await;
+}
+
+pub async fn run_with_counters(
+    shared_config: SharedConfig,
+    data_dir: &Path,
+    resource_id: String,
     counters: Arc<AgentCounters>,
     mut shutdown: watch::Receiver<bool>,
 ) {
-    let mut manager = TraceProxyManager::new(data_dir, resource_id, counters);
+    let mut manager = TraceProxyManager::new(data_dir, resource_id).with_counters(counters);
     let mut last_checksum = String::new();
 
     info!("trace proxy manager started, watching for config changes");
@@ -217,8 +242,7 @@ mod tests {
     #[tokio::test]
     async fn reconcile_starts_and_stops_proxies() {
         let dir = tempfile::tempdir().unwrap();
-        let mut manager =
-            TraceProxyManager::new(dir.path(), "host-test".into(), AgentCounters::new());
+        let mut manager = TraceProxyManager::new(dir.path(), "host-test".into());
 
         // Empty reconcile — no proxies.
         manager.reconcile(&[]).await;
@@ -233,7 +257,8 @@ mod tests {
     fn manager_builds_counted_trace_transports() {
         let dir = tempfile::tempdir().unwrap();
         let counters = AgentCounters::new();
-        let manager = TraceProxyManager::new(dir.path(), "host-test".into(), counters.clone());
+        let manager =
+            TraceProxyManager::new(dir.path(), "host-test".into()).with_counters(counters.clone());
         let config = TraceProxyStreamConfig {
             log_source_id: "trace-source".into(),
             listen_address: "127.0.0.1:0".parse().unwrap(),

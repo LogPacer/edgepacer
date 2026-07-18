@@ -1094,7 +1094,8 @@ mod tests {
         );
         config.listen_address = listen_address;
 
-        let mut proxy = TraceProxy::new(config);
+        let counters = crate::counters::AgentCounters::new();
+        let mut proxy = TraceProxy::new(config).with_counters(counters.clone());
         proxy.start().await.expect("proxy should start");
 
         let body = encode_trace_request(vec![resource_span_with_service(Some("checkout"))]);
@@ -1133,6 +1134,10 @@ mod tests {
 
         assert_eq!(response.status(), reqwest::StatusCode::OK);
         assert_eq!(requests.len(), 1, "exactly one payload should be forwarded");
+        assert_eq!(
+            counters.snapshot().bytes_sent,
+            requests[0].body.len() as u64
+        );
 
         let forwarded = crate::test_support::decode_gzip_wire_request(&requests[0]);
         assert_eq!(forwarded.batches.len(), 1);

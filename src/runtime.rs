@@ -492,7 +492,14 @@ fn spawn_trace_proxy_manager(
     shutdown: watch::Receiver<bool>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
-        trace_proxy_manager::run(shared_config, &data_dir, resource_id, counters, shutdown).await;
+        trace_proxy_manager::run_with_counters(
+            shared_config,
+            &data_dir,
+            resource_id,
+            counters,
+            shutdown,
+        )
+        .await;
     })
 }
 
@@ -507,7 +514,7 @@ fn spawn_ebpf_manager(
     shutdown: watch::Receiver<bool>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
-        ebpf::run(
+        ebpf::run_with_counters(
             shared_config,
             discovery_cache,
             ebpf_status,
