@@ -1955,8 +1955,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn ebpf_delivery_builds_counted_transports() {
+    #[tokio::test]
+    async fn ebpf_delivery_builds_counted_transports() {
         let dir = tempfile::tempdir().unwrap();
         let counters = AgentCounters::new();
         let delivery = create_delivery(
