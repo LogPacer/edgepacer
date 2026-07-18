@@ -257,6 +257,22 @@ impl Orchestrator {
         }
     }
 
+    fn build_shipper(
+        &self,
+        endpoint: &str,
+        archive_id: &str,
+        repo_id: &str,
+        stamp_resource_identifier: bool,
+    ) -> Result<Shipper, crate::common::EdgepacerError> {
+        let identity = stamp_resource_identifier.then(|| self.identity.clone());
+        match &self.counters {
+            Some(counters) => {
+                Shipper::with_counters(endpoint, archive_id, repo_id, identity, counters.clone())
+            }
+            None => Shipper::new(endpoint, archive_id, repo_id, identity),
+        }
+    }
+
     // queue_depth_bytes needs no periodic refresh: each pipeline's buffer
     // maintains the shared QueueDepthGauge itself (wired at start below).
     pub fn update_operational_stats(&self) {
@@ -462,15 +478,14 @@ impl Orchestrator {
     }
 
     fn start_file_pipeline(&mut self, stream: &LogStreamConfig) -> Result<(), PipelineError> {
-        let shipper = Shipper::new(
-            &stream.endpoint,
-            &stream.archive_id,
-            &stream.repo_id,
-            stream
-                .stamp_resource_identifier
-                .then(|| self.identity.clone()),
-        )
-        .map_err(|e| PipelineError::Io(std::io::Error::other(e.to_string())))?;
+        let shipper = self
+            .build_shipper(
+                &stream.endpoint,
+                &stream.archive_id,
+                &stream.repo_id,
+                stream.stamp_resource_identifier,
+            )
+            .map_err(|e| PipelineError::Io(std::io::Error::other(e.to_string())))?;
 
         let source_dir = self.source_data_dir(&stream.log_source_id);
         std::fs::create_dir_all(&source_dir)?;
@@ -526,13 +541,11 @@ impl Orchestrator {
         &mut self,
         stream: &StreamingSourceConfig,
     ) -> Result<(), StreamingPipelineStartError> {
-        let shipper = Shipper::new(
+        let shipper = self.build_shipper(
             &stream.endpoint,
             &stream.archive_id,
             &stream.repo_id,
-            stream
-                .stamp_resource_identifier
-                .then(|| self.identity.clone()),
+            stream.stamp_resource_identifier,
         )?;
 
         let source_dir = self.source_data_dir(&stream.log_source_id);
@@ -943,6 +956,20 @@ mod tests {
         assert_eq!(orch.active_count(), 0);
         orch.reconcile(&[], &[], &[]).await;
         assert_eq!(orch.active_count(), 0);
+    }
+
+    #[test]
+    fn monitored_orchestrator_builds_counted_log_transports() {
+        let dir = tempfile::tempdir().unwrap();
+        let counters = AgentCounters::new();
+        let orchestrator = Orchestrator::new(dir.path(), test_identity())
+            .with_monitoring(counters.clone(), Arc::new(ErrorCollector::new()));
+
+        let shipper = orchestrator
+            .build_shipper("http://relay/wire", "arc", "repo", true)
+            .unwrap();
+
+        assert!(shipper.uses_counters(&counters));
     }
 
     #[tokio::test]

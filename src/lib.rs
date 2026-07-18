@@ -51,6 +51,8 @@ mod streaming_multiline;
 pub mod streaming_pipeline;
 mod streaming_runner;
 pub mod tailer;
+#[cfg(test)]
+pub(crate) mod test_support;
 pub mod token_store;
 pub mod trace_buffer;
 pub mod trace_proxy;

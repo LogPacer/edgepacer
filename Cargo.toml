@@ -45,6 +45,7 @@ reqwest = { version = "0.12", features = [
     "rustls-tls-native-roots",
     "stream",
 ], default-features = false }
+bytes = "1"
 
 # Serialization
 serde = { version = "1", features = ["derive"] }
@@ -122,8 +123,9 @@ chrono = { version = "0.4", features = ["serde"] }
 # Persistent storage: SQLite (WAL) backs all buffers and the checkpoint store.
 rusqlite = { version = "0.40", features = ["bundled"] }
 
-# Compression (historical import)
-flate2 = "1"
+# Compression. zlib-rs keeps flate2's portable API while meeting the agent CPU
+# and ship-latency gates for the always-gzip wire path.
+flate2 = { version = "1", default-features = false, features = ["zlib-rs"] }
 
 # Regex (multiline entry assembler, per-source start patterns)
 regex = "1"
@@ -169,6 +171,10 @@ path = "test/tools/mock_logrelay.rs"
 [[bin]]
 name = "loggen"
 path = "test/tools/loggen.rs"
+
+[[bin]]
+name = "wire-gzip-bench"
+path = "test/tools/wire_gzip_bench.rs"
 
 [[bin]]
 name = "edgepacer-release-manifest"

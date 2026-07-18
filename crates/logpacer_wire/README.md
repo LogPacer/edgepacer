@@ -10,7 +10,12 @@ the EdgePacer workspace so the public repository builds from one checkout.
 
 | Endpoint | Format | Payload |
 |----------|--------|---------|
-| `POST /v1/logpacer-wire` | protobuf | `WireRequest` with routed logs, metrics, graph, traces, or eBPF batches |
+| `POST /v1/logpacer-wire` | protobuf, optionally gzip-encoded | `WireRequest` with routed logs, metrics, graph, traces, or eBPF batches |
+
+Producers may send the protobuf body raw or with `Content-Encoding: gzip`.
+Receivers must accept both forms during mixed-version rollouts and must bound
+the decompressed body size. EdgePacer sends gzip bodies and keeps
+`Content-Type: application/x-protobuf`.
 
 ## Compatibility
 

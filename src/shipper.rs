@@ -1,13 +1,18 @@
-//! LogPacer Wire shipper — encodes log lines as WireRequest and POSTs to the configured wire endpoint.
+//! LogPacer Wire shipper — encodes log lines as WireRequest and POSTs gzip bodies
+//! to the configured wire endpoint.
 //!
 //! This is the critical M2 delivery path: file tailer → logpacer_wire → HTTP POST.
-//! Content-Type: application/x-protobuf (matching what logrelay expects).
+//! Content-Type: application/x-protobuf and Content-Encoding: gzip match the
+//! dual-accept logrelay wire contract.
 
 use crate::common::EdgepacerError;
 use crate::counters::AgentCounters;
 use crate::identity::AgentIdentity;
 use crate::retry::RetryPolicy;
 
+use bytes::Bytes;
+use flate2::Compression;
+use flate2::write::GzEncoder;
 use std::sync::Arc;
 
 use logpacer_wire::{
@@ -16,7 +21,8 @@ use logpacer_wire::{
     WireResponse, routed_batch, wire_ebpf_event, wire_log_event,
 };
 use prost::Message;
-use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderValue};
+use reqwest::header::{AUTHORIZATION, CONTENT_ENCODING, CONTENT_TYPE, HeaderValue};
+use std::io::Write;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tracing::{debug, error, warn};
 
@@ -250,18 +256,27 @@ impl WireTransport {
         self
     }
 
+    #[cfg(test)]
+    fn uses_counters(&self, counters: &Arc<AgentCounters>) -> bool {
+        self.counters
+            .as_ref()
+            .is_some_and(|attached| Arc::ptr_eq(attached, counters))
+    }
+
     pub(crate) async fn send_with_retry(
         &self,
         encoded: &[u8],
         retry_policy: RetryPolicy,
         policy: WireTransportPolicy,
     ) -> Result<ShipResult, EdgepacerError> {
+        let compressed = Bytes::from(crate::common::run_blocking(|| gzip_wire_body(encoded))?);
+        let compressed_len = compressed.len();
         let mut attempt = 0u32;
         loop {
             attempt += 1;
-            match self.send_request(encoded, policy).await {
+            match self.send_request(&compressed, policy).await {
                 Ok(result) => {
-                    self.record_sent_bytes(encoded.len(), &result, policy);
+                    self.record_sent_bytes(compressed_len, &result, policy);
                     return Ok(result);
                 }
                 Err(e) if e.is_retryable() => {
@@ -283,23 +298,18 @@ impl WireTransport {
         }
     }
 
-    fn record_sent_bytes(
-        &self,
-        encoded_len: usize,
-        result: &ShipResult,
-        policy: WireTransportPolicy,
-    ) {
+    fn record_sent_bytes(&self, body_len: usize, result: &ShipResult, policy: WireTransportPolicy) {
         let Some(counters) = &self.counters else {
             return;
         };
         if matches!(result, ShipResult::Accepted { .. }) || policy.count_rejected_bytes {
-            counters.add_bytes_sent(encoded_len as u64);
+            counters.add_bytes_sent(body_len as u64);
         }
     }
 
     async fn send_request(
         &self,
-        data: &[u8],
+        compressed: &Bytes,
         policy: WireTransportPolicy,
     ) -> Result<ShipResult, EdgepacerError> {
         let mut req = self
@@ -309,7 +319,8 @@ impl WireTransport {
                 CONTENT_TYPE,
                 HeaderValue::from_static("application/x-protobuf"),
             )
-            .body(data.to_vec());
+            .header(CONTENT_ENCODING, HeaderValue::from_static("gzip"))
+            .body(compressed.clone());
 
         // Attach the subbox upload token (JWT) for this repo if one is cached;
         // the ingress gate verifies it via JWKS. Absent a token the gate 401s
@@ -397,6 +408,16 @@ impl WireTransport {
     }
 }
 
+fn gzip_wire_body(encoded: &[u8]) -> Result<Vec<u8>, EdgepacerError> {
+    let mut encoder = GzEncoder::new(Vec::new(), Compression::fast());
+    encoder.write_all(encoded).map_err(|error| {
+        EdgepacerError::Other(anyhow::anyhow!("failed to gzip wire body: {error}"))
+    })?;
+    encoder.finish().map_err(|error| {
+        EdgepacerError::Other(anyhow::anyhow!("failed to finish gzip wire body: {error}"))
+    })
+}
+
 impl Shipper {
     pub fn new(
         endpoint: &str,
@@ -424,6 +445,11 @@ impl Shipper {
         let mut shipper = Self::new(endpoint, archive_id, repo_id, identity)?;
         shipper.transport = shipper.transport.with_counters(counters);
         Ok(shipper)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn uses_counters(&self, counters: &Arc<AgentCounters>) -> bool {
+        self.transport.uses_counters(counters)
     }
 
     /// Envelope metadata bytes for a batch. `{}` when this shipper doesn't stamp
@@ -716,7 +742,7 @@ impl Shipper {
     }
 
     /// Send an already-encoded payload with an explicit retry policy.
-    pub(crate) async fn send_with_retry_policy(
+    pub async fn send_with_retry_policy(
         &self,
         encoded: &[u8],
         retry_policy: RetryPolicy,
@@ -1001,6 +1027,78 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[tokio::test]
+    async fn transport_gzips_and_counts_compressed_body_bytes() {
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/wire"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_raw(
+                    WireResponse {
+                        accepted: 1,
+                        rejected: 0,
+                        error_message: String::new(),
+                    }
+                    .encode_to_vec(),
+                    "application/x-protobuf",
+                ),
+            )
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let counters = AgentCounters::new();
+        let shipper = Shipper::with_counters(
+            &format!("{}/wire", mock_server.uri()),
+            "arc_test",
+            "repo_test",
+            None,
+            counters.clone(),
+        )
+        .unwrap();
+        let encoded = vec![b'a'; 4096];
+
+        let result = shipper
+            .send_with_retry_policy(
+                &encoded,
+                RetryPolicy {
+                    max_attempts: 1,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert!(matches!(result, ShipResult::Accepted { count: 1 }));
+
+        let requests = mock_server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(crate::test_support::gunzip_wire_body(&requests[0]), encoded);
+        assert_eq!(
+            counters.snapshot().bytes_sent,
+            requests[0].body.len() as u64
+        );
+    }
+
+    #[test]
+    fn rejected_body_accounting_preserves_transport_policy() {
+        let counters = AgentCounters::new();
+        let transport = WireTransport::new("http://relay/wire", "repo_test")
+            .unwrap()
+            .with_counters(counters.clone());
+        let rejected = ShipResult::Rejected {
+            accepted: 0,
+            rejected: 1,
+            message: "rejected".into(),
+        };
+
+        transport.record_sent_bytes(123, &rejected, WireTransportPolicy::log_batches());
+        assert_eq!(counters.snapshot().bytes_sent, 123);
+
+        transport.record_sent_bytes(456, &rejected, WireTransportPolicy::metrics_batches());
+        transport.record_sent_bytes(789, &rejected, WireTransportPolicy::traces_batches());
+        assert_eq!(counters.snapshot().bytes_sent, 123);
     }
 
     #[test]

@@ -5,12 +5,14 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::sync::watch;
 use tracing::{error, info};
 
 use crate::config::{self, SharedConfig, TraceProxyStreamConfig};
+use crate::counters::AgentCounters;
 use crate::trace_proxy::{DEFAULT_TRACE_BUFFER_MAX_MB, TraceProxy, TraceProxyConfig};
 
 /// A running proxy tracked by its config hash.
@@ -24,14 +26,16 @@ pub struct TraceProxyManager {
     proxies: HashMap<String, ManagedProxy>,
     data_dir: PathBuf,
     resource_id: String,
+    counters: Arc<AgentCounters>,
 }
 
 impl TraceProxyManager {
-    pub fn new(data_dir: &Path, resource_id: String) -> Self {
+    pub fn new(data_dir: &Path, resource_id: String, counters: Arc<AgentCounters>) -> Self {
         Self {
             proxies: HashMap::new(),
             data_dir: data_dir.to_path_buf(),
             resource_id,
+            counters,
         }
     }
 
@@ -82,7 +86,7 @@ impl TraceProxyManager {
         }
     }
 
-    async fn start_proxy(&mut self, cfg: &TraceProxyStreamConfig) {
+    fn build_proxy(&self, cfg: &TraceProxyStreamConfig) -> TraceProxy {
         let buffer_path = self.data_dir.join(format!(
             "trace-buffer-{}.sqlite",
             sanitize_id(&cfg.log_source_id)
@@ -101,7 +105,11 @@ impl TraceProxyManager {
             buffer_max_mb: DEFAULT_TRACE_BUFFER_MAX_MB,
         };
 
-        let mut proxy = TraceProxy::new(proxy_config);
+        TraceProxy::new(proxy_config).with_counters(self.counters.clone())
+    }
+
+    async fn start_proxy(&mut self, cfg: &TraceProxyStreamConfig) {
+        let mut proxy = self.build_proxy(cfg);
         if let Err(e) = proxy.start().await {
             error!(
                 log_source_id = %cfg.log_source_id,
@@ -148,9 +156,10 @@ pub async fn run(
     shared_config: SharedConfig,
     data_dir: &Path,
     resource_id: String,
+    counters: Arc<AgentCounters>,
     mut shutdown: watch::Receiver<bool>,
 ) {
-    let mut manager = TraceProxyManager::new(data_dir, resource_id);
+    let mut manager = TraceProxyManager::new(data_dir, resource_id, counters);
     let mut last_checksum = String::new();
 
     info!("trace proxy manager started, watching for config changes");
@@ -208,7 +217,8 @@ mod tests {
     #[tokio::test]
     async fn reconcile_starts_and_stops_proxies() {
         let dir = tempfile::tempdir().unwrap();
-        let mut manager = TraceProxyManager::new(dir.path(), "host-test".into());
+        let mut manager =
+            TraceProxyManager::new(dir.path(), "host-test".into(), AgentCounters::new());
 
         // Empty reconcile — no proxies.
         manager.reconcile(&[]).await;
@@ -217,5 +227,25 @@ mod tests {
         // Shutdown empty — safe.
         manager.shutdown_all().await;
         assert!(manager.proxies.is_empty());
+    }
+
+    #[test]
+    fn manager_builds_counted_trace_transports() {
+        let dir = tempfile::tempdir().unwrap();
+        let counters = AgentCounters::new();
+        let manager = TraceProxyManager::new(dir.path(), "host-test".into(), counters.clone());
+        let config = TraceProxyStreamConfig {
+            log_source_id: "trace-source".into(),
+            listen_address: "127.0.0.1:0".parse().unwrap(),
+            grpc_listen_address: Some("127.0.0.1:0".parse().unwrap()),
+            subbox_endpoint: "http://relay/wire".into(),
+            archive_id: "arc".into(),
+            repo_id: "repo".into(),
+            require_service_name: false,
+            allowed_service_names: Default::default(),
+            config_hash: "hash".into(),
+        };
+
+        assert!(manager.build_proxy(&config).uses_counters(&counters));
     }
 }
