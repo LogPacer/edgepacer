@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+## 0.2.10 - 2026-07-19
+
+- Gzip every wire upload (`Content-Encoding: gzip`), cutting request-body
+  egress by roughly 83% on the release corpus. Each body is compressed once
+  and reused across retries, and `bytes_sent` now reports on-wire (compressed)
+  bytes for logs, metrics, traces, self-telemetry, and eBPF. Receivers accept
+  raw and gzip bodies, so mixed-version fleets keep working during rollout.
+
 ## 0.2.2 - 2026-07-09
 
 - Build release binaries with fat LTO and a single codegen unit, shrinking the
