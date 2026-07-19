@@ -1,15 +1,17 @@
 //! Integration test: tail a file → encode logpacer_wire → ship to mock logrelay → verify.
 
+mod common;
+
 use edgepacer::shipper::{CappedShipDeferredReason, CappedShipOutcome};
-use logpacer_wire::{WireRequest, WireResponse, routed_batch, wire_log_event};
+use logpacer_wire::{WireResponse, routed_batch, wire_log_event};
 use prost::Message;
 use std::collections::HashMap;
 use std::io::Write;
 use wiremock::matchers::{header, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
-fn decode_log_bodies(data: &[u8]) -> (String, String, u32, Vec<String>) {
-    let request = WireRequest::decode(data).expect("valid WireRequest");
+fn decode_log_bodies(request: &wiremock::Request) -> (String, String, u32, Vec<String>) {
+    let request = common::decode_wire_request(request);
     assert_eq!(request.batches.len(), 1);
 
     let batch = &request.batches[0];
@@ -108,9 +110,10 @@ async fn tail_encode_ship_roundtrip() {
     // Verify the mock received exactly 1 request
     let requests = mock_server.received_requests().await.unwrap();
     assert_eq!(requests.len(), 1);
+    common::assert_gzip(&requests[0]);
 
     // Decode what was sent and verify field mapping
-    let (archive_id, repo_id, schema_version, bodies) = decode_log_bodies(&requests[0].body);
+    let (archive_id, repo_id, schema_version, bodies) = decode_log_bodies(&requests[0]);
     assert_eq!(archive_id, "arc_test_tenant");
     assert_eq!(repo_id, "repo_app");
     assert_eq!(schema_version, 1);
@@ -122,7 +125,7 @@ async fn tail_encode_ship_roundtrip() {
     assert_eq!(bodies[2], "2026-04-05 WARN Slow query detected");
 
     // Verify resource_identifier is carried in envelope metadata
-    let request = WireRequest::decode(&requests[0].body[..]).unwrap();
+    let request = common::decode_wire_request(&requests[0]);
     let Some(routed_batch::Payload::Logs(logs)) = &request.batches[0].payload else {
         panic!("expected routed log payload");
     };
@@ -291,8 +294,8 @@ async fn capped_ship_shrinks_after_payload_too_large() {
 
     let requests = mock_server.received_requests().await.unwrap();
     assert_eq!(requests.len(), 2);
-    let (_, _, _, first_bodies) = decode_log_bodies(&requests[0].body);
-    let (_, _, _, second_bodies) = decode_log_bodies(&requests[1].body);
+    let (_, _, _, first_bodies) = decode_log_bodies(&requests[0]);
+    let (_, _, _, second_bodies) = decode_log_bodies(&requests[1]);
     assert_eq!(first_bodies, vec!["one", "two", "three", "four"]);
     assert_eq!(second_bodies, vec!["one", "two"]);
 }

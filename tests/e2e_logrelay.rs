@@ -10,12 +10,14 @@
 //!
 //! Without LOGRELAY_URL, the test uses a wiremock to verify the wire format.
 
+mod common;
+
 use std::io::Write;
 use std::time::Duration;
 
 use axum::Router;
 use axum::body::Bytes;
-use axum::http::{StatusCode, header};
+use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::IntoResponse;
 use axum::routing::post;
 use logpacer_wire::{WireRequest, WireResponse, routed_batch, wire_log_event};
@@ -28,10 +30,14 @@ async fn spawn_accepting_wire_relay() -> (String, mpsc::UnboundedReceiver<WireRe
     let (tx, rx) = mpsc::unbounded_channel();
     let app = Router::new().route(
         "/wire",
-        post(move |body: Bytes| {
+        post(move |headers: HeaderMap, body: Bytes| {
             let tx = tx.clone();
             async move {
-                let request = match WireRequest::decode(&body[..]) {
+                let decoded = match common::decode_wire_body(&headers, &body) {
+                    Ok(decoded) => decoded,
+                    Err(_) => return StatusCode::BAD_REQUEST.into_response(),
+                };
+                let request = match WireRequest::decode(decoded.as_slice()) {
                     Ok(request) => request,
                     Err(_) => return StatusCode::BAD_REQUEST.into_response(),
                 };
@@ -373,8 +379,8 @@ async fn e2e_file_tail_to_logrelay() {
     );
 
     // Decode the protobuf to verify wire contract
-    let req_body = &received[0].body;
-    let wire_req = WireRequest::decode(&req_body[..]).unwrap();
+    common::assert_gzip(&received[0]);
+    let wire_req = common::decode_wire_request(&received[0]);
 
     assert_eq!(wire_req.batches.len(), 1, "should have one batch");
     let batch = &wire_req.batches[0];

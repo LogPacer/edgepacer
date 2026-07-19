@@ -17,7 +17,9 @@
 //!
 //! Go reference: internal/exporter/direct_batch_exporter.go
 
-use logpacer_wire::{WireRequest, WireResponse, routed_batch, wire_log_event};
+mod common;
+
+use logpacer_wire::{WireResponse, routed_batch, wire_log_event};
 use prost::Message;
 use std::io::Write;
 use wiremock::matchers::{method, path};
@@ -50,8 +52,8 @@ struct RustNativeFields {
 }
 
 /// Extract semantic fields from a captured Rust WireRequest.
-fn extract_rust_fields(data: &[u8]) -> RustNativeFields {
-    let request = WireRequest::decode(data).expect("valid WireRequest");
+fn extract_rust_fields(request: &wiremock::Request) -> RustNativeFields {
+    let request = common::decode_wire_request(request);
     assert_eq!(request.batches.len(), 1, "expected exactly 1 batch");
 
     let batch = &request.batches[0];
@@ -195,7 +197,8 @@ async fn m2_parity_native_vs_otlp_path() {
     // Capture what was sent
     let requests = mock_server.received_requests().await.unwrap();
     assert_eq!(requests.len(), 1);
-    let rust_fields = extract_rust_fields(&requests[0].body);
+    common::assert_gzip(&requests[0]);
+    let rust_fields = extract_rust_fields(&requests[0]);
 
     // === Path 2: Go equivalent (what DirectBatchExporter would produce) ===
     let go_fields = go_equivalent(archive_id, repo_id, resource_identifier, &log_lines);
@@ -206,7 +209,7 @@ async fn m2_parity_native_vs_otlp_path() {
     // === Additional M2-specific checks ===
 
     // Timestamps: source_at_ms should be recent (capture-time)
-    let decoded = WireRequest::decode(&requests[0].body[..]).unwrap();
+    let decoded = common::decode_wire_request(&requests[0]);
     let now_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
@@ -300,7 +303,8 @@ async fn m2_parity_from_file_tail() {
 
     // Verify parity
     let requests = mock_server.received_requests().await.unwrap();
-    let rust_fields = extract_rust_fields(&requests[0].body);
+    common::assert_gzip(&requests[0]);
+    let rust_fields = extract_rust_fields(&requests[0]);
     let go_fields = go_equivalent(archive_id, repo_id, resource_identifier, &log_lines);
     assert_parity(&rust_fields, &go_fields);
 }

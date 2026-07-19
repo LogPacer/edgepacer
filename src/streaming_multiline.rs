@@ -289,7 +289,7 @@ mod tests {
 
         let received = server.received_requests().await.unwrap();
         assert_eq!(received.len(), 1);
-        let request = WireRequest::decode(&received[0].body[..]).unwrap();
+        let request = crate::test_support::decode_gzip_wire_request(&received[0]);
         assert_eq!(
             log_texts(&request),
             vec![

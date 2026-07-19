@@ -570,6 +570,7 @@ impl TraceService for TraceGrpcService {
 
 pub struct TraceProxy {
     config: TraceProxyConfig,
+    counters: Option<Arc<crate::counters::AgentCounters>>,
     shutdown_tx: Option<watch::Sender<bool>>,
     server_handle: Option<JoinHandle<()>>,
     grpc_handle: Option<JoinHandle<()>>,
@@ -580,6 +581,7 @@ impl TraceProxy {
     pub fn new(config: TraceProxyConfig) -> Self {
         Self {
             config,
+            counters: None,
             shutdown_tx: None,
             server_handle: None,
             grpc_handle: None,
@@ -587,12 +589,27 @@ impl TraceProxy {
         }
     }
 
+    pub fn with_counters(mut self, counters: Arc<crate::counters::AgentCounters>) -> Self {
+        self.counters = Some(counters);
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn uses_counters(&self, counters: &Arc<crate::counters::AgentCounters>) -> bool {
+        self.counters
+            .as_ref()
+            .is_some_and(|attached| Arc::ptr_eq(attached, counters))
+    }
+
     pub async fn start(&mut self) -> anyhow::Result<()> {
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let buffer = TraceBuffer::open(&self.config.buffer_path, self.config.buffer_max_mb)?;
 
-        let transport = WireTransport::new(&self.config.subbox_endpoint, &self.config.repo_id)
+        let mut transport = WireTransport::new(&self.config.subbox_endpoint, &self.config.repo_id)
             .map_err(|e| anyhow::anyhow!("failed to build trace wire transport: {e}"))?;
+        if let Some(counters) = &self.counters {
+            transport = transport.with_counters(counters.clone());
+        }
 
         let state = Arc::new(ProxyState {
             service_name_fallback: format!("unknown:{}", self.config.resource_identifier),
@@ -1077,7 +1094,8 @@ mod tests {
         );
         config.listen_address = listen_address;
 
-        let mut proxy = TraceProxy::new(config);
+        let counters = crate::counters::AgentCounters::new();
+        let mut proxy = TraceProxy::new(config).with_counters(counters.clone());
         proxy.start().await.expect("proxy should start");
 
         let body = encode_trace_request(vec![resource_span_with_service(Some("checkout"))]);
@@ -1116,9 +1134,12 @@ mod tests {
 
         assert_eq!(response.status(), reqwest::StatusCode::OK);
         assert_eq!(requests.len(), 1, "exactly one payload should be forwarded");
+        assert_eq!(
+            counters.snapshot().bytes_sent,
+            requests[0].body.len() as u64
+        );
 
-        let forwarded =
-            WireRequest::decode(&requests[0].body[..]).expect("forwarded body decodes as wire");
+        let forwarded = crate::test_support::decode_gzip_wire_request(&requests[0]);
         assert_eq!(forwarded.batches.len(), 1);
         assert_eq!(forwarded.batches[0].archive_id, "arc_test");
         assert_eq!(forwarded.batches[0].repo_id, "repo_test");
@@ -1477,8 +1498,7 @@ mod tests {
         // an encode of the pre-mutation span.
         let requests = server.received_requests().await.unwrap();
         assert_eq!(requests.len(), 1, "exactly one payload should be forwarded");
-        let forwarded =
-            WireRequest::decode(&requests[0].body[..]).expect("forwarded body decodes as wire");
+        let forwarded = crate::test_support::decode_gzip_wire_request(&requests[0]);
         let Some(routed_batch::Payload::Traces(traces)) = &forwarded.batches[0].payload else {
             panic!("expected routed traces payload");
         };
@@ -1594,8 +1614,7 @@ mod tests {
         // The span must reach the wire through the same forward path as HTTP.
         let requests = server.received_requests().await.unwrap();
         assert_eq!(requests.len(), 1, "exactly one payload should be forwarded");
-        let forwarded =
-            WireRequest::decode(&requests[0].body[..]).expect("forwarded body decodes as wire");
+        let forwarded = crate::test_support::decode_gzip_wire_request(&requests[0]);
         let Some(routed_batch::Payload::Traces(traces)) = &forwarded.batches[0].payload else {
             panic!("expected routed traces payload");
         };

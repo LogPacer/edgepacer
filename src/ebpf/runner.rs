@@ -37,6 +37,7 @@ use super::manager::{EbpfManager, ListenerObservation};
 use super::pid_resolver::PidRouting;
 use super::socket_port;
 use crate::config::{self, EbpfTargetConfig, ServiceMapDestination, SharedConfig};
+use crate::counters::AgentCounters;
 use crate::discovery::SharedDiscoveryCache;
 use crate::discovery::ports::discover_ports;
 use crate::shipper::{Shipper, unix_epoch_millis_i64};
@@ -154,6 +155,27 @@ pub async fn run(
     status: SharedEbpfStatus,
     data_dir: &Path,
     identity: &crate::identity::AgentIdentity,
+    shutdown: watch::Receiver<bool>,
+) {
+    run_with_counters(
+        shared_config,
+        discovery_cache,
+        status,
+        data_dir,
+        identity,
+        AgentCounters::new(),
+        shutdown,
+    )
+    .await;
+}
+
+pub async fn run_with_counters(
+    shared_config: SharedConfig,
+    discovery_cache: SharedDiscoveryCache,
+    status: SharedEbpfStatus,
+    data_dir: &Path,
+    identity: &crate::identity::AgentIdentity,
+    counters: Arc<AgentCounters>,
     mut shutdown: watch::Receiver<bool>,
 ) {
     let (captured_tx, mut captured_rx) = mpsc::channel::<CapturedLine>(CAPTURE_CHANNEL_DEPTH);
@@ -419,7 +441,13 @@ pub async fn run(
                 // kernel program's transient running state, so a hiccup never
                 // discards buffered-but-undelivered lines).
                 if section.enabled {
-                    reconcile_deliveries(&mut deliveries, &section.targets, data_dir, identity);
+                    reconcile_deliveries(
+                        &mut deliveries,
+                        &section.targets,
+                        data_dir,
+                        identity,
+                        &counters,
+                    );
                 } else {
                     stop_all_deliveries(&mut deliveries);
                 }
@@ -429,6 +457,7 @@ pub async fn run(
                     service_map,
                     section.enabled.then_some(section.service_map.as_ref()).flatten(),
                     identity,
+                    &counters,
                 );
 
                 flush_flows(&mut pending_flows, &deliveries);
@@ -1639,6 +1668,7 @@ fn reconcile_service_map(
     current: Option<ServiceMapDelivery>,
     desired: Option<&ServiceMapDestination>,
     identity: &crate::identity::AgentIdentity,
+    counters: &Arc<AgentCounters>,
 ) -> Option<ServiceMapDelivery> {
     match desired {
         None => None,
@@ -1648,11 +1678,12 @@ fn reconcile_service_map(
             {
                 return current;
             }
-            match Shipper::new(
+            match Shipper::with_counters(
                 &dest.subbox_endpoint,
                 &dest.archive_id,
                 &dest.repo_id,
                 Some(identity.clone()),
+                counters.clone(),
             ) {
                 Ok(shipper) => Some(ServiceMapDelivery {
                     shipper: Arc::new(shipper),
@@ -1721,6 +1752,7 @@ fn reconcile_deliveries(
     targets: &[EbpfTargetConfig],
     data_dir: &Path,
     identity: &crate::identity::AgentIdentity,
+    counters: &Arc<AgentCounters>,
 ) {
     let desired: HashMap<&str, &EbpfTargetConfig> = targets
         .iter()
@@ -1747,7 +1779,7 @@ fn reconcile_deliveries(
         if deliveries.contains_key(&target.log_source_id) {
             continue;
         }
-        match create_delivery(target, data_dir, identity) {
+        match create_delivery(target, data_dir, identity, counters) {
             Ok(delivery) => {
                 deliveries.insert(target.log_source_id.clone(), delivery);
             }
@@ -1770,21 +1802,24 @@ fn create_delivery(
     target: &EbpfTargetConfig,
     data_dir: &Path,
     identity: &crate::identity::AgentIdentity,
+    counters: &Arc<AgentCounters>,
 ) -> Result<TargetDelivery, String> {
-    let shipper = Shipper::new(
+    let shipper = Shipper::with_counters(
         &target.subbox_endpoint,
         &target.archive_id,
         &target.repo_id,
         Some(identity.clone()),
+        counters.clone(),
     )
     .map_err(|e| format!("shipper: {e}"))?;
 
     let flow_shipper = Arc::new(
-        Shipper::new(
+        Shipper::with_counters(
             &target.subbox_endpoint,
             &target.archive_id,
             &target.repo_id,
             Some(identity.clone()),
+            counters.clone(),
         )
         .map_err(|e| format!("flow shipper: {e}"))?,
     );
@@ -1905,6 +1940,54 @@ mod tests {
 
     fn cgroup_routing(service: &str) -> CgroupRouting {
         CgroupRouting::from_entries(7, [(CgroupAnchor { id: 42, level: 3 }, service)]).unwrap()
+    }
+
+    fn target() -> EbpfTargetConfig {
+        EbpfTargetConfig {
+            log_source_id: "ebpf-source".into(),
+            service_name: "checkout".into(),
+            systemd_unit: None,
+            open_ports: vec![8080],
+            archive_id: "arc".into(),
+            repo_id: "repo".into(),
+            protocols: vec!["http".into()],
+            subbox_endpoint: "http://relay/wire".into(),
+        }
+    }
+
+    #[tokio::test]
+    async fn ebpf_delivery_builds_counted_transports() {
+        let dir = tempfile::tempdir().unwrap();
+        let counters = AgentCounters::new();
+        let delivery = create_delivery(
+            &target(),
+            dir.path(),
+            &crate::identity::AgentIdentity::new("host".into()),
+            &counters,
+        )
+        .unwrap();
+
+        assert!(delivery.flow_shipper.uses_counters(&counters));
+        delivery.stop();
+    }
+
+    #[test]
+    fn service_map_builds_counted_transport() {
+        let counters = AgentCounters::new();
+        let destination = ServiceMapDestination {
+            archive_id: "arc".into(),
+            repo_id: "service-map".into(),
+            subbox_endpoint: "http://relay/wire".into(),
+        };
+        let delivery = reconcile_service_map(
+            None,
+            Some(&destination),
+            &crate::identity::AgentIdentity::new("host".into()),
+            &counters,
+        )
+        .unwrap();
+
+        assert!(delivery.shipper.uses_counters(&counters));
     }
 
     #[test]

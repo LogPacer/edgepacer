@@ -270,13 +270,14 @@ impl AgentTasks {
             identity.clone(),
             telemetry_layer,
             telemetry_rx,
-            counters,
+            counters.clone(),
             shutdown.subscribe(),
         );
         let trace = spawn_trace_proxy_manager(
             shared_config.clone(),
             trace_data_dir,
             identity.current(),
+            counters.clone(),
             shutdown.subscribe(),
         );
 
@@ -287,6 +288,7 @@ impl AgentTasks {
             ebpf_status,
             ebpf_data_dir,
             ebpf_identity,
+            counters,
             shutdown.subscribe(),
         );
 
@@ -486,10 +488,18 @@ fn spawn_trace_proxy_manager(
     shared_config: config::SharedConfig,
     data_dir: PathBuf,
     resource_id: String,
+    counters: Arc<counters::AgentCounters>,
     shutdown: watch::Receiver<bool>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
-        trace_proxy_manager::run(shared_config, &data_dir, resource_id, shutdown).await;
+        trace_proxy_manager::run_with_counters(
+            shared_config,
+            &data_dir,
+            resource_id,
+            counters,
+            shutdown,
+        )
+        .await;
     })
 }
 
@@ -500,15 +510,17 @@ fn spawn_ebpf_manager(
     ebpf_status: ebpf::SharedEbpfStatus,
     data_dir: PathBuf,
     identity: identity::AgentIdentity,
+    counters: Arc<counters::AgentCounters>,
     shutdown: watch::Receiver<bool>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
-        ebpf::run(
+        ebpf::run_with_counters(
             shared_config,
             discovery_cache,
             ebpf_status,
             &data_dir,
             &identity,
+            counters,
             shutdown,
         )
         .await;

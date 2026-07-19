@@ -4,7 +4,8 @@
 //! on POST /v1/logpacer-wire, responds with WireResponse, and serves
 //! cumulative stats on GET /stats.
 
-use std::io::Write;
+use std::borrow::Cow;
+use std::io::{Read, Write};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
@@ -13,7 +14,7 @@ use axum::{
     Json, Router,
     body::Bytes,
     extract::{DefaultBodyLimit, State},
-    http::StatusCode,
+    http::{HeaderMap, StatusCode, header},
     routing::{get, post},
 };
 use logpacer_wire::{WireRequest, WireResponse, routed_batch, wire_log_event};
@@ -23,6 +24,7 @@ struct Stats {
     total_batches: AtomicU64,
     total_records: AtomicU64,
     total_bytes: AtomicU64,
+    body_limit_bytes: usize,
     start_time: Instant,
     /// When set (MOCK_RELAY_DUMP=path), every received log line is appended
     /// here — lets a smoke test verify sequence coverage (gaps/duplicates).
@@ -61,11 +63,42 @@ fn count_records(request: &WireRequest) -> u32 {
         .sum()
 }
 
-async fn handle_ingest(State(stats): State<Arc<Stats>>, body: Bytes) -> Result<Bytes, StatusCode> {
+fn decode_wire_body<'a>(
+    headers: &HeaderMap,
+    body: &'a [u8],
+    body_limit_bytes: usize,
+) -> Result<Cow<'a, [u8]>, StatusCode> {
+    match headers
+        .get(header::CONTENT_ENCODING)
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+    {
+        None => Ok(Cow::Borrowed(body)),
+        Some(value) if value.eq_ignore_ascii_case("gzip") => {
+            let mut decoded = Vec::new();
+            flate2::read::GzDecoder::new(body)
+                .take(body_limit_bytes as u64 + 1)
+                .read_to_end(&mut decoded)
+                .map_err(|_| StatusCode::BAD_REQUEST)?;
+            if decoded.len() > body_limit_bytes {
+                return Err(StatusCode::PAYLOAD_TOO_LARGE);
+            }
+            Ok(Cow::Owned(decoded))
+        }
+        Some(_) => Err(StatusCode::UNSUPPORTED_MEDIA_TYPE),
+    }
+}
+
+async fn handle_ingest(
+    State(stats): State<Arc<Stats>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Bytes, StatusCode> {
     let body_len = body.len() as u64;
     stats.total_bytes.fetch_add(body_len, Ordering::Relaxed);
 
-    let request = WireRequest::decode(body).map_err(|_| StatusCode::BAD_REQUEST)?;
+    let decoded = decode_wire_body(&headers, &body, stats.body_limit_bytes)?;
+    let request = WireRequest::decode(decoded.as_ref()).map_err(|_| StatusCode::BAD_REQUEST)?;
     let record_count = count_records(&request);
     dump_log_lines(&stats, &request);
 
@@ -124,6 +157,7 @@ async fn main() {
         total_batches: AtomicU64::new(0),
         total_records: AtomicU64::new(0),
         total_bytes: AtomicU64::new(0),
+        body_limit_bytes,
         start_time: Instant::now(),
         dump,
     });
@@ -149,4 +183,35 @@ async fn main() {
     let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();
     eprintln!("  body limit: {body_limit_bytes} bytes");
     axum::serve(listener, app).await.unwrap();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use flate2::Compression;
+    use flate2::write::GzEncoder;
+
+    #[test]
+    fn wire_body_decoder_accepts_raw_and_gzip() {
+        let encoded = b"wire body".to_vec();
+        assert_eq!(
+            decode_wire_body(&HeaderMap::new(), &encoded, encoded.len()).unwrap(),
+            encoded
+        );
+
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::fast());
+        encoder.write_all(&encoded).unwrap();
+        let gzip = encoder.finish().unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert(header::CONTENT_ENCODING, "gzip".parse().unwrap());
+
+        assert_eq!(
+            decode_wire_body(&headers, &gzip, encoded.len()).unwrap(),
+            encoded
+        );
+        assert_eq!(
+            decode_wire_body(&headers, &gzip, encoded.len() - 1),
+            Err(StatusCode::PAYLOAD_TOO_LARGE)
+        );
+    }
 }
