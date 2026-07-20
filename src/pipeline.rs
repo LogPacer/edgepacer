@@ -520,6 +520,14 @@ impl DeliveryPipeline {
     }
 
     /// Enqueue a batch of raw (non-aggregated) lines.
+    ///
+    /// Blank lines (e.g. the empty lines inside a multi-line Rails exception
+    /// dump, when no multiline assembler is configured) are dropped here
+    /// rather than buffered: the relay rejects them per-entry with "empty
+    /// raw_text body", and shipping one forever re-adjudicates a rejected
+    /// batch (see `shipper::ship_capped_with_shrink`). Offsets still advance
+    /// across skipped lines so the tailer position and the tracked byte
+    /// ranges of the lines that ARE kept stay correct.
     fn enqueue_batch(
         &mut self,
         records: Vec<TailedLine>,
@@ -529,15 +537,38 @@ impl DeliveryPipeline {
         now_ns: i64,
         count: usize,
     ) {
-        let source_lengths: Vec<u64> = records.iter().map(|line| line.source_len).collect();
-        let lines: Vec<Vec<u8>> = records.into_iter().map(|line| line.payload).collect();
+        let mut lines: Vec<Vec<u8>> = Vec::with_capacity(records.len());
+        let mut kept_offsets: Vec<(u64, u64)> = Vec::with_capacity(records.len());
+        let mut skipped = 0usize;
+        let mut line_start_offset = start_offset;
+        for line in records {
+            let line_end_offset = line_start_offset + line.source_len;
+            if crate::common::is_blank_log_line(&line.payload) {
+                skipped += 1;
+            } else {
+                kept_offsets.push((line_start_offset, line_end_offset));
+                lines.push(line.payload);
+            }
+            line_start_offset = line_end_offset;
+        }
+
+        if lines.is_empty() {
+            if skipped > 0 {
+                debug!(
+                    skipped,
+                    offset = end_offset,
+                    "all lines in batch were blank, none buffered"
+                );
+            }
+            return;
+        }
 
         match self.buffer.enqueue_batch(&lines, now_ns) {
             Ok((buf_first, buf_last)) => {
                 debug_assert_eq!(buf_last - buf_first + 1, lines.len() as u64);
-                let mut line_start_offset = start_offset;
-                for (index, source_len) in source_lengths.iter().enumerate() {
-                    let line_end_offset = line_start_offset + *source_len;
+                for (index, (line_start_offset, line_end_offset)) in
+                    kept_offsets.into_iter().enumerate()
+                {
                     let buffer_sequence = buf_first + index as u64;
                     self.tracker.track(
                         line_start_offset,
@@ -546,9 +577,13 @@ impl DeliveryPipeline {
                         buffer_sequence,
                         buffer_sequence,
                     );
-                    line_start_offset = line_end_offset;
                 }
-                debug!(lines = count, offset = end_offset, "lines buffered");
+                debug!(
+                    lines = count,
+                    skipped,
+                    offset = end_offset,
+                    "lines buffered"
+                );
             }
             Err(crate::buffer::BufferError::Full { .. }) => {
                 let spilled = self.spill_to_overflow(&lines, now_ns);
@@ -755,6 +790,15 @@ impl DeliveryPipeline {
                 warn!(
                     dropped = count,
                     "dropped oversized buffered entries after receiver 413"
+                );
+                deleted
+            }
+            CappedShipOutcome::RejectedAdjudicated { accepted, rejected } => {
+                let deleted = self.delete_and_ack_prefix(sequences, accepted + rejected);
+                warn!(
+                    accepted,
+                    rejected,
+                    "dropped permanently-rejected buffered entries after full relay adjudication"
                 );
                 deleted
             }
@@ -1037,6 +1081,152 @@ mod tests {
         assert_eq!(
             safe_checkpoint.offset, 10,
             "only the impossible oversized record was dropped"
+        );
+    }
+
+    #[tokio::test]
+    async fn drain_cycle_advances_past_fully_adjudicated_rejection() {
+        // Regression test for the reject-poison livelock: when the relay
+        // fully adjudicates a batch (accepted + rejected == the batch size),
+        // both the accepted and the permanently-rejected entries must leave
+        // the buffer — otherwise the accepted entry re-ships every drain
+        // cycle forever.
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/wire"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(
+                encoded_wire_response(1, 1, "one entry rejected"),
+                "application/x-protobuf",
+            ))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let dir = tempfile::tempdir().unwrap();
+        let log_path = dir.path().join("app.log");
+        std::fs::write(&log_path, "").unwrap();
+        let shipper = Shipper::new(
+            &format!("{}/wire", mock_server.uri()),
+            "arc_file",
+            "repo_file",
+            None,
+        )
+        .unwrap();
+        let config = PipelineConfig {
+            ship_batch_size: 10,
+            ship_batch_max: 10,
+            ship_batch_max_bytes: usize::MAX,
+            ..Default::default()
+        };
+        let mut pipeline =
+            DeliveryPipeline::open(log_path.to_str().unwrap(), dir.path(), shipper, config)
+                .unwrap();
+
+        let lines = vec![b"one".to_vec(), b"two".to_vec()];
+        let end_offset = lines.iter().map(|line| line.len() as u64 + 1).sum();
+        pipeline.enqueue_batch(tailed_lines(lines), 0, end_offset, 42, now_nanos(), 2);
+
+        pipeline.drain_cycle().await;
+
+        let remaining: Vec<Vec<u8>> = pipeline
+            .buffer
+            .peek(10)
+            .unwrap()
+            .into_iter()
+            .map(|entry| entry.data)
+            .collect();
+        assert!(
+            remaining.is_empty(),
+            "both the accepted and rejected entries were adjudicated; buffer must be empty"
+        );
+
+        let safe_checkpoint = pipeline
+            .tracker
+            .safe_checkpoint()
+            .expect("fully adjudicated batch produces a checkpoint");
+        assert_eq!(
+            safe_checkpoint.offset, end_offset,
+            "checkpoint advances past the whole adjudicated batch"
+        );
+
+        // A second drain cycle must not re-ship anything: the buffer is
+        // empty, so drain_cycle returns before sending a request. The mock's
+        // `expect(1)` above enforces this — a second POST would fail the
+        // test on drop.
+        pipeline.drain_cycle().await;
+    }
+
+    #[tokio::test]
+    async fn drain_cycle_skips_blank_lines_and_checkpoints_true_offset() {
+        // Regression test: blank lines between multi-line exception frames
+        // never enter the buffer (the relay rejects them with "empty
+        // raw_text body"), and the checkpoint still lands at the TRUE
+        // tailer offset — including the skipped blank lines' bytes — so a
+        // restart doesn't re-read them.
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/wire"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_raw(encoded_wire_response(2, 0, ""), "application/x-protobuf"),
+            )
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let dir = tempfile::tempdir().unwrap();
+        let log_path = dir.path().join("app.log");
+        std::fs::write(&log_path, "").unwrap();
+        let shipper = Shipper::new(
+            &format!("{}/wire", mock_server.uri()),
+            "arc_blank",
+            "repo_blank",
+            None,
+        )
+        .unwrap();
+        let config = PipelineConfig {
+            ship_batch_size: 10,
+            ship_batch_max: 10,
+            ship_batch_max_bytes: usize::MAX,
+            ..Default::default()
+        };
+        let mut pipeline =
+            DeliveryPipeline::open(log_path.to_str().unwrap(), dir.path(), shipper, config)
+                .unwrap();
+
+        let lines = vec![
+            b"first".to_vec(),
+            b"".to_vec(),
+            b"   ".to_vec(),
+            b"second".to_vec(),
+        ];
+        let end_offset: u64 = lines.iter().map(|line| line.len() as u64 + 1).sum();
+        pipeline.enqueue_batch(tailed_lines(lines), 0, end_offset, 7, now_nanos(), 4);
+
+        let buffered: Vec<Vec<u8>> = pipeline
+            .buffer
+            .peek(10)
+            .unwrap()
+            .into_iter()
+            .map(|entry| entry.data)
+            .collect();
+        assert_eq!(
+            buffered,
+            vec![b"first".to_vec(), b"second".to_vec()],
+            "blank lines never enter the buffer"
+        );
+
+        pipeline.drain_cycle().await;
+
+        let safe_checkpoint = pipeline
+            .tracker
+            .safe_checkpoint()
+            .expect("delivered lines produce a checkpoint");
+        assert_eq!(
+            safe_checkpoint.offset, end_offset,
+            "checkpoint reaches the true tailer offset, including skipped blank lines"
         );
     }
 }

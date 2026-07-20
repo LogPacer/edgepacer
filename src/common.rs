@@ -96,6 +96,17 @@ pub fn truncate_body(body: &str) -> String {
     }
 }
 
+/// True when `line` is empty or entirely ASCII whitespace — the shape the
+/// relay rejects per-entry with "empty raw_text body" (e.g. the blank lines
+/// between frames of a multi-line stack trace, when no multiline assembler
+/// is configured to fold them into one event). Checked at collection time so
+/// such a line never occupies a batch slot the relay will reject; shipping
+/// one anyway would poison every re-ship of that batch (see
+/// `shipper::ship_capped_with_shrink`).
+pub(crate) fn is_blank_log_line(line: &[u8]) -> bool {
+    line.trim_ascii().is_empty()
+}
+
 /// Run a blocking (fsync-bearing or bulk-I/O) operation without stalling the
 /// async runtime's worker thread: on the multi-thread runtime the worker's
 /// core is handed to the blocking pool for the duration of `f`.

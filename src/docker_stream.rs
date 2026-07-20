@@ -22,6 +22,30 @@ use crate::streaming_multiline::{StreamingEmit, StreamingEntryAssembler};
 const CHECKPOINT_INTERVAL: u64 = 100;
 const ASSEMBLER_CHECK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
 
+/// Why a Docker stream loop exited — tells the reconnect loop
+/// (`streaming_runner`) a transient disconnect (retry on the normal backoff)
+/// from a container that no longer exists (candidate for parking).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DockerStreamEnd {
+    /// Stream ended or errored for any other reason — reconnect as usual.
+    Disconnected,
+    /// The Docker API returned 404 for this container: it's gone.
+    ContainerNotFound,
+}
+
+/// True for the 404 the Docker API returns when a container id no longer
+/// exists (removed, or never existed) — as opposed to a transient stream
+/// error that a normal reconnect should just retry.
+fn is_container_not_found(error: &bollard::errors::Error) -> bool {
+    matches!(
+        error,
+        bollard::errors::Error::DockerResponseServerError {
+            status_code: 404,
+            ..
+        }
+    )
+}
+
 /// Stream logs from a Docker container into the streaming pipeline actor.
 ///
 /// Runs until the container stops or shutdown is signaled.
@@ -33,7 +57,7 @@ pub async fn stream_container_logs(
     since: Option<&str>,
     multiline: Option<&MultilineConfig>,
     shutdown: &mut watch::Receiver<bool>,
-) {
+) -> DockerStreamEnd {
     let docker = match crate::discovery::docker::connect_docker() {
         Ok(Some(d)) => d,
         Ok(None) => {
@@ -41,11 +65,11 @@ pub async fn stream_container_logs(
                 container_id,
                 "failed to connect to Docker: no Docker socket found"
             );
-            return;
+            return DockerStreamEnd::Disconnected;
         }
         Err(e) => {
             error!(container_id, error = %e, "failed to connect to Docker");
-            return;
+            return DockerStreamEnd::Disconnected;
         }
     };
 
@@ -75,7 +99,7 @@ pub async fn stream_container_logs(
         Ok(assembler) => assembler,
         Err(error) => {
             error!(container_id, source_id, error = %error, "invalid Docker multiline pattern");
-            return;
+            return DockerStreamEnd::Disconnected;
         }
     };
     let mut assembler_tick = tokio::time::interval(ASSEMBLER_CHECK_INTERVAL);
@@ -85,6 +109,7 @@ pub async fn stream_container_logs(
     let mut last_checkpoint =
         since.map(|timestamp| StreamingCheckpoint::docker(source_id, container_id, timestamp));
     let mut lines_streamed: u64 = 0;
+    let mut stream_end = DockerStreamEnd::Disconnected;
 
     loop {
         tokio::select! {
@@ -121,18 +146,23 @@ pub async fn stream_container_logs(
                                 )
                                 .await
                                 {
-                                    return;
+                                    return DockerStreamEnd::Disconnected;
                                 }
                             }
                             Err(_) => {
                                 warn!(container_id, "streaming pipeline actor gone, stopping Docker stream");
-                                return;
+                                return DockerStreamEnd::Disconnected;
                             }
                         }
                     }
                     Some(Err(e)) => {
-                        warn!(container_id, error = %e, "Docker log stream error");
-                        // Transient error — break to reconnect.
+                        if is_container_not_found(&e) {
+                            info!(container_id, "Docker container not found (404), likely removed");
+                            stream_end = DockerStreamEnd::ContainerNotFound;
+                        } else {
+                            warn!(container_id, error = %e, "Docker log stream error");
+                        }
+                        // Break to reconnect (or park, if not found — see streaming_runner).
                         break;
                     }
                     None => {
@@ -154,12 +184,12 @@ pub async fn stream_container_logs(
                         )
                         .await
                         {
-                            return;
+                            return DockerStreamEnd::Disconnected;
                         }
                     }
                     Err(_) => {
                         warn!(container_id, "streaming pipeline actor gone, stopping Docker stream");
-                        return;
+                        return DockerStreamEnd::Disconnected;
                     }
                 }
             }
@@ -181,7 +211,7 @@ pub async fn stream_container_logs(
             )
             .await
             {
-                return;
+                return DockerStreamEnd::Disconnected;
             }
         }
         Err(_) => {
@@ -189,7 +219,7 @@ pub async fn stream_container_logs(
                 container_id,
                 "streaming pipeline actor gone, stopping Docker stream"
             );
-            return;
+            return DockerStreamEnd::Disconnected;
         }
     }
 
@@ -205,6 +235,8 @@ pub async fn stream_container_logs(
         total_lines = lines_streamed,
         "Docker log streaming stopped"
     );
+
+    stream_end
 }
 
 async fn record_emit(
@@ -290,6 +322,31 @@ fn parse_since_timestamp(since: &str) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn not_found_is_only_the_404_status() {
+        assert!(is_container_not_found(
+            &bollard::errors::Error::DockerResponseServerError {
+                status_code: 404,
+                message: "No such container".to_string(),
+            }
+        ));
+    }
+
+    #[test]
+    fn other_statuses_are_not_container_not_found() {
+        // Negative control: a different server status must not be mistaken
+        // for "container gone" — it would wrongly start the parking streak.
+        assert!(!is_container_not_found(
+            &bollard::errors::Error::DockerResponseServerError {
+                status_code: 500,
+                message: "internal error".to_string(),
+            }
+        ));
+        assert!(!is_container_not_found(
+            &bollard::errors::Error::RequestTimeoutError
+        ));
+    }
 
     #[test]
     fn parse_docker_line_with_timestamp() {

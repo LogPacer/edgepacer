@@ -169,8 +169,19 @@ impl StreamingDeliveryPipeline {
     /// This is the core streaming guarantee: data is durable in the buffer before
     /// this method returns. The caller can proceed knowing the line won't be lost.
     ///
-    /// Returns `true` if enqueued, `false` if buffer is full (backpressure).
+    /// A blank line (empty or all-whitespace — e.g. between frames of a
+    /// multi-line stack trace) is dropped here instead of buffered: the relay
+    /// rejects it per-entry with "empty raw_text body", and shipping one
+    /// forever re-adjudicates a rejected batch (see
+    /// `shipper::ship_capped_with_shrink`). Treated as handled, not
+    /// backpressure, so the caller's resume checkpoint still advances past it.
+    ///
+    /// Returns `true` if enqueued (or dropped as blank), `false` if buffer is
+    /// full (backpressure).
     pub fn enqueue(&mut self, line: &[u8], timestamp_ns: i64) -> bool {
+        if crate::common::is_blank_log_line(line) {
+            return true;
+        }
         match self.buffer.enqueue_batch(&[line.to_vec()], timestamp_ns) {
             Ok(_) => true,
             Err(crate::buffer::BufferError::Full { .. }) => {
@@ -187,12 +198,21 @@ impl StreamingDeliveryPipeline {
         }
     }
 
-    /// Enqueue a batch of log lines atomically.
+    /// Enqueue a batch of log lines atomically. Blank lines are filtered out
+    /// first — see [`Self::enqueue`].
     pub fn enqueue_batch(&mut self, lines: &[Vec<u8>], timestamp_ns: i64) -> bool {
-        match self.buffer.enqueue_batch(lines, timestamp_ns) {
+        let lines: Vec<Vec<u8>> = lines
+            .iter()
+            .filter(|line| !crate::common::is_blank_log_line(line))
+            .cloned()
+            .collect();
+        if lines.is_empty() {
+            return true;
+        }
+        match self.buffer.enqueue_batch(&lines, timestamp_ns) {
             Ok(_) => true,
             Err(crate::buffer::BufferError::Full { .. }) => {
-                if self.spill_to_overflow(lines, timestamp_ns) > 0 {
+                if self.spill_to_overflow(&lines, timestamp_ns) > 0 {
                     return true;
                 }
                 warn!(source_id = %self.source_id, "streaming buffer full, backpressure");
@@ -327,6 +347,15 @@ impl StreamingDeliveryPipeline {
                 );
                 deleted
             }
+            CappedShipOutcome::RejectedAdjudicated { accepted, rejected } => {
+                let deleted = self.confirm_drained(&sequences[..accepted + rejected]);
+                warn!(
+                    accepted,
+                    rejected,
+                    "dropped permanently-rejected streaming entries after full relay adjudication"
+                );
+                deleted
+            }
             CappedShipOutcome::Deferred { reason } => {
                 warn!(reason = ?reason, "streaming ship deferred, will retry");
                 false
@@ -435,11 +464,24 @@ impl StreamingDeliveryPipeline {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use logpacer_wire::WireResponse;
+    use prost::Message;
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     // Note: full pipeline tests require a mock shipper and are in the integration test file.
     // Unit tests here cover the checkpoint gating logic.
+
+    fn encoded_wire_response(accepted: u32, rejected: u32, error_message: &str) -> Vec<u8> {
+        let response = WireResponse {
+            accepted,
+            rejected,
+            error_message: error_message.to_string(),
+        };
+        let mut buf = Vec::new();
+        response.encode(&mut buf).unwrap();
+        buf
+    }
 
     #[test]
     fn streaming_pipeline_config_defaults() {
@@ -521,5 +563,159 @@ mod tests {
             .map(|entry| entry.data)
             .collect();
         assert_eq!(remaining, vec![b"next".to_vec()]);
+    }
+
+    #[tokio::test]
+    async fn drain_cycle_advances_past_fully_adjudicated_rejection() {
+        // Regression test for the reject-poison livelock: when the relay
+        // fully adjudicates a batch (accepted + rejected == the batch size),
+        // both the accepted and the permanently-rejected entries must leave
+        // the buffer — otherwise the accepted entry re-ships every drain
+        // cycle forever.
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/wire"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(
+                encoded_wire_response(1, 1, "one entry rejected"),
+                "application/x-protobuf",
+            ))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let dir = tempfile::tempdir().unwrap();
+        let shipper = Shipper::new(
+            &format!("{}/wire", mock_server.uri()),
+            "arc_stream",
+            "repo_stream",
+            None,
+        )
+        .unwrap();
+        let config = StreamingPipelineConfig {
+            ship_batch_size: 10,
+            ship_batch_max_bytes: usize::MAX,
+            ..Default::default()
+        };
+        let mut pipeline =
+            StreamingDeliveryPipeline::open("stream-source", dir.path(), shipper, config, None)
+                .unwrap();
+        let input = vec![b"one".to_vec(), b"two".to_vec()];
+        assert!(pipeline.enqueue_batch(&input, 1000));
+
+        pipeline.drain_cycle().await;
+
+        let remaining: Vec<Vec<u8>> = pipeline
+            .buffer
+            .peek(10)
+            .unwrap()
+            .into_iter()
+            .map(|entry| entry.data)
+            .collect();
+        assert!(
+            remaining.is_empty(),
+            "both the accepted and rejected entries were adjudicated; buffer must be empty"
+        );
+
+        // A second drain cycle must not re-ship anything: the buffer is
+        // empty, so it runs idle housekeeping instead. The mock's
+        // `expect(1)` above enforces this — a second POST would fail the
+        // test on drop.
+        pipeline.drain_cycle().await;
+    }
+
+    #[test]
+    fn enqueue_skips_blank_lines_but_reports_them_as_handled() {
+        // Regression test: a blank/whitespace-only line (e.g. between frames
+        // of a multi-line stack trace) is dropped here instead of buffered —
+        // the relay rejects it per-entry with "empty raw_text body". It must
+        // report `true` (handled), not `false` (backpressure), so the
+        // caller's resume checkpoint still advances past it.
+        let dir = tempfile::tempdir().unwrap();
+        let shipper = Shipper::new("http://127.0.0.1:9", "arc_blank", "repo_blank", None).unwrap();
+        let mut pipeline = StreamingDeliveryPipeline::open(
+            "stream-blank",
+            dir.path(),
+            shipper,
+            StreamingPipelineConfig::default(),
+            None,
+        )
+        .unwrap();
+
+        assert!(pipeline.enqueue(b"real line", 1000));
+        assert!(pipeline.enqueue(b"", 1000));
+        assert!(pipeline.enqueue(b"   \t  ", 1000));
+        assert!(pipeline.enqueue(b"another real line", 1000));
+
+        let buffered: Vec<Vec<u8>> = pipeline
+            .buffer
+            .peek(10)
+            .unwrap()
+            .into_iter()
+            .map(|entry| entry.data)
+            .collect();
+        assert_eq!(
+            buffered,
+            vec![b"real line".to_vec(), b"another real line".to_vec()],
+            "blank lines never enter the buffer"
+        );
+    }
+
+    #[test]
+    fn enqueue_batch_skips_blank_lines() {
+        let dir = tempfile::tempdir().unwrap();
+        let shipper = Shipper::new(
+            "http://127.0.0.1:9",
+            "arc_blank_batch",
+            "repo_blank_batch",
+            None,
+        )
+        .unwrap();
+        let mut pipeline = StreamingDeliveryPipeline::open(
+            "stream-blank-batch",
+            dir.path(),
+            shipper,
+            StreamingPipelineConfig::default(),
+            None,
+        )
+        .unwrap();
+
+        let input = vec![b"one".to_vec(), b"".to_vec(), b"two".to_vec()];
+        assert!(pipeline.enqueue_batch(&input, 1000));
+
+        let buffered: Vec<Vec<u8>> = pipeline
+            .buffer
+            .peek(10)
+            .unwrap()
+            .into_iter()
+            .map(|entry| entry.data)
+            .collect();
+        assert_eq!(buffered, vec![b"one".to_vec(), b"two".to_vec()]);
+    }
+
+    #[test]
+    fn enqueue_batch_of_only_blank_lines_is_a_noop_not_backpressure() {
+        // Negative control alongside the two tests above: an all-blank batch
+        // still reports success (nothing to retry) and the buffer stays
+        // empty rather than receiving any entries.
+        let dir = tempfile::tempdir().unwrap();
+        let shipper = Shipper::new(
+            "http://127.0.0.1:9",
+            "arc_all_blank",
+            "repo_all_blank",
+            None,
+        )
+        .unwrap();
+        let mut pipeline = StreamingDeliveryPipeline::open(
+            "stream-all-blank",
+            dir.path(),
+            shipper,
+            StreamingPipelineConfig::default(),
+            None,
+        )
+        .unwrap();
+
+        let input = vec![b"".to_vec(), b"   ".to_vec()];
+        assert!(pipeline.enqueue_batch(&input, 1000));
+        assert!(pipeline.buffer.is_empty().unwrap());
     }
 }
