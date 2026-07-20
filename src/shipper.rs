@@ -153,6 +153,12 @@ pub enum CappedShipOutcome {
     /// A single oversized record was rejected even after shrink-to-one and must
     /// be deleted to let later durable records make progress.
     DroppedOversized { count: usize },
+    /// The relay fully adjudicated the batch (`accepted + rejected` covers
+    /// every entry sent): `accepted` were committed and `rejected` were
+    /// permanently refused (e.g. an empty raw_text body). The whole prefix
+    /// may be deleted — accepted entries already landed exactly once, and
+    /// rejected entries are dropped-by-decision, never retried.
+    RejectedAdjudicated { accepted: usize, rejected: usize },
     /// Nothing was safely handled; keep the full buffer prefix for a later retry.
     Deferred { reason: CappedShipDeferredReason },
 }
@@ -518,7 +524,30 @@ impl Shipper {
                     rejected,
                     message,
                 }) => {
-                    warn!(accepted, rejected, error = %message, "batch rejected by relay, will retry");
+                    // Fully adjudicated: every entry sent was resolved one way
+                    // or the other. Advance past the whole prefix — retrying
+                    // would re-ship the accepted entries (duplication) while
+                    // the rejected ones can never succeed (they're rejected
+                    // by content, not by transient relay state).
+                    if accepted as usize + rejected as usize == n {
+                        warn!(
+                            accepted,
+                            rejected,
+                            error = %message,
+                            "batch rejected by relay, fully adjudicated: dropping rejected entries"
+                        );
+                        return CappedShipOutcome::RejectedAdjudicated {
+                            accepted: accepted as usize,
+                            rejected: rejected as usize,
+                        };
+                    }
+                    warn!(
+                        accepted,
+                        rejected,
+                        requested = n,
+                        error = %message,
+                        "batch partially adjudicated by relay, will retry"
+                    );
                     return CappedShipOutcome::Deferred {
                         reason: CappedShipDeferredReason::RelayRejected,
                     };

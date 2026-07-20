@@ -331,7 +331,11 @@ async fn capped_ship_drops_single_entry_rejected_as_payload_too_large() {
 }
 
 #[tokio::test]
-async fn capped_ship_defers_partial_rejection() {
+async fn capped_ship_drops_fully_adjudicated_rejection() {
+    // accepted + rejected == the requested batch size (2): the relay fully
+    // resolved every entry, so the poison fix must advance past the whole
+    // prefix rather than re-shipping the accepted entry forever (the
+    // duplication livelock this fix closes).
     let mock_server = MockServer::start().await;
 
     Mock::given(method("POST"))
@@ -354,6 +358,44 @@ async fn capped_ship_defers_partial_rejection() {
     )
     .unwrap();
     let lines = vec![b"one".to_vec(), b"two".to_vec()];
+
+    let outcome = shipper.ship_capped_with_shrink(&lines, usize::MAX).await;
+    assert_eq!(
+        outcome,
+        CappedShipOutcome::RejectedAdjudicated {
+            accepted: 1,
+            rejected: 1,
+        }
+    );
+}
+
+#[tokio::test]
+async fn capped_ship_defers_partial_adjudication() {
+    // Negative control: accepted + rejected (2) is LESS than the requested
+    // batch size (3) — the relay hasn't resolved the whole batch, so the
+    // normal retry/defer behavior must still apply (nothing dropped).
+    let mock_server = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path("/wire"))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(
+            encoded_wire_response(1, 1, "partial adjudication"),
+            "application/x-protobuf",
+        ))
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    let shipper = edgepacer::shipper::Shipper::new(
+        &format!("{}/wire", mock_server.uri()),
+        "arc_partial_adjudication",
+        "repo_partial_adjudication",
+        Some(edgepacer::identity::AgentIdentity::new(
+            "host-partial-adjudication".to_string(),
+        )),
+    )
+    .unwrap();
+    let lines = vec![b"one".to_vec(), b"two".to_vec(), b"three".to_vec()];
 
     let outcome = shipper.ship_capped_with_shrink(&lines, usize::MAX).await;
     assert_eq!(
