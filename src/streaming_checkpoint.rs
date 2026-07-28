@@ -35,14 +35,16 @@ pub struct StreamingCheckpoint {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "type", content = "resume_token")]
 pub enum StreamingSourceType {
-    /// Docker container logs. Resume token is a timestamp (RFC3339Nano).
-    /// At-least-once: duplicates around the resume point are accepted.
+    /// Docker container logs. The resume token is an RFC3339Nano timestamp
+    /// plus the 1-based occurrence delivered at that timestamp. Reconnect
+    /// fences Docker's replay at that exact boundary.
     Docker {
-        /// Last seen log timestamp as RFC3339Nano string.
-        /// Passed to Docker API as `since` parameter on reconnect.
+        /// Last seen log timestamp as an RFC3339Nano string.
+        /// Converted to Docker's second-precision `since` value on reconnect.
         last_timestamp: String,
         /// 1-based occurrence of the last seen line at `last_timestamp`.
         ///
+        /// Entries through this occurrence are skipped at the replay boundary.
         /// Old timestamp-only checkpoints deserialize as zero, which fails
         /// open by replaying every line at the exact boundary.
         #[serde(default)]
