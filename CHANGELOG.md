@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Prevent Docker API streams from re-shipping final container logs after
+  reconnect: checkpoints fence the exact timestamp occurrence, and stopped or
+  repeatedly missing containers park instead of retrying every 30 seconds.
+
 ## 0.2.10 - 2026-07-19
 
 - Gzip every wire upload (`Content-Encoding: gzip`), cutting request-body

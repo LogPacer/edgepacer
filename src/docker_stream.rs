@@ -3,12 +3,14 @@
 //! Streams logs from running Docker containers and enqueues them to the
 //! `StreamingDeliveryPipeline` for guaranteed at-least-once delivery.
 //!
-//! Resume semantics: timestamp-based. On reconnect, passes `since=last_timestamp`
-//! to the Docker API. Duplicates around the resume point are accepted — this is
-//! the at-least-once contract, not exactly-once.
+//! Resume semantics: timestamp-based. Docker accepts `since` only as an epoch
+//! second, so reconnects replay that whole second. An exact timestamp +
+//! same-timestamp occurrence fence suppresses only lines already enqueued while
+//! preserving distinct lines that share the boundary timestamp.
 
 use bollard::query_parameters::LogsOptions;
 use futures_util::StreamExt;
+use std::cmp::Ordering;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::watch;
 use tokio::time::MissedTickBehavior;
@@ -29,6 +31,8 @@ const ASSEMBLER_CHECK_INTERVAL: std::time::Duration = std::time::Duration::from_
 pub(crate) enum DockerStreamEnd {
     /// Stream ended or errored for any other reason — reconnect as usual.
     Disconnected,
+    /// A clean EOF was followed by an inspect showing the container is stopped.
+    ContainerStopped,
     /// The Docker API returned 404 for this container: it's gone.
     ContainerNotFound,
 }
@@ -46,6 +50,111 @@ fn is_container_not_found(error: &bollard::errors::Error) -> bool {
     )
 }
 
+/// Classify a clean follow-stream EOF from the inspected Docker state.
+///
+/// Missing or active state fails open to reconnect. Every concrete inactive
+/// state parks the reader; it keeps re-probing while source reconciliation can
+/// replace it when the configured container changes.
+fn classify_clean_eof_state(state: Option<&bollard::models::ContainerState>) -> DockerStreamEnd {
+    use bollard::models::ContainerStateStatusEnum;
+
+    match state.and_then(|state| state.status) {
+        Some(
+            ContainerStateStatusEnum::RUNNING
+            | ContainerStateStatusEnum::PAUSED
+            | ContainerStateStatusEnum::RESTARTING,
+        )
+        | Some(ContainerStateStatusEnum::EMPTY)
+        | None => DockerStreamEnd::Disconnected,
+        Some(_) => DockerStreamEnd::ContainerStopped,
+    }
+}
+
+async fn classify_clean_eof(docker: &bollard::Docker, container_id: &str) -> DockerStreamEnd {
+    match docker.inspect_container(container_id, None).await {
+        Ok(inspect) => {
+            let outcome = classify_clean_eof_state(inspect.state.as_ref());
+            if outcome == DockerStreamEnd::ContainerStopped {
+                info!(
+                    container_id,
+                    status = ?inspect.state.and_then(|state| state.status),
+                    "Docker log stream ended for stopped container"
+                );
+            }
+            outcome
+        }
+        Err(error) if is_container_not_found(&error) => {
+            info!(
+                container_id,
+                "Docker container not found after log stream ended"
+            );
+            DockerStreamEnd::ContainerNotFound
+        }
+        Err(error) => {
+            warn!(
+                container_id,
+                error = %error,
+                "failed to inspect container after Docker log stream ended"
+            );
+            DockerStreamEnd::Disconnected
+        }
+    }
+}
+
+/// Filters the replay caused by Docker's second-precision `since` without
+/// turning a same-timestamp group into a lossy `timestamp + 1ns` cursor.
+struct DockerResumeBoundary {
+    resume: Option<(chrono::DateTime<chrono::FixedOffset>, u64)>,
+    observed_timestamp: Option<chrono::DateTime<chrono::FixedOffset>>,
+    observed_occurrence: u64,
+}
+
+impl DockerResumeBoundary {
+    fn new(resume: Option<(&str, u64)>) -> Self {
+        Self {
+            resume: resume.and_then(|(timestamp, occurrence)| {
+                chrono::DateTime::parse_from_rfc3339(timestamp)
+                    .ok()
+                    .map(|timestamp| (timestamp, occurrence))
+            }),
+            observed_timestamp: None,
+            observed_occurrence: 0,
+        }
+    }
+
+    fn should_skip(&mut self, timestamp: &str) -> bool {
+        let Ok(timestamp) = chrono::DateTime::parse_from_rfc3339(timestamp) else {
+            self.observed_timestamp = None;
+            self.observed_occurrence = 1;
+            return false;
+        };
+
+        if self.observed_timestamp == Some(timestamp) {
+            self.observed_occurrence += 1;
+        } else {
+            self.observed_timestamp = Some(timestamp);
+            self.observed_occurrence = 1;
+        }
+
+        let Some((resume_timestamp, resume_occurrence)) = self.resume.as_ref() else {
+            return false;
+        };
+
+        match timestamp.cmp(resume_timestamp) {
+            Ordering::Less => true,
+            Ordering::Equal => self.observed_occurrence <= *resume_occurrence,
+            Ordering::Greater => {
+                self.resume = None;
+                false
+            }
+        }
+    }
+
+    fn observed_occurrence(&self) -> u64 {
+        self.observed_occurrence
+    }
+}
+
 /// Stream logs from a Docker container into the streaming pipeline actor.
 ///
 /// Runs until the container stops or shutdown is signaled.
@@ -54,7 +163,7 @@ pub async fn stream_container_logs(
     handle: &StreamHandle,
     container_id: &str,
     source_id: &str,
-    since: Option<&str>,
+    resume: Option<(&str, u64)>,
     multiline: Option<&MultilineConfig>,
     shutdown: &mut watch::Receiver<bool>,
 ) -> DockerStreamEnd {
@@ -74,7 +183,7 @@ pub async fn stream_container_logs(
     };
 
     // Build log options with optional resume timestamp.
-    let since_str = since.unwrap_or("0");
+    let since_str = resume.map_or("0", |(timestamp, _)| timestamp);
 
     info!(
         container_id,
@@ -95,6 +204,7 @@ pub async fn stream_container_logs(
     };
 
     let mut stream = docker.logs(container_id, Some(options));
+    let mut resume_boundary = DockerResumeBoundary::new(resume);
     let mut assembler = match StreamingEntryAssembler::new(multiline) {
         Ok(assembler) => assembler,
         Err(error) => {
@@ -106,8 +216,9 @@ pub async fn stream_container_logs(
     assembler_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
     assembler_tick.tick().await;
 
-    let mut last_checkpoint =
-        since.map(|timestamp| StreamingCheckpoint::docker(source_id, container_id, timestamp));
+    let mut last_checkpoint = resume.map(|(timestamp, occurrence)| {
+        StreamingCheckpoint::docker_at_occurrence(source_id, container_id, timestamp, occurrence)
+    });
     let mut lines_streamed: u64 = 0;
     let mut stream_end = DockerStreamEnd::Disconnected;
 
@@ -123,13 +234,24 @@ pub async fn stream_container_logs(
                             continue;
                         }
 
+                        if timestamp.is_some_and(|timestamp| {
+                            resume_boundary.should_skip(timestamp)
+                        }) {
+                            continue;
+                        }
+
                         let now_ns = SystemTime::now()
                             .duration_since(UNIX_EPOCH)
                             .unwrap_or_default()
                             .as_nanos() as i64;
 
                         let checkpoint = timestamp.map(|ts| {
-                            StreamingCheckpoint::docker(source_id, container_id, ts)
+                            StreamingCheckpoint::docker_at_occurrence(
+                                source_id,
+                                container_id,
+                                ts,
+                                resume_boundary.observed_occurrence(),
+                            )
                         });
 
                         match assembler
@@ -166,8 +288,11 @@ pub async fn stream_container_logs(
                         break;
                     }
                     None => {
-                        // Stream ended (container stopped or detached).
+                        // A clean EOF can mean either a stopped container or a
+                        // dropped follow connection. Inspect before deciding
+                        // whether the reader is terminal or reconnectable.
                         info!(container_id, lines = lines_streamed, "Docker log stream ended");
+                        stream_end = classify_clean_eof(&docker, container_id).await;
                         break;
                     }
                 }
@@ -346,6 +471,73 @@ mod tests {
         assert!(!is_container_not_found(
             &bollard::errors::Error::RequestTimeoutError
         ));
+    }
+
+    #[test]
+    fn clean_eof_from_exited_container_requests_parking() {
+        let state = bollard::models::ContainerState {
+            status: Some(bollard::models::ContainerStateStatusEnum::EXITED),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            classify_clean_eof_state(Some(&state)),
+            DockerStreamEnd::ContainerStopped
+        );
+    }
+
+    #[test]
+    fn clean_eof_from_running_container_is_a_disconnect() {
+        let state = bollard::models::ContainerState {
+            status: Some(bollard::models::ContainerStateStatusEnum::RUNNING),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            classify_clean_eof_state(Some(&state)),
+            DockerStreamEnd::Disconnected
+        );
+    }
+
+    #[test]
+    fn clean_eof_with_unknown_state_is_a_disconnect() {
+        assert_eq!(
+            classify_clean_eof_state(None),
+            DockerStreamEnd::Disconnected
+        );
+        assert_eq!(
+            classify_clean_eof_state(Some(&bollard::models::ContainerState::default())),
+            DockerStreamEnd::Disconnected
+        );
+    }
+
+    #[test]
+    fn resume_boundary_skips_only_delivered_same_timestamp_occurrences() {
+        let boundary_timestamp = "2026-07-09T00:09:14.107595876Z";
+        let checkpoint = StreamingCheckpoint::docker_at_occurrence(
+            "service-4",
+            "e0eab7b5c0d9",
+            boundary_timestamp,
+            2,
+        );
+        let mut boundary =
+            DockerResumeBoundary::new(checkpoint.docker_resume_boundary("e0eab7b5c0d9"));
+
+        assert!(boundary.should_skip("2026-07-09T00:09:14.100000000Z"));
+        assert!(boundary.should_skip(boundary_timestamp));
+        assert!(boundary.should_skip(boundary_timestamp));
+        assert!(
+            !boundary.should_skip(boundary_timestamp),
+            "a distinct third line sharing the boundary timestamp must be delivered"
+        );
+        assert!(!boundary.should_skip("2026-07-09T00:09:14.200000000Z"));
+        assert!(boundary.resume.is_none(), "past-boundary fence must retire");
+        assert!(!boundary.should_skip("2026-07-09T00:09:14.200000000Z"));
+        assert_eq!(
+            boundary.observed_occurrence(),
+            2,
+            "same-timestamp occurrence tracking continues after fence retirement"
+        );
     }
 
     #[test]
