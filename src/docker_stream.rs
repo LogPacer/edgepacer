@@ -53,8 +53,8 @@ fn is_container_not_found(error: &bollard::errors::Error) -> bool {
 /// Classify a clean follow-stream EOF from the inspected Docker state.
 ///
 /// Missing or active state fails open to reconnect. Every concrete inactive
-/// state is terminal for this reader; the orchestrator can start a new reader
-/// when source reconciliation supplies a live container.
+/// state parks the reader; it keeps re-probing while source reconciliation can
+/// replace it when the configured container changes.
 fn classify_clean_eof_state(state: Option<&bollard::models::ContainerState>) -> DockerStreamEnd {
     use bollard::models::ContainerStateStatusEnum;
 
@@ -474,7 +474,7 @@ mod tests {
     }
 
     #[test]
-    fn clean_eof_from_exited_container_is_terminal() {
+    fn clean_eof_from_exited_container_requests_parking() {
         let state = bollard::models::ContainerState {
             status: Some(bollard::models::ContainerStateStatusEnum::EXITED),
             ..Default::default()
