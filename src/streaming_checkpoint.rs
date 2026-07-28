@@ -4,8 +4,9 @@
 //! streaming sources (Docker API, journald, Windows Event Log) cannot replay
 //! from an arbitrary position. Their resume tokens are best-effort:
 //!
-//! - **Docker**: timestamp of the last seen log line. On reconnect, uses Docker API
-//!   `since` parameter. Duplicates around the resume point are accepted (at-least-once).
+//! - **Docker**: timestamp plus occurrence at that timestamp. Docker's `since`
+//!   parameter is only second-precision, so the occurrence fences replay at the
+//!   exact timestamp without dropping distinct same-timestamp lines.
 //! - **Journald**: cursor string. Exact replay (no duplicates).
 //! - **Windows Event Log**: record ID. Exact replay.
 //!
@@ -34,12 +35,20 @@ pub struct StreamingCheckpoint {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "type", content = "resume_token")]
 pub enum StreamingSourceType {
-    /// Docker container logs. Resume token is a timestamp (RFC3339Nano).
-    /// At-least-once: duplicates around the resume point are accepted.
+    /// Docker container logs. The resume token is an RFC3339Nano timestamp
+    /// plus the 1-based occurrence delivered at that timestamp. Reconnect
+    /// fences Docker's replay at that exact boundary.
     Docker {
-        /// Last seen log timestamp as RFC3339Nano string.
-        /// Passed to Docker API as `since` parameter on reconnect.
+        /// Last seen log timestamp as an RFC3339Nano string.
+        /// Converted to Docker's second-precision `since` value on reconnect.
         last_timestamp: String,
+        /// 1-based occurrence of the last seen line at `last_timestamp`.
+        ///
+        /// Entries through this occurrence are skipped at the replay boundary.
+        /// Old timestamp-only checkpoints deserialize as zero, which fails
+        /// open by replaying every line at the exact boundary.
+        #[serde(default)]
+        last_timestamp_occurrence: u64,
         /// Container ID being streamed.
         container_id: String,
     },
@@ -62,10 +71,21 @@ pub enum StreamingSourceType {
 impl StreamingCheckpoint {
     /// Create a Docker streaming checkpoint.
     pub fn docker(source_id: &str, container_id: &str, last_timestamp: &str) -> Self {
+        Self::docker_at_occurrence(source_id, container_id, last_timestamp, 1)
+    }
+
+    /// Create a Docker checkpoint at an exact same-timestamp occurrence.
+    pub(crate) fn docker_at_occurrence(
+        source_id: &str,
+        container_id: &str,
+        last_timestamp: &str,
+        last_timestamp_occurrence: u64,
+    ) -> Self {
         Self {
             source_id: source_id.to_string(),
             source_type: StreamingSourceType::Docker {
                 last_timestamp: last_timestamp.to_string(),
+                last_timestamp_occurrence,
                 container_id: container_id.to_string(),
             },
             updated_at: SystemTime::now(),
@@ -103,6 +123,20 @@ impl StreamingCheckpoint {
         }
     }
 
+    /// Extract the exact Docker replay boundary for this container.
+    pub(crate) fn docker_resume_boundary(&self, container_id: &str) -> Option<(&str, u64)> {
+        match &self.source_type {
+            StreamingSourceType::Docker {
+                last_timestamp,
+                last_timestamp_occurrence,
+                container_id: checkpoint_container_id,
+            } if checkpoint_container_id == container_id => {
+                Some((last_timestamp.as_str(), *last_timestamp_occurrence))
+            }
+            _ => None,
+        }
+    }
+
     /// Extract the journald cursor for exact resume, if this is a journald checkpoint.
     pub fn journald_cursor(&self) -> Option<&str> {
         match &self.source_type {
@@ -134,6 +168,10 @@ mod tests {
 
         assert_eq!(cp.source_id, "src-123");
         assert_eq!(cp.docker_since(), Some("2026-04-05T10:30:00.123456789Z"));
+        assert_eq!(
+            cp.docker_resume_boundary("abc123"),
+            Some(("2026-04-05T10:30:00.123456789Z", 1))
+        );
 
         // Serialize and deserialize
         let json = serde_json::to_string(&cp).unwrap();
@@ -142,6 +180,10 @@ mod tests {
         assert_eq!(
             restored.docker_since(),
             Some("2026-04-05T10:30:00.123456789Z")
+        );
+        assert_eq!(
+            restored.docker_resume_boundary("abc123"),
+            Some(("2026-04-05T10:30:00.123456789Z", 1))
         );
     }
 
@@ -155,6 +197,42 @@ mod tests {
             updated_at: SystemTime::now(),
         };
         assert!(cp.docker_since().is_none());
+    }
+
+    #[test]
+    fn legacy_docker_checkpoint_defaults_to_conservative_boundary() {
+        let legacy = r#"{
+            "source_id":"src-legacy",
+            "source_type":{
+                "type":"Docker",
+                "resume_token":{
+                    "last_timestamp":"2026-07-09T00:09:14.107595876Z",
+                    "container_id":"e0eab7b5c0d9"
+                }
+            },
+            "updated_at":{"secs_since_epoch":0,"nanos_since_epoch":0}
+        }"#;
+
+        let checkpoint: StreamingCheckpoint = serde_json::from_str(legacy).unwrap();
+        assert_eq!(
+            checkpoint.docker_resume_boundary("e0eab7b5c0d9"),
+            Some(("2026-07-09T00:09:14.107595876Z", 0))
+        );
+    }
+
+    #[test]
+    fn docker_checkpoint_from_another_container_is_not_a_resume_boundary() {
+        let checkpoint = StreamingCheckpoint::docker_at_occurrence(
+            "service-4",
+            "old-container",
+            "2026-07-09T00:09:14.107595876Z",
+            2,
+        );
+
+        assert_eq!(
+            checkpoint.docker_resume_boundary("replacement-container"),
+            None
+        );
     }
 
     #[test]
@@ -173,6 +251,7 @@ mod tests {
     fn source_types_are_distinct() {
         let docker = StreamingSourceType::Docker {
             last_timestamp: "2026-01-01T00:00:00Z".into(),
+            last_timestamp_occurrence: 1,
             container_id: "abc".into(),
         };
         let journald = StreamingSourceType::Journald {
