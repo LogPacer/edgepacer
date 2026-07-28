@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.2.11 - 2026-07-29
+
 - Prevent Docker API streams from re-shipping final container logs after
   reconnect: checkpoints fence the exact timestamp occurrence, and stopped or
   repeatedly missing containers park instead of retrying every 30 seconds.
