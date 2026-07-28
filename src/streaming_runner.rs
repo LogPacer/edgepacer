@@ -38,17 +38,22 @@ impl NotFoundStreak {
     /// Record an outcome, returning the sleep to use before the next
     /// reconnect: `backoff` normally, or — once
     /// `PARK_AFTER_CONSECUTIVE_NOT_FOUND` consecutive not-found results have
-    /// been seen — the parked re-probe interval instead. Any non-not-found
-    /// outcome resets the streak immediately.
-    fn record(&mut self, outcome: docker_stream::DockerStreamEnd, backoff: Duration) -> Duration {
+    /// been seen — the parked re-probe interval instead. A stopped container
+    /// returns `None`; any retryable non-not-found outcome resets the streak.
+    fn record(
+        &mut self,
+        outcome: docker_stream::DockerStreamEnd,
+        backoff: Duration,
+    ) -> Option<Duration> {
         match outcome {
             docker_stream::DockerStreamEnd::ContainerNotFound => self.0 += 1,
             docker_stream::DockerStreamEnd::Disconnected => self.0 = 0,
+            docker_stream::DockerStreamEnd::ContainerStopped => return None,
         }
         if self.0 >= PARK_AFTER_CONSECUTIVE_NOT_FOUND {
-            PARKED_REPROBE_INTERVAL
+            Some(PARKED_REPROBE_INTERVAL)
         } else {
-            backoff
+            Some(backoff)
         }
     }
 
@@ -88,18 +93,27 @@ pub async fn run_streaming_reader(
 
         let sleep_duration = match &config.access_method {
             StreamAccessMethod::DockerApi { container_id } => {
-                let since = checkpoint.as_ref().and_then(|cp| cp.docker_since());
+                let resume = checkpoint
+                    .as_ref()
+                    .and_then(|cp| cp.docker_resume_boundary(container_id));
                 let outcome = docker_stream::stream_container_logs(
                     &handle,
                     container_id,
                     &config.log_source_id,
-                    since,
+                    resume,
                     config.multiline.as_ref(),
                     &mut shutdown,
                 )
                 .await;
 
-                let sleep_duration = not_found_streak.record(outcome, backoff);
+                let Some(sleep_duration) = not_found_streak.record(outcome, backoff) else {
+                    info!(
+                        log_source_id = %config.log_source_id,
+                        container_id,
+                        "Docker container stopped, ending streaming reader"
+                    );
+                    return;
+                };
                 if not_found_streak.just_parked() {
                     warn!(
                         log_source_id = %config.log_source_id,
@@ -170,18 +184,18 @@ mod tests {
 
         for i in 1..PARK_AFTER_CONSECUTIVE_NOT_FOUND {
             let sleep = streak.record(docker_stream::DockerStreamEnd::ContainerNotFound, backoff);
-            assert_eq!(sleep, backoff, "not parked yet at streak {i}");
+            assert_eq!(sleep, Some(backoff), "not parked yet at streak {i}");
             assert!(!streak.just_parked());
         }
 
         let sleep = streak.record(docker_stream::DockerStreamEnd::ContainerNotFound, backoff);
-        assert_eq!(sleep, PARKED_REPROBE_INTERVAL);
+        assert_eq!(sleep, Some(PARKED_REPROBE_INTERVAL));
         assert!(streak.just_parked());
 
         // Stays parked (re-probing hourly) on further not-found results,
         // without re-triggering the transition log.
         let sleep = streak.record(docker_stream::DockerStreamEnd::ContainerNotFound, backoff);
-        assert_eq!(sleep, PARKED_REPROBE_INTERVAL);
+        assert_eq!(sleep, Some(PARKED_REPROBE_INTERVAL));
         assert!(!streak.just_parked());
     }
 
@@ -194,10 +208,23 @@ mod tests {
         let backoff = Duration::from_secs(4);
 
         let sleep = streak.record(docker_stream::DockerStreamEnd::ContainerNotFound, backoff);
-        assert_eq!(sleep, backoff);
+        assert_eq!(sleep, Some(backoff));
 
         let sleep = streak.record(docker_stream::DockerStreamEnd::Disconnected, backoff);
-        assert_eq!(sleep, backoff);
+        assert_eq!(sleep, Some(backoff));
         assert_eq!(streak.0, 0);
+    }
+
+    #[test]
+    fn stopped_container_does_not_reconnect() {
+        let mut streak = NotFoundStreak::default();
+
+        assert_eq!(
+            streak.record(
+                docker_stream::DockerStreamEnd::ContainerStopped,
+                Duration::from_secs(30)
+            ),
+            None
+        );
     }
 }
