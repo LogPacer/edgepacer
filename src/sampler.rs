@@ -421,7 +421,7 @@ fn read_kubernetes_lines(dir: &str) -> Result<Vec<String>, String> {
 ///
 /// Rails sends two flavors of identifier in sample requests:
 ///   * file paths      — "/var/log/auth.log"
-///   * systemd units   — "pacer_proxy.service", "logrelay.socket", "atd.timer"
+///   * systemd units   — "pacer-proxy.service", "logrelay.socket", "atd.timer"
 ///
 /// We dispatch on shape, not on an extra type field, because the wire format
 /// is just a string today. Adding journald units here is what unblocks the
