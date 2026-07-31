@@ -46,12 +46,12 @@ mod tests {
 
     #[test]
     fn unit_detection() {
-        assert!(is_systemd_unit("pacer_proxy.service"));
+        assert!(is_systemd_unit("pacer-proxy.service"));
         assert!(is_systemd_unit("logrelay.socket"));
         assert!(is_systemd_unit("backup.timer"));
         assert!(is_systemd_unit("multi-user.target"));
 
-        assert!(!is_systemd_unit("/var/log/pacer_proxy.service"));
+        assert!(!is_systemd_unit("/var/log/pacer-proxy.service"));
         assert!(!is_systemd_unit("/var/log/auth.log"));
         assert!(!is_systemd_unit("auth.log"));
     }
