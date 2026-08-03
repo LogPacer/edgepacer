@@ -43,7 +43,7 @@ pub use edge::EdgeAggregator;
 pub(crate) use otlp::to_otlp_span;
 pub use propagation::PropagatedContext;
 pub use red::RedAggregator;
-pub use span::{SpanContext, mint_id, to_request_signal};
+pub use span::{SpanContext, ctx_trace_id, mint_id, to_request_signal};
 
 /// Direction of a captured socket segment, from the monitored server's view:
 /// `Inbound` = bytes it read (requests), `Outbound` = bytes it wrote (responses).

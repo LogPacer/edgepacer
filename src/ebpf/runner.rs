@@ -30,7 +30,7 @@ use super::capture::{
 use super::cgroup_resolver::{self, CgroupRouting};
 use super::l7::{
     CapturedConnectionIdentity, CapturedSegment, ConnRegistry, EdgeAggregator, L7Record,
-    RedAggregator, SpanContext, mint_id, to_otlp_span, to_request_signal,
+    RedAggregator, SpanContext, ctx_trace_id, mint_id, to_otlp_span, to_request_signal,
 };
 use super::listener_snapshot;
 use super::listener_state::{DeltaOutcome, ListenerAssociation, ListenerSnapshot, ListenerState};
@@ -1110,7 +1110,13 @@ pub async fn run_with_counters(
                         service_name: service.to_string(),
                         pid,
                         cgroup_id: seg.cgroup_id,
-                        trace_id: mint_id(16, span_seq ^ ((pid as u64) << 32) ^ ts as u64),
+                        // A valid propagated context replaces the minted trace
+                        // id — both span arms build from this same ctx, so
+                        // they stay identical.
+                        trace_id: ctx_trace_id(
+                            &record,
+                            mint_id(16, span_seq ^ ((pid as u64) << 32) ^ ts as u64),
+                        ),
                         span_id: mint_id(8, span_seq.wrapping_mul(0x100_0000_01b3) ^ pid as u64),
                         peer: peer.clone(),
                     };

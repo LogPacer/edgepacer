@@ -25,9 +25,19 @@ use super::span::SpanContext;
 /// without a flip, and `None` for unhinted signature-detected flows — which
 /// must render as `UNSPECIFIED`, never as a guessed `SERVER`.
 pub fn to_otlp_span(record: &L7Record, ctx: &SpanContext, kind: Option<SpanKind>) -> Span {
+    // Propagated requests join the caller's trace: the runner adopts the
+    // propagated trace id into ctx (so BOTH arms carry it identically), and
+    // here the remote parent + raw tracestate attach. `trace_id` stays
+    // ctx-owned — the builder must not second-guess ctx. Un-propagated
+    // requests stay root spans with no trace_state.
+    let (parent_span_id, trace_state) = match record.propagated.as_ref() {
+        Some(p) => (p.parent_span_id.to_vec(), p.trace_state.clone()),
+        None => (Vec::new(), String::new()),
+    };
     Span {
         trace_id: ctx.trace_id.clone(),
         span_id: ctx.span_id.clone(),
+        parent_span_id,
         name: record.operation.clone(),
         // Unhinted flows stay UNSPECIFIED — the kind is never guessed.
         kind: kind.unwrap_or(SpanKind::Unspecified) as i32,
@@ -40,6 +50,7 @@ pub fn to_otlp_span(record: &L7Record, ctx: &SpanContext, kind: Option<SpanKind>
             code: StatusCode::Error as i32,
             message: String::new(),
         }),
+        trace_state,
         ..Default::default()
     }
 }
@@ -338,7 +349,6 @@ mod tests {
     /// adopts the propagated trace id where it builds the context, so BOTH
     /// arms carry it identically — `to_otlp_span` must not second-guess ctx.
     #[test]
-    #[ignore = "Slice 2 acceptance — implement propagated adoption in to_otlp_span, then remove this ignore"]
     fn propagated_context_sets_parent_and_trace_state_and_absence_changes_nothing() {
         let propagated = crate::ebpf::l7::PropagatedContext {
             trace_id: [0x4b; 16],

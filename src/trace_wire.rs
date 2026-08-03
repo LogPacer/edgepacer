@@ -99,6 +99,11 @@ pub fn span_to_json_value(span: &Span, service_name: &str, resource_attributes: 
         obj.insert("status".into(), status_to_json(status));
     }
 
+    // Trace state: pass through verbatim, omit when empty.
+    if !span.trace_state.is_empty() {
+        obj.insert("trace_state".into(), json!(span.trace_state));
+    }
+
     // Service name: omit when empty.
     if !service_name.is_empty() {
         obj.insert("service_name".into(), json!(service_name));
@@ -291,7 +296,6 @@ mod tests {
     /// Reviewer-owned Slice 2 acceptance (additive field; logrelay stores span
     /// JSON verbatim, so downstream is unaffected until it opts in).
     #[test]
-    #[ignore = "Slice 2 acceptance — render trace_state in span_to_json_value, then remove this ignore"]
     fn trace_state_renders_when_present_and_is_omitted_when_empty() {
         let mut span = Span {
             trace_id: vec![0x01; 16],
