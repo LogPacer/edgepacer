@@ -1077,6 +1077,7 @@ fn spawn_l7_drain(
                 let seg = CapturedSegment {
                     capture_generation,
                     pid: chunk.pid,
+                    tid: chunk.tid,
                     cgroup_id: chunk.cgroup_id,
                     scope_cgroup_id: chunk.scope_cgroup_id,
                     policy_generation: chunk.policy_generation,
@@ -1140,6 +1141,7 @@ fn spawn_tls_drain(
                 let seg = CapturedSegment {
                     capture_generation,
                     pid: chunk.pid,
+                    tid: chunk.tid,
                     cgroup_id: chunk.cgroup_id,
                     scope_cgroup_id: chunk.scope_cgroup_id,
                     policy_generation: chunk.policy_generation,

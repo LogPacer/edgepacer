@@ -29,7 +29,7 @@ use super::capture::{
 };
 use super::cgroup_resolver::{self, CgroupRouting};
 use super::l7::{
-    CapturedConnectionIdentity, CapturedSegment, ConnRegistry, EdgeAggregator, L7Record,
+    CapturedConnectionIdentity, CapturedSegment, ConnRegistry, EdgeAggregator, LocalSpan,
     RedAggregator, SpanContext, ctx_trace_id, mint_id, to_otlp_span, to_request_signal,
 };
 use super::listener_snapshot;
@@ -209,9 +209,10 @@ pub async fn run_with_counters(
     // minting; cgroup enrichment, durable buffering, and real trace ids (vs. v1
     // spanlets) are refinements.
     let mut l7_conns = ConnRegistry::new();
-    // Pre-conversion records + context + kind: both span arms build from the
-    // same entries at flush time so they share identical trace/span ids.
-    let mut pending_spans: HashMap<String, Vec<PendingSpan>> = HashMap::new();
+    // Pre-conversion spans (record + context + kind + capturing tid): both
+    // span arms build from the same entries at flush time so they share
+    // identical trace/span ids.
+    let mut pending_spans: HashMap<String, Vec<LocalSpan>> = HashMap::new();
     let mut l7_red = RedAggregator::new();
     // Service-map edges aggregated across ALL services on this host, shipped to
     // the one account-level graph repo (`section.service_map`), not per-target.
@@ -1129,7 +1130,15 @@ pub async fn run_with_counters(
                     pending_spans
                         .entry(service.to_string())
                         .or_default()
-                        .push((record, ctx, kind));
+                        // The completing segment's thread — the causality key.
+                        // Right for thread-per-request runtimes; async runtimes
+                        // degrade to flat (never a guessed parent).
+                        .push(LocalSpan {
+                            record,
+                            ctx,
+                            kind,
+                            tid: seg.tid,
+                        });
                 }
             }
 
@@ -1626,11 +1635,6 @@ fn flush_flows(
     }
 }
 
-/// A pending L7 span awaiting flush: the parsed record + its context + the
-/// wiring layer's kind verdict. Both span arms convert from this at flush
-/// time so they share identical trace/span ids.
-type PendingSpan = (L7Record, SpanContext, Option<SpanKind>);
-
 /// The span kind from the port-hint verdict: a flip marks the monitored
 /// process as the client, an unflipped hint marks it as the server, and no
 /// hint leaves the kind unset — it is never guessed `SERVER`.
@@ -1665,7 +1669,7 @@ fn otlp_resource_attributes(service: &str, host: &str) -> serde_json::Value {
 /// are identical in either arm. Best-effort, fire-and-forget. Drains
 /// `pending`. Durable buffering (like log lines) is a refinement.
 fn flush_spans(
-    pending: &mut HashMap<String, Vec<PendingSpan>>,
+    pending: &mut HashMap<String, Vec<LocalSpan>>,
     deliveries: &HashMap<String, TargetDelivery>,
     spans_otlp: bool,
     identity: &crate::identity::AgentIdentity,
@@ -1684,7 +1688,7 @@ fn flush_spans(
         // Arm 1: the legacy RequestSignal batch, unchanged.
         let signals: Vec<RequestSignal> = entries
             .iter()
-            .map(|(record, ctx, _kind)| to_request_signal(record, ctx))
+            .map(|entry| to_request_signal(&entry.record, &entry.ctx))
             .collect();
         let legacy_shipper = shipper.clone();
         let legacy_service = service.clone();
@@ -1714,8 +1718,8 @@ fn flush_spans(
         if spans_otlp {
             let resource_attrs = otlp_resource_attributes(&service, &host);
             let mut spans_json: Vec<Vec<u8>> = Vec::with_capacity(entries.len());
-            for (record, ctx, kind) in &entries {
-                let span = to_otlp_span(record, ctx, *kind);
+            for entry in &entries {
+                let span = to_otlp_span(&entry.record, &entry.ctx, entry.kind);
                 let value = crate::trace_wire::span_to_json_value(&span, &service, &resource_attrs);
                 match serde_json::to_vec(&value) {
                     Ok(bytes) => spans_json.push(bytes),

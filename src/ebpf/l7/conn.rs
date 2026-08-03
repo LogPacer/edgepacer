@@ -37,6 +37,9 @@ pub struct CapturedSegment {
     /// Atomically selected cgroup or PID authorization-policy generation.
     pub policy_generation: u64,
     pub pid: u32,
+    /// The kernel-reported thread that captured this segment — the causality
+    /// key for local span parenting. Zero for synthetic segments.
+    pub tid: u32,
     /// The capturing task's v2 cgroup id — the container/service identity key.
     pub cgroup_id: u64,
     /// The configured workload anchor that authorized capture. This may be an
@@ -427,6 +430,7 @@ mod tests {
             capture_generation: 0,
             policy_generation: 0,
             pid,
+            tid: 0,
             cgroup_id: 0,
             scope_cgroup_id: 0,
             fd,
@@ -448,6 +452,7 @@ mod tests {
             capture_generation: 1,
             policy_generation: 1,
             pid,
+            tid: 0,
             cgroup_id,
             scope_cgroup_id,
             fd,
