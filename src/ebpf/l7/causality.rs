@@ -24,6 +24,19 @@ pub struct LocalSpan {
     pub ctx: SpanContext,
     pub kind: Option<SpanKind>,
     pub tid: u32,
+    /// The connection's two endpoints as the capturing process saw them —
+    /// the same-host cross-process key: monitored A's outbound connection is
+    /// monitored B's inbound with local/remote exactly reversed. `None` when
+    /// socket resolution couldn't name both ends (TLS pseudo-fds,
+    /// cross-uid /proc gating) — such spans never cross-link.
+    pub conn: Option<ConnEndpoints>,
+}
+
+/// A connection's `"ip:port"` endpoints from the capturing process's view.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConnEndpoints {
+    pub local: String,
+    pub remote: String,
 }
 
 /// Assign local parents within one flush batch: every CLIENT span whose
@@ -107,6 +120,26 @@ fn window(record: &L7Record) -> (i64, i64) {
     )
 }
 
+/// The whole-batch hierarchy pass the runner calls once per flush tick, over
+/// every service's entries together: intra-process parenting
+/// ([`assign_local_parents`]), same-host cross-process linking (a SERVER span
+/// whose connection endpoints exactly reverse a CLIENT span's, with the
+/// server's window nested in the client's, adopts that client as its remote
+/// parent — deterministic or nothing: NAT'd or unresolved endpoints never
+/// match), and a transitive trace refresh so a whole causal chain
+/// (SERVER → its CLIENT → the callee's SERVER → its CLIENT …) reports ONE
+/// trace id end to end. Sequential requests multiplexed on one connection
+/// disambiguate by window containment. All [`assign_local_parents`]
+/// invariants hold throughout: wire-extracted context on the ADOPTING side
+/// is never overwritten and nothing is ever guessed.
+#[allow(dead_code)] // wired into the runner's flush path later in this slice
+pub fn assign_batch_hierarchy(entries: &mut [LocalSpan]) {
+    // Slice H2 stub: intra-process parenting already works; the cross-process
+    // link + transitive refresh are the work, pinned by the #[ignore]d
+    // acceptance tests below.
+    assign_local_parents(entries);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -142,6 +175,7 @@ mod tests {
             ctx: ctx(trace_seed, span_seed),
             kind: Some(SpanKind::Server),
             tid,
+            conn: None,
         }
     }
 
@@ -151,6 +185,7 @@ mod tests {
             ctx: ctx(trace_seed, span_seed),
             kind: Some(SpanKind::Client),
             tid,
+            conn: None,
         }
     }
 
@@ -290,5 +325,179 @@ mod tests {
             Some(&wire),
             "wire context wins over local causality"
         );
+    }
+
+    // ── Slice H2: same-host cross-process linking ───────────────────────────
+
+    fn conn(local: &str, remote: &str) -> Option<ConnEndpoints> {
+        Some(ConnEndpoints {
+            local: local.to_string(),
+            remote: remote.to_string(),
+        })
+    }
+
+    /// Monitored A calls monitored B on the same host: one agent sees both
+    /// sides, the endpoints reverse exactly, and B's SERVER span (window
+    /// nested in A's CLIENT window) adopts A as its remote parent — both of
+    /// B's arms carrying A's trace id.
+    #[test]
+    #[ignore = "Slice H2 acceptance — implement cross-process linking in assign_batch_hierarchy, then remove this ignore"]
+    fn same_host_pair_links_across_processes() {
+        let mut a_cli = client(100, 500, 7, 0xaa, 0xa1);
+        a_cli.conn = conn("127.0.0.1:51000", "127.0.0.1:8080");
+        let mut b_srv = server(150, 400, 9, 0xbb, 0xb1);
+        b_srv.ctx.pid = 5151;
+        b_srv.conn = conn("127.0.0.1:8080", "127.0.0.1:51000");
+
+        let mut batch = vec![a_cli, b_srv];
+        assign_batch_hierarchy(&mut batch);
+
+        let p = batch[1]
+            .record
+            .propagated
+            .as_ref()
+            .expect("the reversed pair links");
+        assert_eq!(p.parent_span_id.to_vec(), vec![0xa1; 8]);
+        assert_eq!(p.trace_id.to_vec(), batch[0].ctx.trace_id);
+        assert_eq!(batch[1].ctx.trace_id, batch[0].ctx.trace_id);
+        assert!(
+            batch[0].record.propagated.is_none(),
+            "the client side is never modified by the link"
+        );
+    }
+
+    /// Deterministic or nothing: mismatched ports, same-direction endpoints,
+    /// missing resolution, or a server window not nested in the client's all
+    /// refuse to link. The leading valid pair keeps this self-controlling.
+    #[test]
+    #[ignore = "Slice H2 acceptance — implement cross-process linking in assign_batch_hierarchy, then remove this ignore"]
+    fn no_link_without_exact_endpoint_reversal_and_nesting() {
+        let valid = |a_conn: Option<ConnEndpoints>,
+                     b_conn: Option<ConnEndpoints>,
+                     b_start: i64,
+                     b_end: i64| {
+            let mut a = client(100, 500, 7, 0xaa, 0xa1);
+            a.conn = a_conn;
+            let mut b = server(b_start, b_end, 9, 0xbb, 0xb1);
+            b.ctx.pid = 5151;
+            b.conn = b_conn;
+            let mut batch = vec![a, b];
+            assign_batch_hierarchy(&mut batch);
+            batch[1].record.propagated.is_some()
+        };
+
+        assert!(
+            valid(
+                conn("127.0.0.1:51000", "127.0.0.1:8080"),
+                conn("127.0.0.1:8080", "127.0.0.1:51000"),
+                150,
+                400
+            ),
+            "contract sanity: the reversed nested pair must link"
+        );
+        assert!(
+            !valid(
+                conn("127.0.0.1:51000", "127.0.0.1:8080"),
+                conn("127.0.0.1:9090", "127.0.0.1:51000"),
+                150,
+                400
+            ),
+            "mismatched port must not link"
+        );
+        assert!(
+            !valid(
+                conn("127.0.0.1:51000", "127.0.0.1:8080"),
+                conn("127.0.0.1:51000", "127.0.0.1:8080"),
+                150,
+                400
+            ),
+            "same-direction endpoints (not reversed) must not link"
+        );
+        assert!(
+            !valid(conn("127.0.0.1:51000", "127.0.0.1:8080"), None, 150, 400),
+            "unresolved endpoints must not link"
+        );
+        assert!(
+            !valid(
+                conn("127.0.0.1:51000", "127.0.0.1:8080"),
+                conn("127.0.0.1:8080", "127.0.0.1:51000"),
+                400,
+                600
+            ),
+            "a server window straddling the client's end must not link"
+        );
+    }
+
+    /// Keep-alive: several sequential request pairs multiplex one connection
+    /// — identical endpoints — and each server span pairs with the client
+    /// span whose window contains it.
+    #[test]
+    #[ignore = "Slice H2 acceptance — implement cross-process linking in assign_batch_hierarchy, then remove this ignore"]
+    fn sequential_requests_on_one_connection_pair_by_containment() {
+        let ab = conn("127.0.0.1:51000", "127.0.0.1:8080");
+        let ba = conn("127.0.0.1:8080", "127.0.0.1:51000");
+        let mut a1 = client(100, 200, 7, 0xa0, 0xa1);
+        a1.conn = ab.clone();
+        let mut a2 = client(300, 400, 7, 0xa0, 0xa2);
+        a2.conn = ab;
+        let mut b1 = server(120, 180, 9, 0xb0, 0xb1);
+        b1.ctx.pid = 5151;
+        b1.conn = ba.clone();
+        let mut b2 = server(320, 380, 9, 0xb0, 0xb2);
+        b2.ctx.pid = 5151;
+        b2.conn = ba;
+
+        let mut batch = vec![a1, a2, b1, b2];
+        assign_batch_hierarchy(&mut batch);
+
+        let p1 = batch[2].record.propagated.as_ref().expect("first pair");
+        let p2 = batch[3].record.propagated.as_ref().expect("second pair");
+        assert_eq!(p1.parent_span_id.to_vec(), vec![0xa1; 8]);
+        assert_eq!(p2.parent_span_id.to_vec(), vec![0xa2; 8]);
+    }
+
+    /// The capstone: an SDK caller's wire trace flows through a zero-code
+    /// chain — A's SERVER (wire-propagated) → A's CLIENT (intra-process) →
+    /// B's SERVER (cross-process) → B's CLIENT (intra-process) — and every
+    /// span reports the ONE wire trace id with parents chaining correctly.
+    #[test]
+    #[ignore = "Slice H2 acceptance — implement cross-process linking in assign_batch_hierarchy, then remove this ignore"]
+    fn full_chain_shares_one_wire_trace() {
+        let wire_trace = [0x4b; 16];
+        let mut a_srv = server(0, 1_000, 7, 0x4b, 0xa1);
+        a_srv.record.propagated = Some(PropagatedContext {
+            trace_id: wire_trace,
+            parent_span_id: [0xf0; 8],
+            trace_flags: 0x01,
+            trace_state: "vendor=opaque".to_string(),
+        });
+        let mut a_cli = client(100, 500, 7, 0xaa, 0xa2);
+        a_cli.conn = conn("127.0.0.1:51000", "127.0.0.1:8080");
+        let mut b_srv = server(150, 400, 9, 0xbb, 0xb1);
+        b_srv.ctx.pid = 5151;
+        b_srv.conn = conn("127.0.0.1:8080", "127.0.0.1:51000");
+        let mut b_cli = client(200, 300, 9, 0xcc, 0xb2);
+        b_cli.ctx.pid = 5151;
+
+        let mut batch = vec![a_srv, a_cli, b_srv, b_cli];
+        assign_batch_hierarchy(&mut batch);
+
+        for (i, name) in ["a_srv", "a_cli", "b_srv", "b_cli"].iter().enumerate() {
+            assert_eq!(
+                batch[i].ctx.trace_id,
+                wire_trace.to_vec(),
+                "{name} must carry the one wire trace id"
+            );
+        }
+        let parent = |i: usize| {
+            batch[i]
+                .record
+                .propagated
+                .as_ref()
+                .map(|p| p.parent_span_id.to_vec())
+        };
+        assert_eq!(parent(1), Some(vec![0xa1; 8]), "a_cli under a_srv");
+        assert_eq!(parent(2), Some(vec![0xa2; 8]), "b_srv under a_cli");
+        assert_eq!(parent(3), Some(vec![0xb1; 8]), "b_cli under b_srv");
     }
 }

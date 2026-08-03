@@ -1139,6 +1139,10 @@ pub async fn run_with_counters(
                             ctx,
                             kind,
                             tid: seg.tid,
+                            // Cross-process linking needs both endpoints from
+                            // socket resolution — threaded in this slice; None
+                            // keeps same-host linking inert until then.
+                            conn: None,
                         });
                 }
             }
