@@ -129,7 +129,9 @@ pub struct L7Record {
     /// When the request was received (unix nanos). The span's start time.
     pub start_unix_nano: i64,
     /// Server latency: response-observed minus request-observed (unix-nano diff).
-    /// Approximate (segment arrival times, not kernel ktime) — a refinement.
+    /// Kernel-derived when the BPF object stamps segments (capture ktime,
+    /// converted to unix nanos in the drain); wall-clock arrival times
+    /// otherwise (synthetic tests, unstamped chunks).
     pub duration_nano: i64,
     /// Protocol-specific span enrichment (e.g. HTTP `host`, `llm.model`) merged
     /// into the exported `RequestSignal.attributes`. Empty for parsers that encode
