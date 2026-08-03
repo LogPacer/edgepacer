@@ -519,6 +519,8 @@ mod tests {
             streams_active: 3,
             samples_pending: 1,
             samples_completed: 4,
+            spans_built: 0,
+            spans_ship_failed: 0,
         };
 
         let map = agent_metrics_to_map(&counters, 7, 12.5, 64, 300);

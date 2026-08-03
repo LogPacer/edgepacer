@@ -340,6 +340,7 @@ mod tests {
             receiver_port: 4318,
             network_flows_enabled: false,
             network_cidrs: Vec::new(),
+            spans_otlp: true,
             targets,
             service_map: None,
             config_hash: config_hash.to_string(),

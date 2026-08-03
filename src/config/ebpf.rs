@@ -32,6 +32,10 @@ pub struct EbpfSectionConfig {
     pub network_flows_enabled: bool,
     pub network_cidrs: Vec<String>,
     pub targets: Vec<EbpfTargetConfig>,
+    /// Dual-ship parsed L7 spans as OTLP through the Traces arm in addition
+    /// to the RequestSignal arm. Defaults on; a userspace ship toggle, so it
+    /// stays out of the capture-restart `config_hash`.
+    pub spans_otlp: bool,
     /// Account-level graph repo aggregated service-map edges ship to, in
     /// addition to each target's per-service span repo. `None` until the
     /// control plane provisions it.
@@ -76,28 +80,37 @@ pub fn ebpf_section(config: &UnifiedConfig) -> Option<EbpfSectionConfig> {
     let network_cidrs = network_flows
         .map(|network_flows| string_array_field(network_flows, "cidrs"))
         .unwrap_or_default();
+    // Userspace ship toggle for the OTLP Traces arm — dual-ship by default.
+    let spans_otlp = section
+        .get("spans_otlp")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true);
 
     Some(EbpfSectionConfig {
         enabled,
         receiver_port,
         network_flows_enabled,
         network_cidrs,
+        spans_otlp,
         targets: parse_ebpf_targets(section.get("targets")),
         service_map: parse_service_map(section.get("service_map")),
         // config_hash drives kernel capture restart, so it must cover only
-        // capture-relevant fields. service_map is a userspace ship destination —
-        // provisioning it must NOT restart capture — so hash the section without it.
-        config_hash: compute_checksum(&section_without_service_map(section)),
+        // capture-relevant fields. service_map and spans_otlp are userspace ship
+        // concerns — toggling them must NOT restart capture — so hash the
+        // section without them.
+        config_hash: compute_checksum(&section_without_userspace_ships(section)),
     })
 }
 
-/// The ebpf section with the userspace-only `service_map` key removed, for the
-/// capture-restart checksum. Returns the section unchanged when the key is absent.
-fn section_without_service_map(section: &serde_json::Value) -> serde_json::Value {
+/// The ebpf section with the userspace-only ship keys (`service_map`,
+/// `spans_otlp`) removed, for the capture-restart checksum. Returns the
+/// section unchanged when neither key is present.
+fn section_without_userspace_ships(section: &serde_json::Value) -> serde_json::Value {
     match section.as_object() {
-        Some(map) if map.contains_key("service_map") => {
+        Some(map) if map.contains_key("service_map") || map.contains_key("spans_otlp") => {
             let mut trimmed = map.clone();
             trimmed.remove("service_map");
+            trimmed.remove("spans_otlp");
             serde_json::Value::Object(trimmed)
         }
         _ => section.clone(),
@@ -254,6 +267,37 @@ mod tests {
         .unwrap();
         assert_eq!(base, with_map.config_hash);
         assert!(with_map.service_map.is_some());
+    }
+
+    #[test]
+    fn spans_otlp_defaults_on_and_parses_explicit_values() {
+        let defaulted = ebpf_section(&unified(json!({ "ebpf": { "enabled": true } }))).unwrap();
+        assert!(defaulted.spans_otlp, "an absent key means dual-ship on");
+
+        let off = ebpf_section(&unified(json!({
+            "ebpf": { "enabled": true, "spans_otlp": false }
+        })))
+        .unwrap();
+        assert!(!off.spans_otlp);
+
+        let on = ebpf_section(&unified(json!({
+            "ebpf": { "enabled": true, "spans_otlp": true }
+        })))
+        .unwrap();
+        assert!(on.spans_otlp);
+    }
+
+    #[test]
+    fn spans_otlp_does_not_change_the_capture_config_hash() {
+        // Toggling the userspace OTLP arm must not restart kernel capture.
+        let base = ebpf_section(&unified(json!({ "ebpf": { "enabled": true } })))
+            .unwrap()
+            .config_hash;
+        let toggled = ebpf_section(&unified(json!({
+            "ebpf": { "enabled": true, "spans_otlp": false }
+        })))
+        .unwrap();
+        assert_eq!(base, toggled.config_hash);
     }
 
     #[test]

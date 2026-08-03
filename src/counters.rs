@@ -91,6 +91,8 @@ pub struct AgentCounters {
     pub samples_pending: AtomicU32,
     pub samples_completed: AtomicU32,
     pub entries_overflowed: AtomicU64,
+    pub spans_built: AtomicU64,
+    pub spans_ship_failed: AtomicU64,
     error_window: ErrorWindow,
 }
 
@@ -104,6 +106,8 @@ impl AgentCounters {
             samples_pending: AtomicU32::new(0),
             samples_completed: AtomicU32::new(0),
             entries_overflowed: AtomicU64::new(0),
+            spans_built: AtomicU64::new(0),
+            spans_ship_failed: AtomicU64::new(0),
             error_window: ErrorWindow::new(),
         })
     }
@@ -138,6 +142,14 @@ impl AgentCounters {
         self.samples_completed.fetch_add(1, Ordering::Relaxed);
     }
 
+    pub fn add_spans_built(&self, n: u64) {
+        self.spans_built.fetch_add(n, Ordering::Relaxed);
+    }
+
+    pub fn increment_spans_ship_failed(&self) {
+        self.spans_ship_failed.fetch_add(1, Ordering::Relaxed);
+    }
+
     pub fn snapshot(&self) -> CountersSnapshot {
         CountersSnapshot {
             bytes_sent: self.bytes_sent.load(Ordering::Relaxed),
@@ -146,6 +158,8 @@ impl AgentCounters {
             streams_active: self.streams_active.load(Ordering::Relaxed),
             samples_pending: self.samples_pending.load(Ordering::Relaxed),
             samples_completed: self.samples_completed.load(Ordering::Relaxed),
+            spans_built: self.spans_built.load(Ordering::Relaxed),
+            spans_ship_failed: self.spans_ship_failed.load(Ordering::Relaxed),
         }
     }
 }
@@ -159,6 +173,8 @@ pub struct CountersSnapshot {
     pub streams_active: u32,
     pub samples_pending: u32,
     pub samples_completed: u32,
+    pub spans_built: u64,
+    pub spans_ship_failed: u64,
 }
 
 #[cfg(test)]
@@ -189,6 +205,18 @@ mod tests {
         assert_eq!(snap.streams_active, 3);
         assert_eq!(snap.samples_completed, 1);
         assert_eq!(snap.samples_pending, 0);
+    }
+
+    #[test]
+    fn otlp_span_counters_increment_and_snapshot() {
+        let counters = AgentCounters::new();
+        counters.add_spans_built(3);
+        counters.add_spans_built(2);
+        counters.increment_spans_ship_failed();
+
+        let snap = counters.snapshot();
+        assert_eq!(snap.spans_built, 5);
+        assert_eq!(snap.spans_ship_failed, 1);
     }
 
     #[test]

@@ -464,8 +464,13 @@ pub async fn run_with_counters(
                 );
 
                 flush_flows(&mut pending_flows, &deliveries);
-                // Dual-ship defaults on; the config knob lands with the counters.
-                flush_spans(&mut pending_spans, &deliveries, true, identity);
+                flush_spans(
+                    &mut pending_spans,
+                    &deliveries,
+                    section.spans_otlp,
+                    identity,
+                    &counters,
+                );
                 flush_red(&mut l7_red, &deliveries);
                 let edge_window_end_ms = unix_epoch_millis_i64();
                 flush_edges(
@@ -1652,6 +1657,7 @@ fn flush_spans(
     deliveries: &HashMap<String, TargetDelivery>,
     spans_otlp: bool,
     identity: &crate::identity::AgentIdentity,
+    counters: &Arc<AgentCounters>,
 ) {
     let host = identity.current();
     for (service, entries) in pending.drain() {
@@ -1704,8 +1710,10 @@ fn flush_spans(
                     Err(e) => warn!(service, error = %e, "eBPF L7: OTLP span render failed"),
                 }
             }
+            counters.add_spans_built(spans_json.len() as u64);
             let otlp_shipper = shipper.clone();
             let otlp_service = service.clone();
+            let otlp_counters = counters.clone();
             tokio::spawn(async move {
                 match otlp_shipper.encode_trace_json_batch(spans_json) {
                     Ok((encoded, count)) => match otlp_shipper.send_with_retry(&encoded).await {
@@ -1714,11 +1722,14 @@ fn flush_spans(
                             spans = count,
                             "eBPF L7: shipped OTLP span batch"
                         ),
-                        Err(e) => warn!(
-                            service = otlp_service,
-                            error = %e,
-                            "eBPF L7: OTLP span batch ship failed (best-effort)"
-                        ),
+                        Err(e) => {
+                            otlp_counters.increment_spans_ship_failed();
+                            warn!(
+                                service = otlp_service,
+                                error = %e,
+                                "eBPF L7: OTLP span batch ship failed (best-effort)"
+                            );
+                        }
                     },
                     Err(e) => warn!(
                         service = otlp_service,
