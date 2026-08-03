@@ -18,7 +18,6 @@ pub struct KtimeCalibration {
 
 impl KtimeCalibration {
     /// Build from an already-known offset (tests and re-sampling).
-    #[allow(dead_code)] // wired into capture.rs later in this slice
     pub fn from_offset_ns(offset_ns: i64) -> Self {
         Self { offset_ns }
     }
@@ -27,7 +26,6 @@ impl KtimeCalibration {
     /// "the kernel did not stamp" (synthetic tests, old BPF objects) and
     /// returns `None` — the caller falls back to wall-clock now, never to a
     /// garbage timestamp. Out-of-range stamps or sums fall back the same way.
-    #[allow(dead_code)] // wired into capture.rs later in this slice
     pub fn convert(&self, observed_ktime_ns: u64) -> Option<i64> {
         if observed_ktime_ns == 0 {
             return None; // unstamped — fall back, never fabricate
@@ -43,7 +41,6 @@ impl KtimeCalibration {
     /// keeps its previous calibration. Linux-only: the conversion above
     /// stays cross-platform.
     #[cfg(target_os = "linux")]
-    #[allow(dead_code)] // wired into capture.rs later in this slice
     pub fn sample() -> Option<Self> {
         let mut pairs = [(0i64, 0i64); 3];
         for pair in &mut pairs {
