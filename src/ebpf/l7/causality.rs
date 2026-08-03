@@ -6,9 +6,8 @@
 //! produces, so local causality and W3C propagation flow through one
 //! adoption path: `ctx_trace_id`, `to_otlp_span`, both arms, identical ids.
 //!
-//! The `#[ignore]`d acceptance tests below are the standing definition of the
-//! matching contract. They are owned by the reviewer — implement until they
-//! pass with the `#[ignore]` attributes removed; any change to their
+//! The acceptance tests below are the standing definition of the matching
+//! contract. They are owned by the reviewer; any change to their
 //! expectations needs reviewer sign-off.
 
 use opentelemetry_proto::tonic::trace::v1::span::SpanKind;
@@ -37,9 +36,76 @@ pub struct LocalSpan {
 /// never participate, and servers are never modified.
 #[allow(dead_code)] // wired into the runner's flush path later in this slice
 pub fn assign_local_parents(entries: &mut [LocalSpan]) {
-    // Slice H1 stub: the acceptance tests below define the contract and stay
-    // #[ignore]d red until this is implemented.
-    let _ = entries;
+    for i in 0..entries.len() {
+        // Only bare CLIENT spans adopt: servers are never modified, a
+        // wire-extracted context is never overwritten, and UNSPECIFIED spans
+        // never participate.
+        if entries[i].kind != Some(SpanKind::Client) || entries[i].record.propagated.is_some() {
+            continue;
+        }
+        let pid = entries[i].ctx.pid;
+        let tid = entries[i].tid;
+        let (c_start, c_end) = window(&entries[i].record);
+
+        // The innermost containing server window on the same (pid, tid): the
+        // tightest window is the direct cause when several nest.
+        let mut best: Option<usize> = None;
+        for j in 0..entries.len() {
+            if j == i || entries[j].kind != Some(SpanKind::Server) {
+                continue;
+            }
+            if entries[j].ctx.pid != pid || entries[j].tid != tid {
+                continue;
+            }
+            let (s_start, s_end) = window(&entries[j].record);
+            // Full containment, inclusive at both ends — a window that
+            // straddles either bound is not causality, it's overlap.
+            if c_start < s_start || c_end > s_end {
+                continue;
+            }
+            match best {
+                None => best = Some(j),
+                Some(b) => {
+                    let (b_start, b_end) = window(&entries[b].record);
+                    if s_end - s_start < b_end - b_start {
+                        best = Some(j);
+                    }
+                }
+            }
+        }
+        let Some(j) = best else {
+            continue;
+        };
+
+        // Read the server's facts, then rewrite the client — adoption
+        // synthesizes the same PropagatedContext wire extraction produces,
+        // so one path carries local causality and W3C propagation alike.
+        let inherited = entries[j].record.propagated.as_ref();
+        let Ok(trace_id) = <[u8; 16]>::try_from(entries[j].ctx.trace_id.as_slice()) else {
+            continue; // malformed ids never parent
+        };
+        let Ok(parent_span_id) = <[u8; 8]>::try_from(entries[j].ctx.span_id.as_slice()) else {
+            continue;
+        };
+        let trace_flags = inherited.map(|p| p.trace_flags).unwrap_or(0x01);
+        let trace_state = inherited.map(|p| p.trace_state.clone()).unwrap_or_default();
+
+        entries[i].ctx.trace_id = trace_id.to_vec();
+        entries[i].record.propagated = Some(PropagatedContext {
+            trace_id,
+            parent_span_id,
+            trace_flags,
+            trace_state,
+        });
+    }
+}
+
+/// A record's observation window, inclusive at both ends.
+fn window(record: &L7Record) -> (i64, i64) {
+    (
+        record.start_unix_nano,
+        record.start_unix_nano + record.duration_nano,
+    )
 }
 
 #[cfg(test)]
@@ -93,7 +159,6 @@ mod tests {
     /// trace id on ctx (both arms), server's span id as the remote parent —
     /// while the server itself is untouched.
     #[test]
-    #[ignore = "Slice H1 acceptance — implement assign_local_parents, then remove this ignore"]
     fn nested_client_adopts_server_trace_and_parent() {
         let mut batch = vec![
             server(100, 500, 7, 0xaa, 0xa1),
@@ -121,7 +186,6 @@ mod tests {
     /// nested-valid pair keeps this from passing vacuously against a matcher
     /// that never assigns.
     #[test]
-    #[ignore = "Slice H1 acceptance — implement assign_local_parents, then remove this ignore"]
     fn no_parent_without_same_thread_and_full_nesting() {
         let mut sane = vec![
             server(100, 500, 7, 0xaa, 0xa1),
@@ -160,7 +224,6 @@ mod tests {
     /// Several containing windows on one thread: the innermost (tightest)
     /// server is the parent.
     #[test]
-    #[ignore = "Slice H1 acceptance — implement assign_local_parents, then remove this ignore"]
     fn innermost_containing_server_wins() {
         let mut batch = vec![
             server(0, 1_000, 7, 0xaa, 0xa1),
@@ -181,7 +244,6 @@ mod tests {
     /// trace_state — an SDK caller's trace continues through the zero-code
     /// server INTO its downstream calls.
     #[test]
-    #[ignore = "Slice H1 acceptance — implement assign_local_parents, then remove this ignore"]
     fn propagated_server_extends_its_wire_trace_to_nested_clients() {
         let mut srv = server(100, 500, 7, 0x4b, 0xa1);
         srv.record.propagated = Some(PropagatedContext {
@@ -206,7 +268,6 @@ mod tests {
     /// causality must never clobber real propagation. The valid pair first,
     /// so a matcher that never assigns fails here instead of passing.
     #[test]
-    #[ignore = "Slice H1 acceptance — implement assign_local_parents, then remove this ignore"]
     fn wire_extracted_context_is_never_overwritten() {
         let mut sane = vec![
             server(100, 500, 7, 0xaa, 0xa1),
