@@ -247,6 +247,8 @@ pub(crate) fn agent_metrics_to_map(
         ("errors_last_hour", errors_last_hour as f64),
         ("spans_built", counters.spans_built as f64),
         ("spans_ship_failed", counters.spans_ship_failed as f64),
+        ("spans_propagated", counters.spans_propagated as f64),
+        ("spans_minted", counters.spans_minted as f64),
     ]
     .into_iter()
     .map(|(key, value)| (format!("agent_{key}"), value))
@@ -523,11 +525,13 @@ mod tests {
             samples_completed: 4,
             spans_built: 6,
             spans_ship_failed: 1,
+            spans_propagated: 2,
+            spans_minted: 9,
         };
 
         let map = agent_metrics_to_map(&counters, 7, 12.5, 64, 300);
 
-        assert_eq!(map.len(), 11);
+        assert_eq!(map.len(), 13);
         assert!(map.keys().all(|k| k.starts_with("agent_")));
         assert_eq!(map["agent_cpu_percent"], 12.5);
         assert_eq!(map["agent_memory_mb"], 64.0);
@@ -536,6 +540,8 @@ mod tests {
         assert_eq!(map["agent_errors_last_hour"], 7.0);
         assert_eq!(map["agent_spans_built"], 6.0);
         assert_eq!(map["agent_spans_ship_failed"], 1.0);
+        assert_eq!(map["agent_spans_propagated"], 2.0);
+        assert_eq!(map["agent_spans_minted"], 9.0);
     }
 
     #[test]

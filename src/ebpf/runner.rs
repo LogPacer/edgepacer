@@ -1106,17 +1106,23 @@ pub async fn run_with_counters(
                     l7_red.observe(service, &record);
                     l7_edges.observe(service, peer.as_deref(), &record);
                     span_seq = span_seq.wrapping_add(1);
+                    // A valid propagated context replaces the minted trace
+                    // id — both span arms build from this same ctx, so they
+                    // stay identical. The counters record which origin won.
+                    let trace_id = ctx_trace_id(
+                        &record,
+                        mint_id(16, span_seq ^ ((pid as u64) << 32) ^ ts as u64),
+                    );
+                    if record.propagated.is_some() {
+                        counters.increment_spans_propagated();
+                    } else {
+                        counters.increment_spans_minted();
+                    }
                     let ctx = SpanContext {
                         service_name: service.to_string(),
                         pid,
                         cgroup_id: seg.cgroup_id,
-                        // A valid propagated context replaces the minted trace
-                        // id — both span arms build from this same ctx, so
-                        // they stay identical.
-                        trace_id: ctx_trace_id(
-                            &record,
-                            mint_id(16, span_seq ^ ((pid as u64) << 32) ^ ts as u64),
-                        ),
+                        trace_id,
                         span_id: mint_id(8, span_seq.wrapping_mul(0x100_0000_01b3) ^ pid as u64),
                         peer: peer.clone(),
                     };

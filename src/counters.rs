@@ -93,6 +93,8 @@ pub struct AgentCounters {
     pub entries_overflowed: AtomicU64,
     pub spans_built: AtomicU64,
     pub spans_ship_failed: AtomicU64,
+    pub spans_propagated: AtomicU64,
+    pub spans_minted: AtomicU64,
     error_window: ErrorWindow,
 }
 
@@ -108,6 +110,8 @@ impl AgentCounters {
             entries_overflowed: AtomicU64::new(0),
             spans_built: AtomicU64::new(0),
             spans_ship_failed: AtomicU64::new(0),
+            spans_propagated: AtomicU64::new(0),
+            spans_minted: AtomicU64::new(0),
             error_window: ErrorWindow::new(),
         })
     }
@@ -150,6 +154,14 @@ impl AgentCounters {
         self.spans_ship_failed.fetch_add(1, Ordering::Relaxed);
     }
 
+    pub fn increment_spans_propagated(&self) {
+        self.spans_propagated.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn increment_spans_minted(&self) {
+        self.spans_minted.fetch_add(1, Ordering::Relaxed);
+    }
+
     pub fn snapshot(&self) -> CountersSnapshot {
         CountersSnapshot {
             bytes_sent: self.bytes_sent.load(Ordering::Relaxed),
@@ -160,6 +172,8 @@ impl AgentCounters {
             samples_completed: self.samples_completed.load(Ordering::Relaxed),
             spans_built: self.spans_built.load(Ordering::Relaxed),
             spans_ship_failed: self.spans_ship_failed.load(Ordering::Relaxed),
+            spans_propagated: self.spans_propagated.load(Ordering::Relaxed),
+            spans_minted: self.spans_minted.load(Ordering::Relaxed),
         }
     }
 }
@@ -175,6 +189,8 @@ pub struct CountersSnapshot {
     pub samples_completed: u32,
     pub spans_built: u64,
     pub spans_ship_failed: u64,
+    pub spans_propagated: u64,
+    pub spans_minted: u64,
 }
 
 #[cfg(test)]
@@ -217,6 +233,18 @@ mod tests {
         let snap = counters.snapshot();
         assert_eq!(snap.spans_built, 5);
         assert_eq!(snap.spans_ship_failed, 1);
+    }
+
+    #[test]
+    fn span_id_origin_counters_increment_and_snapshot() {
+        let counters = AgentCounters::new();
+        counters.increment_spans_propagated();
+        counters.increment_spans_minted();
+        counters.increment_spans_minted();
+
+        let snap = counters.snapshot();
+        assert_eq!(snap.spans_propagated, 1);
+        assert_eq!(snap.spans_minted, 2);
     }
 
     #[test]
