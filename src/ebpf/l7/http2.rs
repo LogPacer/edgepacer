@@ -43,7 +43,8 @@ use std::collections::HashMap;
 
 use httlib_hpack::decoder::{Decoder, DecoderError};
 
-use super::{L7Parser, L7Record, Protocol};
+use super::propagation::parse_traceparent;
+use super::{L7Parser, L7Record, PropagatedContext, Protocol};
 
 /// The HTTP/2 client connection preface. The client sends exactly these 24 bytes
 /// before any frame (RFC 9113 §3.4).
@@ -140,6 +141,9 @@ struct PendingRequest {
     /// Service-map / classification span attributes (`http.host`, `http.target`).
     attributes: Vec<(String, String)>,
     start_unix_nano: i64,
+    /// W3C trace context extracted from the request HEADERS block (`None`
+    /// when absent or invalid). Request trailers never displace it.
+    propagated: Option<PropagatedContext>,
 }
 
 /// Response-side accumulation for one stream: the `:status` from the initial
@@ -174,6 +178,28 @@ struct OpenBlock {
 /// One decoded header field. `:status`/`:method`/`:path` are pseudo-headers; the
 /// rest are regular fields (only `grpc-status` matters to us).
 type DecodedHeaders = Vec<(Vec<u8>, Vec<u8>)>;
+
+/// W3C trace context from the decoded request headers: a validated
+/// `traceparent`, with the raw `tracestate` attached when present. HTTP/2
+/// field names are lowercase by contract (RFC 9113 §8.2), so the match is
+/// exact. An absent or invalid `traceparent` leaves the context `None` — a
+/// bad header must never poison the span, and `tracestate` only ever rides
+/// a valid one.
+fn propagated_context(headers: &DecodedHeaders) -> Option<PropagatedContext> {
+    let mut ctx = headers
+        .iter()
+        .find(|(name, _)| name == b"traceparent")
+        .and_then(|(_, value)| std::str::from_utf8(value).ok())
+        .and_then(|value| parse_traceparent(value.trim()))?;
+    if let Some(state) = headers
+        .iter()
+        .find(|(name, _)| name == b"tracestate")
+        .and_then(|(_, value)| std::str::from_utf8(value).ok())
+    {
+        ctx.trace_state = state.trim().to_string();
+    }
+    Some(ctx)
+}
 
 /// Bounds-check that an HPACK block is fully framed before it reaches the
 /// decoder. `httlib-hpack` 0.1.3 reads past the end of a *truncated* block in
@@ -535,7 +561,8 @@ impl Http2Parser {
             }
         }
         // Trailers on the request side carry no pseudo-headers; ignore blocks
-        // without :method (they don't open a new logical request).
+        // without :method (they don't open a new logical request — and never
+        // displace the HEADERS block's trace context).
         let (Some(method), Some(path)) = (method, path) else {
             return;
         };
@@ -552,6 +579,7 @@ impl Http2Parser {
                     operation: format!("{method} {path}"),
                     attributes,
                     start_unix_nano: ts,
+                    propagated: propagated_context(headers),
                 },
             );
         }
@@ -610,7 +638,7 @@ impl Http2Parser {
             error: status >= 500 || grpc_error,
             start_unix_nano: req.start_unix_nano,
             duration_nano: ts.saturating_sub(req.start_unix_nano).max(0),
-            propagated: None,
+            propagated: req.propagated,
         });
     }
 }
@@ -1097,6 +1125,142 @@ mod tests {
         );
         assert!(parser.take_records().is_empty());
         assert!(!parser.is_dead());
+    }
+
+    // --- W3C trace-context extraction --------------------------------------
+
+    const TRACEPARENT: &str = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01";
+    const TRACE_ID: [u8; 16] = [
+        0x4b, 0xf9, 0x2f, 0x35, 0x77, 0xb3, 0x4d, 0xa6, 0xa3, 0xce, 0x92, 0x9d, 0x0e, 0x0e, 0x47,
+        0x36,
+    ];
+
+    /// Drive one request block + one `:status 200` response through the
+    /// parser and return the single completed record.
+    fn record_for_request_block(req_block: &[u8]) -> L7Record {
+        let mut parser = Http2Parser::new();
+        let mut inbound = preface();
+        inbound.extend(frame(
+            FRAME_HEADERS,
+            FLAG_END_HEADERS | FLAG_END_STREAM,
+            1,
+            req_block,
+        ));
+        parser.on_inbound(&inbound, 0);
+
+        let mut renc = Encoder::default();
+        parser.on_outbound(
+            &frame(
+                FRAME_HEADERS,
+                FLAG_END_HEADERS | FLAG_END_STREAM,
+                1,
+                &hpack(&[(b":status", b"200")], &mut renc),
+            ),
+            1,
+        );
+        let recs = parser.take_records();
+        assert_eq!(recs.len(), 1);
+        assert!(!parser.is_dead());
+        recs.into_iter().next().unwrap()
+    }
+
+    #[test]
+    fn traceparent_in_request_headers_yields_propagated_context() {
+        // A gRPC-shaped request block: extraction covers gRPC-over-h2 by
+        // construction.
+        let mut enc = Encoder::default();
+        let req = hpack(
+            &[
+                (b":method", b"POST"),
+                (b":path", b"/pkg.Svc/Method"),
+                (b"traceparent", TRACEPARENT.as_bytes()),
+                (b"tracestate", b"vendor=opaque"),
+            ],
+            &mut enc,
+        );
+        let rec = record_for_request_block(&req);
+        let ctx = rec
+            .propagated
+            .as_ref()
+            .expect("a valid traceparent attaches the context");
+        assert_eq!(ctx.trace_id, TRACE_ID);
+        assert_eq!(
+            ctx.parent_span_id,
+            [0x00, 0xf0, 0x67, 0xaa, 0x0b, 0xa9, 0x02, 0xb7]
+        );
+        assert_eq!(ctx.trace_state, "vendor=opaque");
+    }
+
+    #[test]
+    fn invalid_or_absent_traceparent_leaves_propagated_none() {
+        // Invalid header (uppercase hex): rejected by validation, and the
+        // tracestate beside it must NOT ride along on its own.
+        let mut enc = Encoder::default();
+        let invalid = hpack(
+            &[
+                (b":method", b"GET"),
+                (b":path", b"/x"),
+                (
+                    b"traceparent",
+                    b"00-4BF92F3577B34DA6A3CE929D0E0E4736-00f067aa0ba902b7-01",
+                ),
+                (b"tracestate", b"vendor=opaque"),
+            ],
+            &mut enc,
+        );
+        assert!(record_for_request_block(&invalid).propagated.is_none());
+
+        // Absent header: minted-id path, no context.
+        let mut enc = Encoder::default();
+        let absent = hpack(&[(b":method", b"GET"), (b":path", b"/x")], &mut enc);
+        assert!(record_for_request_block(&absent).propagated.is_none());
+    }
+
+    #[test]
+    fn request_trailers_do_not_displace_the_headers_block_context() {
+        let mut enc = Encoder::default();
+        let mut parser = Http2Parser::new();
+
+        let mut inbound = preface();
+        let req = hpack(
+            &[
+                (b":method", b"POST"),
+                (b":path", b"/upload"),
+                (b"traceparent", TRACEPARENT.as_bytes()),
+            ],
+            &mut enc,
+        );
+        // No END_STREAM: a DATA frame + request trailers follow.
+        inbound.extend(frame(FRAME_HEADERS, FLAG_END_HEADERS, 1, &req));
+        inbound.extend(frame(FRAME_DATA, 0, 1, b"body"));
+        // Trailers carry no :method, so the block is ignored — it must not
+        // displace the context the request HEADERS block carried.
+        let trailer = hpack(&[(b"x-checksum", b"ok")], &mut enc);
+        inbound.extend(frame(
+            FRAME_HEADERS,
+            FLAG_END_HEADERS | FLAG_END_STREAM,
+            1,
+            &trailer,
+        ));
+        parser.on_inbound(&inbound, 0);
+
+        let mut renc = Encoder::default();
+        parser.on_outbound(
+            &frame(
+                FRAME_HEADERS,
+                FLAG_END_HEADERS | FLAG_END_STREAM,
+                1,
+                &hpack(&[(b":status", b"200")], &mut renc),
+            ),
+            1,
+        );
+        let recs = parser.take_records();
+        assert_eq!(recs.len(), 1);
+        assert_eq!(
+            recs[0].propagated.as_ref().map(|c| c.trace_id),
+            Some(TRACE_ID),
+            "trailers must not displace the HEADERS-block context"
+        );
     }
 
     // --- hostile / truncated HPACK (never-panic) ---------------------------
