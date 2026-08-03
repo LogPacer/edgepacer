@@ -329,4 +329,51 @@ mod tests {
             "an unresolved peer must omit the attribute entirely"
         );
     }
+
+    /// Slice 2 acceptance (reviewer-owned): a record carrying a propagated
+    /// context yields a span whose `parent_span_id` and `trace_state` come
+    /// from it — while a record without one keeps today's exact root-span
+    /// shape. Both halves in one test so neither can pass vacuously. The
+    /// span's `trace_id` intentionally stays `ctx.trace_id`: the runner
+    /// adopts the propagated trace id where it builds the context, so BOTH
+    /// arms carry it identically — `to_otlp_span` must not second-guess ctx.
+    #[test]
+    #[ignore = "Slice 2 acceptance — implement propagated adoption in to_otlp_span, then remove this ignore"]
+    fn propagated_context_sets_parent_and_trace_state_and_absence_changes_nothing() {
+        let propagated = crate::ebpf::l7::PropagatedContext {
+            trace_id: [0x4b; 16],
+            parent_span_id: [0xf0; 8],
+            trace_flags: 0x01,
+            trace_state: "vendor=opaque".to_string(),
+        };
+        let with = L7Record {
+            propagated: Some(propagated),
+            ..record()
+        };
+        let span = to_otlp_span(&with, &ctx(), Some(SpanKind::Server));
+        assert_eq!(
+            span.parent_span_id,
+            vec![0xf0; 8],
+            "propagated parent becomes the span's remote parent"
+        );
+        assert_eq!(
+            span.trace_state, "vendor=opaque",
+            "raw tracestate passes through onto the span"
+        );
+        assert_eq!(
+            span.trace_id,
+            ctx().trace_id,
+            "trace id stays ctx-owned — the runner adopts it for both arms"
+        );
+
+        let without = to_otlp_span(&record(), &ctx(), Some(SpanKind::Server));
+        assert!(
+            without.parent_span_id.is_empty(),
+            "no propagation → still a root span"
+        );
+        assert!(
+            without.trace_state.is_empty(),
+            "no propagation → no trace_state"
+        );
+    }
 }
