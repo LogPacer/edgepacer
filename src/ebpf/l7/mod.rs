@@ -26,6 +26,7 @@ mod mysql;
 mod nats;
 mod otlp;
 mod postgres;
+mod propagation;
 mod pulsar;
 mod red;
 mod redis;

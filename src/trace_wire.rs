@@ -285,6 +285,40 @@ mod tests {
         assert_eq!(value["duration_ms"], json!(0));
     }
 
+    /// `trace_state` passthrough: rendered verbatim when the span carries one,
+    /// omitted entirely when empty. Both halves asserted so the omission half
+    /// can't pass vacuously against a renderer that never emits the field.
+    /// Reviewer-owned Slice 2 acceptance (additive field; logrelay stores span
+    /// JSON verbatim, so downstream is unaffected until it opts in).
+    #[test]
+    #[ignore = "Slice 2 acceptance — render trace_state in span_to_json_value, then remove this ignore"]
+    fn trace_state_renders_when_present_and_is_omitted_when_empty() {
+        let mut span = Span {
+            trace_id: vec![0x01; 16],
+            span_id: vec![0x02; 8],
+            name: "GET /x".into(),
+            kind: span::SpanKind::Server as i32,
+            start_time_unix_nano: 1_000_000,
+            end_time_unix_nano: 2_000_000,
+            trace_state: "vendor=opaque,other=1".into(),
+            ..Default::default()
+        };
+
+        let with_state = span_to_json_value(&span, "svc", &json!({}));
+        assert_eq!(
+            with_state["trace_state"],
+            json!("vendor=opaque,other=1"),
+            "non-empty tracestate passes through verbatim"
+        );
+
+        span.trace_state = String::new();
+        let without = span_to_json_value(&span, "svc", &json!({}));
+        assert!(
+            !without.as_object().unwrap().contains_key("trace_state"),
+            "empty tracestate omits the field (omit-if-empty contract)"
+        );
+    }
+
     #[test]
     fn anyvalue_mapping_covers_all_arms() {
         assert_eq!(anyvalue_to_json(None), Value::Null);
