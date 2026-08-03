@@ -96,6 +96,7 @@ pub struct AgentCounters {
     pub spans_propagated: AtomicU64,
     pub spans_minted: AtomicU64,
     pub spans_parented: AtomicU64,
+    pub spans_cross_linked: AtomicU64,
     error_window: ErrorWindow,
 }
 
@@ -114,6 +115,7 @@ impl AgentCounters {
             spans_propagated: AtomicU64::new(0),
             spans_minted: AtomicU64::new(0),
             spans_parented: AtomicU64::new(0),
+            spans_cross_linked: AtomicU64::new(0),
             error_window: ErrorWindow::new(),
         })
     }
@@ -168,6 +170,10 @@ impl AgentCounters {
         self.spans_parented.fetch_add(n, Ordering::Relaxed);
     }
 
+    pub fn add_spans_cross_linked(&self, n: u64) {
+        self.spans_cross_linked.fetch_add(n, Ordering::Relaxed);
+    }
+
     pub fn snapshot(&self) -> CountersSnapshot {
         CountersSnapshot {
             bytes_sent: self.bytes_sent.load(Ordering::Relaxed),
@@ -181,6 +187,7 @@ impl AgentCounters {
             spans_propagated: self.spans_propagated.load(Ordering::Relaxed),
             spans_minted: self.spans_minted.load(Ordering::Relaxed),
             spans_parented: self.spans_parented.load(Ordering::Relaxed),
+            spans_cross_linked: self.spans_cross_linked.load(Ordering::Relaxed),
         }
     }
 }
@@ -199,6 +206,7 @@ pub struct CountersSnapshot {
     pub spans_propagated: u64,
     pub spans_minted: u64,
     pub spans_parented: u64,
+    pub spans_cross_linked: u64,
 }
 
 #[cfg(test)]
@@ -262,6 +270,15 @@ mod tests {
         counters.add_spans_parented(1);
 
         assert_eq!(counters.snapshot().spans_parented, 3);
+    }
+
+    #[test]
+    fn spans_cross_linked_counter_increments_and_snapshots() {
+        let counters = AgentCounters::new();
+        counters.add_spans_cross_linked(1);
+        counters.add_spans_cross_linked(2);
+
+        assert_eq!(counters.snapshot().spans_cross_linked, 3);
     }
 
     #[test]

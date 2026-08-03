@@ -29,9 +29,9 @@ use super::capture::{
 };
 use super::cgroup_resolver::{self, CgroupRouting};
 use super::l7::{
-    CapturedConnectionIdentity, CapturedSegment, ConnRegistry, EdgeAggregator, LocalSpan,
-    RedAggregator, SpanContext, assign_local_parents, ctx_trace_id, mint_id, to_otlp_span,
-    to_request_signal,
+    CapturedConnectionIdentity, CapturedSegment, ConnEndpoints, ConnRegistry, EdgeAggregator,
+    LocalSpan, RedAggregator, SpanContext, assign_batch_hierarchy, assign_local_parents,
+    ctx_trace_id, mint_id, to_otlp_span, to_request_signal,
 };
 use super::listener_snapshot;
 use super::listener_state::{DeltaOutcome, ListenerAssociation, ListenerSnapshot, ListenerState};
@@ -1096,6 +1096,13 @@ pub async fn run_with_counters(
                 let kind = span_kind_from_hint(hint.map(|h| h.client));
                 // The connection's peer endpoint — the service-map edge's other node.
                 let socket_peer = resolved.as_ref().map(|r| r.peer.clone());
+                // Both endpoints as the capturing process saw them — the
+                // cross-process linking key. None when resolution couldn't
+                // name the ends (TLS pseudo-fds): such spans never cross-link.
+                let conn = resolved.as_ref().map(|r| ConnEndpoints {
+                    local: r.local.clone(),
+                    remote: r.peer.clone(),
+                });
                 for record in l7_conns.on_segment_hinted(&seg, proto, flip) {
                     // Socket resolution fails for every cross-uid target (the
                     // /proc fd readlink is ptrace-gated) and for TLS pseudo-fds,
@@ -1139,10 +1146,7 @@ pub async fn run_with_counters(
                             ctx,
                             kind,
                             tid: seg.tid,
-                            // Cross-process linking needs both endpoints from
-                            // socket resolution — threaded in this slice; None
-                            // keeps same-host linking inert until then.
-                            conn: None,
+                            conn: conn.clone(),
                         });
                 }
             }
@@ -1653,6 +1657,15 @@ fn span_kind_from_hint(client: Option<bool>) -> Option<SpanKind> {
     })
 }
 
+/// Entries carrying a propagated context — the post-minus-pre count basis
+/// for hierarchy adoptions by origin.
+fn propagated_count(entries: &[LocalSpan]) -> usize {
+    entries
+        .iter()
+        .filter(|e| e.record.propagated.is_some())
+        .count()
+}
+
 /// Resource attributes stamped onto every eBPF-built OTLP span: who emitted
 /// the request (`service.name`), which host observed it (`host.name`, stamped
 /// by the flush caller the way `EdgeEntry::to_json` stamps `host`), and the
@@ -1671,7 +1684,9 @@ fn otlp_resource_attributes(service: &str, host: &str) -> serde_json::Value {
 /// `WireEbpfBatch` arm (`kind = REQUEST`) stays exactly as before, and the
 /// same records also render as OTLP spans through the Traces arm (gated by
 /// `spans_otlp`) — both arms build from the same entries, so a request's ids
-/// are identical in either arm. Best-effort, fire-and-forget. Drains
+/// are identical in either arm. Before either arm converts, the whole-flush
+/// batch gets one hierarchy pass (cross-process links span services, so a
+/// per-service pass cannot see them). Best-effort, fire-and-forget. Drains
 /// `pending`. Durable buffering (like log lines) is a refinement.
 fn flush_spans(
     pending: &mut HashMap<String, Vec<LocalSpan>>,
@@ -1681,7 +1696,33 @@ fn flush_spans(
     counters: &Arc<AgentCounters>,
 ) {
     let host = identity.current();
-    for (service, mut entries) in pending.drain() {
+
+    // Hierarchy runs once over the flattened whole-flush batch — cross-process
+    // links span services, so per-service passes cannot see them — then the
+    // entries regroup by service for shipping. The intra-process pass runs
+    // first for its counter split; assign_batch_hierarchy re-enters it as a
+    // no-op (adopted clients are skipped, servers are never modified) and
+    // adds the cross-process link + transitive refresh.
+    let mut flat: Vec<LocalSpan> = pending.drain().flat_map(|(_, spans)| spans).collect();
+    if flat.is_empty() {
+        return;
+    }
+    let pre = propagated_count(&flat);
+    assign_local_parents(&mut flat);
+    let after_intra = propagated_count(&flat);
+    counters.add_spans_parented((after_intra - pre) as u64);
+    assign_batch_hierarchy(&mut flat);
+    counters.add_spans_cross_linked((propagated_count(&flat) - after_intra) as u64);
+
+    let mut by_service: HashMap<String, Vec<LocalSpan>> = HashMap::new();
+    for entry in flat {
+        by_service
+            .entry(entry.ctx.service_name.clone())
+            .or_default()
+            .push(entry);
+    }
+
+    for (service, entries) in by_service {
         if entries.is_empty() {
             continue;
         }
@@ -1689,22 +1730,6 @@ fn flush_spans(
             continue; // no target for this service (raced with removal)
         };
         let shipper = delivery.flow_shipper.clone();
-
-        // Local hierarchy before either arm converts: CLIENT spans nested in
-        // a same-thread SERVER window adopt its trace, so BOTH arms ship the
-        // adopted ids through the existing adoption machinery — parenting
-        // synthesizes the same PropagatedContext wire extraction produces.
-        let wire_propagated = entries
-            .iter()
-            .filter(|e| e.record.propagated.is_some())
-            .count();
-        assign_local_parents(&mut entries);
-        let parented = entries
-            .iter()
-            .filter(|e| e.record.propagated.is_some())
-            .count()
-            - wire_propagated;
-        counters.add_spans_parented(parented as u64);
 
         // Arm 1: the legacy RequestSignal batch, unchanged.
         let signals: Vec<RequestSignal> = entries
