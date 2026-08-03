@@ -38,9 +38,10 @@ impl KtimeCalibration {
     /// Sample the offset afresh: three `(CLOCK_REALTIME, CLOCK_BOOTTIME)`
     /// pairs, medianed — one preempted read pair can skew a sample, but not
     /// the median of three. Returns `None` if a clock read fails; the caller
-    /// keeps its previous calibration. Linux-only: the conversion above
-    /// stays cross-platform.
-    #[cfg(target_os = "linux")]
+    /// keeps its previous calibration. Gated to the capture build (its only
+    /// consumer) — a plain-Linux build would flag it dead; the conversion
+    /// above stays cross-platform.
+    #[cfg(all(target_os = "linux", feature = "ebpf"))]
     pub fn sample() -> Option<Self> {
         let mut pairs = [(0i64, 0i64); 3];
         for pair in &mut pairs {
@@ -53,7 +54,7 @@ impl KtimeCalibration {
 }
 
 /// One clock read as nanos, validated like `runner::monotonic_ns`.
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", feature = "ebpf"))]
 fn clock_nanos(clock_id: libc::c_int) -> Option<i64> {
     let mut timestamp = std::mem::MaybeUninit::<libc::timespec>::uninit();
     // SAFETY: `timestamp` points to writable storage for one `timespec`; the
