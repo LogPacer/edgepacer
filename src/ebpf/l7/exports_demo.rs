@@ -1,14 +1,17 @@
 //! Golden-output demonstration: runs a representative request/response exchange
 //! per protocol through the REAL pipeline (`ConnRegistry` → `L7Record` →
-//! `RequestSignal` + RED) and prints the exact bytes that would be exported, so
-//! the actual on-the-wire output can be inspected. Test-only; also guards that
-//! every wired protocol still produces a span. Run with:
+//! `RequestSignal` + RED + OTLP span) and prints the exact bytes that would be
+//! exported, so the actual on-the-wire output can be inspected. Test-only;
+//! also guards that every wired protocol still produces a span — and that
+//! every protocol's OTLP render is a well-formed span object. Run with:
 //!   cargo test --lib l7::exports_demo -- --nocapture
 
 use super::{
     CapturedSegment, ConnRegistry, Direction, L7Record, RedAggregator, SpanContext, mint_id,
-    to_request_signal,
+    to_otlp_span, to_request_signal,
 };
+use crate::trace_wire::span_to_json_value;
+use opentelemetry_proto::tonic::trace::v1::span::SpanKind;
 
 const REQ_TS: i64 = 1_000_000_000; // 2001-09-09T01:46:40Z (unix nanos)
 const RESP_TS: i64 = 1_002_500_000; // +2.5 ms
@@ -37,7 +40,8 @@ fn preview(b: &[u8]) -> String {
 }
 
 /// Run a request (inbound) + response (outbound) through the pipeline, emit the
-/// RequestSignal + RED entry that would be exported, and append a report block.
+/// RequestSignal + RED entry + OTLP span that would be exported, and append a
+/// report block.
 fn demo(out: &mut String, name: &str, key: Option<&str>, req: &[u8], resp: &[u8], seed: u64) {
     let mut reg = ConnRegistry::new();
     let inbound = CapturedSegment {
@@ -134,6 +138,36 @@ fn demo(out: &mut String, name: &str, key: Option<&str>, req: &[u8], resp: &[u8]
     out.push_str(&format!("    cgroup_id       = {}\n", signal.cgroup_id));
     out.push_str(&format!("    attributes      = {:?}\n", signal.attributes));
     out.push_str(&format!("  RED metric entry  : {red_json}\n"));
+
+    // The same record through the OTLP Traces arm. Kind follows the demo's
+    // hinting the way the runner derives it: hinted no-flip → SERVER,
+    // unhinted → UNSPECIFIED.
+    let kind = key.map(|_| SpanKind::Server);
+    let span = to_otlp_span(&record, &ctx, kind);
+    let span_json = span_to_json_value(
+        &span,
+        "checkout",
+        &serde_json::json!({ "service.name": "checkout" }),
+    );
+    // Wire roundtrip guard: every protocol must yield a JSON object carrying
+    // the standing identity fields.
+    let wire = serde_json::to_vec(&span_json)
+        .unwrap_or_else(|e| panic!("{name}: OTLP span JSON must serialize ({e})"));
+    let parsed: serde_json::Value = serde_json::from_slice(&wire)
+        .unwrap_or_else(|e| panic!("{name}: OTLP span wire bytes must parse as JSON ({e})"));
+    let object = parsed
+        .as_object()
+        .unwrap_or_else(|| panic!("{name}: OTLP span JSON must be an object"));
+    for field in ["trace_id", "span_id", "name"] {
+        assert!(
+            object
+                .get(field)
+                .and_then(|v| v.as_str())
+                .is_some_and(|s| !s.is_empty()),
+            "{name}: OTLP span JSON must carry a non-empty {field}"
+        );
+    }
+    out.push_str(&format!("  OTLP span (Traces)  : {span_json}\n"));
 }
 
 // ── protocol byte builders (mirroring each parser's own test construction) ──────
