@@ -12,6 +12,7 @@
 mod amqp;
 mod amqp1;
 mod cassandra;
+mod causality;
 mod clickhouse;
 mod conn;
 mod dns;
