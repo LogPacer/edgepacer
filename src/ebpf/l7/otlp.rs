@@ -3,15 +3,18 @@
 //! (the `Traces` arm). Successor to the `RequestSignal` producer in `span.rs`,
 //! dual-shipped alongside it until that arm is retired.
 //!
-//! The `#[ignore]`d acceptance tests below are the standing definition of
-//! "near-native fidelity": field-set parity with an SDK-built span rendered
-//! through the same serializer. They are owned by the reviewer — implement
-//! until they pass with the `#[ignore]` attributes removed; any change to
-//! their expectations needs reviewer sign-off.
+//! The acceptance tests below are the standing definition of "near-native
+//! fidelity": field-set parity with an SDK-built span rendered through the
+//! same serializer. They are owned by the reviewer; any change to their
+//! expectations needs reviewer sign-off.
 
-use opentelemetry_proto::tonic::trace::v1::{Span, span::SpanKind};
+use opentelemetry_proto::tonic::common::v1::{
+    AnyValue, KeyValue, any_value::Value as AnyValueKind,
+};
+use opentelemetry_proto::tonic::trace::v1::{Span, Status, span::SpanKind, status::StatusCode};
 
 use super::L7Record;
+use super::Protocol;
 use super::span::SpanContext;
 
 /// Build an OTLP `Span` from a parsed record + its context.
@@ -23,17 +26,70 @@ use super::span::SpanContext;
 /// must render as `UNSPECIFIED`, never as a guessed `SERVER`.
 #[allow(dead_code)] // wired into the runner's flush path later in Slice 1 (dual-ship)
 pub fn to_otlp_span(record: &L7Record, ctx: &SpanContext, kind: Option<SpanKind>) -> Span {
-    // Slice 1 stub: identity + timing only, so the acceptance tests compile
-    // and fail. Kind, status, and the attribute set are the work.
-    let _ = kind;
     Span {
         trace_id: ctx.trace_id.clone(),
         span_id: ctx.span_id.clone(),
         name: record.operation.clone(),
+        // Unhinted flows stay UNSPECIFIED — the kind is never guessed.
+        kind: kind.unwrap_or(SpanKind::Unspecified) as i32,
         start_time_unix_nano: record.start_unix_nano as u64,
         end_time_unix_nano: (record.start_unix_nano + record.duration_nano) as u64,
+        attributes: span_attributes(record, ctx),
+        // Errors surface as an ERROR status; success leaves status UNSET —
+        // the contract here is UNSET-or-ERROR, never OK.
+        status: record.error.then(|| Status {
+            code: StatusCode::Error as i32,
+            message: String::new(),
+        }),
         ..Default::default()
     }
+}
+
+/// Typed span attributes: the service-map facts the bare fields don't carry
+/// (the wire `protocol` label and `peer.address`, the same facts
+/// `span::to_request_signal` ships), the parser's enrichment pairs as
+/// strings, plus the HTTP status code as a typed int — http family only;
+/// other protocols get no status-code attribute.
+fn span_attributes(record: &L7Record, ctx: &SpanContext) -> Vec<KeyValue> {
+    let mut attributes = Vec::with_capacity(record.attributes.len() + 3);
+    attributes.push(KeyValue {
+        key: "protocol".to_string(),
+        key_strindex: 0,
+        value: Some(AnyValue {
+            value: Some(AnyValueKind::StringValue(
+                record.protocol.name().to_string(),
+            )),
+        }),
+    });
+    if let Some(peer) = &ctx.peer {
+        attributes.push(KeyValue {
+            key: "peer.address".to_string(),
+            key_strindex: 0,
+            value: Some(AnyValue {
+                value: Some(AnyValueKind::StringValue(peer.clone())),
+            }),
+        });
+    }
+    // Protocol-specific enrichment the parser attached (HTTP host, llm.model, …).
+    for (key, value) in &record.attributes {
+        attributes.push(KeyValue {
+            key: key.clone(),
+            key_strindex: 0,
+            value: Some(AnyValue {
+                value: Some(AnyValueKind::StringValue(value.clone())),
+            }),
+        });
+    }
+    if matches!(record.protocol, Protocol::Http1 | Protocol::Http2) {
+        attributes.push(KeyValue {
+            key: "http.response.status_code".to_string(),
+            key_strindex: 0,
+            value: Some(AnyValue {
+                value: Some(AnyValueKind::IntValue(i64::from(record.status_code))),
+            }),
+        });
+    }
+    attributes
 }
 
 #[cfg(test)]
@@ -124,7 +180,6 @@ mod tests {
     /// §3 acceptance: same top-level field set, same kind/status encodings,
     /// same attribute object (typed values included) as the SDK twin.
     #[test]
-    #[ignore = "Slice 1 acceptance — implement to_otlp_span, then remove this ignore"]
     fn parity_with_sdk_built_span_at_the_ingest_json() {
         let ebpf = span_to_json_value(
             &to_otlp_span(&record(), &ctx(), Some(SpanKind::Server)),
@@ -155,7 +210,6 @@ mod tests {
     /// Kind is tri-state and never guessed: flip → CLIENT, hinted no-flip →
     /// SERVER, unhinted → UNSPECIFIED.
     #[test]
-    #[ignore = "Slice 1 acceptance — implement to_otlp_span, then remove this ignore"]
     fn kind_is_tri_state_and_never_guessed() {
         for (kind, expected) in [
             (Some(SpanKind::Client), "CLIENT"),
@@ -175,7 +229,6 @@ mod tests {
     /// error → status present. Both halves asserted so the omission half can't
     /// pass vacuously against a builder that never sets status at all.
     #[test]
-    #[ignore = "Slice 1 acceptance — implement to_otlp_span, then remove this ignore"]
     fn status_present_on_error_and_omitted_entirely_on_success() {
         let ok = L7Record {
             status_code: 200,
@@ -201,6 +254,79 @@ mod tests {
             err_value["status"]["code"],
             json!("ERROR"),
             "record.error must surface as status ERROR"
+        );
+    }
+
+    /// The typed status code is http-family enrichment: Http1 and Http2 carry
+    /// it as an int, every other protocol's span omits it in this slice.
+    #[test]
+    fn status_code_attribute_is_http_family_only_and_typed() {
+        for protocol in [Protocol::Http1, Protocol::Http2] {
+            let span = to_otlp_span(
+                &L7Record {
+                    protocol,
+                    ..record()
+                },
+                &ctx(),
+                Some(SpanKind::Server),
+            );
+            let kv = span
+                .attributes
+                .iter()
+                .find(|kv| kv.key == "http.response.status_code")
+                .expect("http family carries the status code attribute");
+            assert_eq!(
+                kv.value.as_ref().and_then(|v| v.value.as_ref()),
+                Some(&AnyValueKind::IntValue(503)),
+                "the status code ships as a typed int, not a string"
+            );
+        }
+
+        let span = to_otlp_span(
+            &L7Record {
+                protocol: Protocol::Postgres,
+                ..record()
+            },
+            &ctx(),
+            Some(SpanKind::Server),
+        );
+        assert!(
+            span.attributes
+                .iter()
+                .all(|kv| kv.key != "http.response.status_code"),
+            "non-http records get no status-code attribute in this slice"
+        );
+    }
+
+    /// Attribute order is ingest-shaped: service-map facts first, parser
+    /// enrichment in record order, typed status code last.
+    #[test]
+    fn attribute_order_is_protocol_peer_enrichment_then_status_code() {
+        let span = to_otlp_span(&record(), &ctx(), Some(SpanKind::Server));
+        let keys: Vec<&str> = span.attributes.iter().map(|kv| kv.key.as_str()).collect();
+        assert_eq!(
+            keys,
+            [
+                "protocol",
+                "peer.address",
+                "http.host",
+                "http.response.status_code",
+            ]
+        );
+    }
+
+    /// `peer.address` comes from the connection peer; when it couldn't be
+    /// resolved the attribute is omitted, not emitted empty.
+    #[test]
+    fn missing_peer_omits_peer_address_attribute() {
+        let no_peer = SpanContext {
+            peer: None,
+            ..ctx()
+        };
+        let span = to_otlp_span(&record(), &no_peer, None);
+        assert!(
+            span.attributes.iter().all(|kv| kv.key != "peer.address"),
+            "an unresolved peer must omit the attribute entirely"
         );
     }
 }
