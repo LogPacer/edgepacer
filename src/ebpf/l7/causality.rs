@@ -1,10 +1,14 @@
-//! Intra-process span hierarchy — tid-window causality. A CLIENT record whose
+//! Span hierarchy — intra-process tid-window causality and same-host
+//! cross-process endpoint linking. Intra-process: a CLIENT record whose
 //! window nests inside a SERVER record's window on the same (pid, tid) was
 //! caused by that request (thread-per-request runtimes; async runtimes
-//! degrade to today's flat behavior — never a guessed parent). Parenting is
-//! expressed by synthesizing the same [`PropagatedContext`] wire extraction
-//! produces, so local causality and W3C propagation flow through one
-//! adoption path: `ctx_trace_id`, `to_otlp_span`, both arms, identical ids.
+//! degrade to today's flat behavior — never a guessed parent).
+//! Cross-process: one agent seeing both ends of a same-host connection —
+//! the endpoints reverse exactly, so the callee's SERVER adopts the
+//! caller's CLIENT. Parenting is expressed by synthesizing the same
+//! [`PropagatedContext`] wire extraction produces, so local causality and
+//! W3C propagation flow through one adoption path: `ctx_trace_id`,
+//! `to_otlp_span`, both arms, identical ids.
 //!
 //! The acceptance tests below are the standing definition of the matching
 //! contract. They are owned by the reviewer; any change to their
@@ -134,10 +138,125 @@ fn window(record: &L7Record) -> (i64, i64) {
 /// is never overwritten and nothing is ever guessed.
 #[allow(dead_code)] // wired into the runner's flush path later in this slice
 pub fn assign_batch_hierarchy(entries: &mut [LocalSpan]) {
-    // Slice H2 stub: intra-process parenting already works; the cross-process
-    // link + transitive refresh are the work, pinned by the #[ignore]d
-    // acceptance tests below.
+    // Spans that arrived with wire-extracted context: every pass already
+    // refuses to overwrite them, and the transitive refresh must too.
+    let wire_derived: Vec<bool> = entries
+        .iter()
+        .map(|e| e.record.propagated.is_some())
+        .collect();
+
     assign_local_parents(entries);
+    link_cross_process(entries);
+    refresh_traces(entries, &wire_derived);
+}
+
+/// Same-host cross-process link: a SERVER span adopts the CLIENT span on the
+/// other end of the same connection — one agent, two monitored processes,
+/// endpoints exactly reversed. Deterministic or nothing: both ends must be
+/// resolved and reverse exactly, and the server's window must nest in the
+/// client's (the tightest containment when several — keep-alive requests
+/// multiplex one connection pair). Adoption synthesizes exactly like the
+/// intra-process pass; the client side is never modified.
+fn link_cross_process(entries: &mut [LocalSpan]) {
+    for i in 0..entries.len() {
+        if entries[i].kind != Some(SpanKind::Server) || entries[i].record.propagated.is_some() {
+            continue;
+        }
+        let Some(server_conn) = entries[i].conn.clone() else {
+            continue;
+        };
+        let (s_start, s_end) = window(&entries[i].record);
+
+        let mut best: Option<usize> = None;
+        for j in 0..entries.len() {
+            if j == i || entries[j].kind != Some(SpanKind::Client) {
+                continue;
+            }
+            let Some(client_conn) = &entries[j].conn else {
+                continue;
+            };
+            // Exact reversal: the same socket seen from each end.
+            if client_conn.local != server_conn.remote || client_conn.remote != server_conn.local {
+                continue;
+            }
+            let (c_start, c_end) = window(&entries[j].record);
+            if s_start < c_start || s_end > c_end {
+                continue; // not nested in the client's window
+            }
+            match best {
+                None => best = Some(j),
+                Some(b) => {
+                    let (b_start, b_end) = window(&entries[b].record);
+                    if c_end - c_start < b_end - b_start {
+                        best = Some(j);
+                    }
+                }
+            }
+        }
+        let Some(j) = best else {
+            continue;
+        };
+
+        let inherited = entries[j].record.propagated.as_ref();
+        let Ok(trace_id) = <[u8; 16]>::try_from(entries[j].ctx.trace_id.as_slice()) else {
+            continue; // malformed ids never parent
+        };
+        let Ok(parent_span_id) = <[u8; 8]>::try_from(entries[j].ctx.span_id.as_slice()) else {
+            continue;
+        };
+        let trace_flags = inherited.map(|p| p.trace_flags).unwrap_or(0x01);
+        let trace_state = inherited.map(|p| p.trace_state.clone()).unwrap_or_default();
+
+        entries[i].ctx.trace_id = trace_id.to_vec();
+        entries[i].record.propagated = Some(PropagatedContext {
+            trace_id,
+            parent_span_id,
+            trace_flags,
+            trace_state,
+        });
+    }
+}
+
+/// Follow parent span ids within the batch to a fixed point, so a chain
+/// adopted in stages (a span's parent adopting AFTER it did) reports one
+/// trace id end to end. Only spans adopted by this pass are refreshed —
+/// wire-extracted context is never touched.
+fn refresh_traces(entries: &mut [LocalSpan], wire_derived: &[bool]) {
+    loop {
+        let mut changed = false;
+        for i in 0..entries.len() {
+            if wire_derived[i] {
+                continue;
+            }
+            let Some(parent_span_id) = entries[i]
+                .record
+                .propagated
+                .as_ref()
+                .map(|p| p.parent_span_id.to_vec())
+            else {
+                continue;
+            };
+            let Some(parent_trace) = entries
+                .iter()
+                .find(|e| e.ctx.span_id == parent_span_id)
+                .map(|e| e.ctx.trace_id.clone())
+            else {
+                continue; // parent is outside this batch
+            };
+            if entries[i].ctx.trace_id != parent_trace {
+                if let Some(p) = entries[i].record.propagated.as_mut()
+                    && let Ok(trace_id) = <[u8; 16]>::try_from(parent_trace.as_slice())
+                {
+                    p.trace_id = trace_id;
+                }
+                entries[i].ctx.trace_id = parent_trace;
+                changed = true;
+            }
+        }
+        if !changed {
+            return;
+        }
+    }
 }
 
 #[cfg(test)]
@@ -341,7 +460,6 @@ mod tests {
     /// nested in A's CLIENT window) adopts A as its remote parent — both of
     /// B's arms carrying A's trace id.
     #[test]
-    #[ignore = "Slice H2 acceptance — implement cross-process linking in assign_batch_hierarchy, then remove this ignore"]
     fn same_host_pair_links_across_processes() {
         let mut a_cli = client(100, 500, 7, 0xaa, 0xa1);
         a_cli.conn = conn("127.0.0.1:51000", "127.0.0.1:8080");
@@ -370,7 +488,6 @@ mod tests {
     /// missing resolution, or a server window not nested in the client's all
     /// refuse to link. The leading valid pair keeps this self-controlling.
     #[test]
-    #[ignore = "Slice H2 acceptance — implement cross-process linking in assign_batch_hierarchy, then remove this ignore"]
     fn no_link_without_exact_endpoint_reversal_and_nesting() {
         let valid = |a_conn: Option<ConnEndpoints>,
                      b_conn: Option<ConnEndpoints>,
@@ -432,7 +549,6 @@ mod tests {
     /// — identical endpoints — and each server span pairs with the client
     /// span whose window contains it.
     #[test]
-    #[ignore = "Slice H2 acceptance — implement cross-process linking in assign_batch_hierarchy, then remove this ignore"]
     fn sequential_requests_on_one_connection_pair_by_containment() {
         let ab = conn("127.0.0.1:51000", "127.0.0.1:8080");
         let ba = conn("127.0.0.1:8080", "127.0.0.1:51000");
@@ -461,7 +577,6 @@ mod tests {
     /// B's SERVER (cross-process) → B's CLIENT (intra-process) — and every
     /// span reports the ONE wire trace id with parents chaining correctly.
     #[test]
-    #[ignore = "Slice H2 acceptance — implement cross-process linking in assign_batch_hierarchy, then remove this ignore"]
     fn full_chain_shares_one_wire_trace() {
         let wire_trace = [0x4b; 16];
         let mut a_srv = server(0, 1_000, 7, 0x4b, 0xa1);
