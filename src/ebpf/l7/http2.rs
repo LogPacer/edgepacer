@@ -610,6 +610,7 @@ impl Http2Parser {
             error: status >= 500 || grpc_error,
             start_unix_nano: req.start_unix_nano,
             duration_nano: ts.saturating_sub(req.start_unix_nano).max(0),
+            propagated: None,
         });
     }
 }

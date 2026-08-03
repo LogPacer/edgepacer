@@ -165,6 +165,7 @@ mod tests {
             start_unix_nano: 0,
             duration_nano,
             attributes: Vec::new(),
+            propagated: None,
         }
     }
 

@@ -161,6 +161,7 @@ impl Http1Conn {
                 error: status >= 500,
                 start_unix_nano: req.start_unix_nano,
                 duration_nano: ts.saturating_sub(req.start_unix_nano).max(0),
+                propagated: None,
             });
         }
     }

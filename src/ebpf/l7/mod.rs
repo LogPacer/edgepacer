@@ -41,6 +41,7 @@ pub(crate) use conn::CapturedConnectionIdentity;
 pub use conn::{CapturedSegment, ConnRegistry};
 pub use edge::EdgeAggregator;
 pub(crate) use otlp::to_otlp_span;
+pub use propagation::PropagatedContext;
 pub use red::RedAggregator;
 pub use span::{SpanContext, mint_id, to_request_signal};
 
@@ -134,6 +135,11 @@ pub struct L7Record {
     /// into the exported `RequestSignal.attributes`. Empty for parsers that encode
     /// everything in `operation`.
     pub attributes: Vec<(String, String)>,
+    /// Trace context extracted from the request's propagation headers —
+    /// `None` for protocols without propagation headers, requests lacking
+    /// them, and headers that failed validation. Only the http family
+    /// extracts; every other parser leaves this `None`.
+    pub propagated: Option<PropagatedContext>,
 }
 
 impl L7Record {
@@ -218,6 +224,7 @@ mod tests {
             start_unix_nano: 0,
             duration_nano: 0,
             attributes,
+            propagated: None,
         }
     }
 

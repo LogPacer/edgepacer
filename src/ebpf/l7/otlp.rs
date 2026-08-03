@@ -131,6 +131,7 @@ mod tests {
             error: true,
             start_unix_nano: 5_000_000_000,
             duration_nano: 250_000_000,
+            propagated: None,
         }
     }
 

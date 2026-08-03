@@ -94,6 +94,7 @@ mod tests {
             error: true,
             start_unix_nano: 1_000,
             duration_nano: 250,
+            propagated: None,
         }
     }
 
