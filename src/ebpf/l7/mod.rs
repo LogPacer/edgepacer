@@ -24,6 +24,7 @@ mod mongodb;
 mod mqtt;
 mod mysql;
 mod nats;
+mod otlp;
 mod postgres;
 mod pulsar;
 mod red;
