@@ -39,6 +39,7 @@ mod exports_demo;
 pub(crate) use conn::CapturedConnectionIdentity;
 pub use conn::{CapturedSegment, ConnRegistry};
 pub use edge::EdgeAggregator;
+pub(crate) use otlp::to_otlp_span;
 pub use red::RedAggregator;
 pub use span::{SpanContext, mint_id, to_request_signal};
 

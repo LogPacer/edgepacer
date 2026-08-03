@@ -24,7 +24,6 @@ use super::span::SpanContext;
 /// monitored process as the client, `Some(Server)` when a hint was present
 /// without a flip, and `None` for unhinted signature-detected flows — which
 /// must render as `UNSPECIFIED`, never as a guessed `SERVER`.
-#[allow(dead_code)] // wired into the runner's flush path later in Slice 1 (dual-ship)
 pub fn to_otlp_span(record: &L7Record, ctx: &SpanContext, kind: Option<SpanKind>) -> Span {
     Span {
         trace_id: ctx.trace_id.clone(),

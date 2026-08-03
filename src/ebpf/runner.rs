@@ -18,6 +18,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use logpacer_wire::{NetworkFlow, RequestSignal};
+use opentelemetry_proto::tonic::trace::v1::span::SpanKind;
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 use tracing::{debug, error, info, warn};
@@ -28,8 +29,8 @@ use super::capture::{
 };
 use super::cgroup_resolver::{self, CgroupRouting};
 use super::l7::{
-    CapturedConnectionIdentity, CapturedSegment, ConnRegistry, EdgeAggregator, RedAggregator,
-    SpanContext, mint_id, to_request_signal,
+    CapturedConnectionIdentity, CapturedSegment, ConnRegistry, EdgeAggregator, L7Record,
+    RedAggregator, SpanContext, mint_id, to_otlp_span, to_request_signal,
 };
 use super::listener_snapshot;
 use super::listener_state::{DeltaOutcome, ListenerAssociation, ListenerSnapshot, ListenerState};
@@ -208,7 +209,9 @@ pub async fn run_with_counters(
     // minting; cgroup enrichment, durable buffering, and real trace ids (vs. v1
     // spanlets) are refinements.
     let mut l7_conns = ConnRegistry::new();
-    let mut pending_spans: HashMap<String, Vec<RequestSignal>> = HashMap::new();
+    // Pre-conversion records + context + kind: both span arms build from the
+    // same entries at flush time so they share identical trace/span ids.
+    let mut pending_spans: HashMap<String, Vec<PendingSpan>> = HashMap::new();
     let mut l7_red = RedAggregator::new();
     // Service-map edges aggregated across ALL services on this host, shipped to
     // the one account-level graph repo (`section.service_map`), not per-target.
@@ -461,7 +464,8 @@ pub async fn run_with_counters(
                 );
 
                 flush_flows(&mut pending_flows, &deliveries);
-                flush_spans(&mut pending_spans, &deliveries);
+                // Dual-ship defaults on; the config knob lands with the counters.
+                flush_spans(&mut pending_spans, &deliveries, true, identity);
                 flush_red(&mut l7_red, &deliveries);
                 let edge_window_end_ms = unix_epoch_millis_i64();
                 flush_edges(
@@ -1077,10 +1081,12 @@ pub async fn run_with_counters(
                 let resolved = port_hints
                     .entry(seg.connection_identity())
                     .or_insert_with(|| socket_port::resolve(pid, seg.fd));
-                let (proto, flip) = match resolved.as_ref().and_then(|r| r.hint) {
+                let hint = resolved.as_ref().and_then(|r| r.hint);
+                let (proto, flip) = match hint {
                     Some(h) => (Some(h.protocol), h.client),
                     None => (None, false),
                 };
+                let kind = span_kind_from_hint(hint.map(|h| h.client));
                 // The connection's peer endpoint — the service-map edge's other node.
                 let socket_peer = resolved.as_ref().map(|r| r.peer.clone());
                 for record in l7_conns.on_segment_hinted(&seg, proto, flip) {
@@ -1106,7 +1112,7 @@ pub async fn run_with_counters(
                     pending_spans
                         .entry(service.to_string())
                         .or_default()
-                        .push(to_request_signal(&record, &ctx));
+                        .push((record, ctx, kind));
                 }
             }
 
@@ -1603,32 +1609,125 @@ fn flush_flows(
     }
 }
 
-/// Ship each service's accumulated L7 spans to its repo as a `WireEbpfBatch`
-/// (`kind = REQUEST`, best-effort, fire-and-forget). Drains `pending`. Durable
-/// buffering (like log lines) is a refinement.
+/// A pending L7 span awaiting flush: the parsed record + its context + the
+/// wiring layer's kind verdict. Both span arms convert from this at flush
+/// time so they share identical trace/span ids.
+type PendingSpan = (L7Record, SpanContext, Option<SpanKind>);
+
+/// The span kind from the port-hint verdict: a flip marks the monitored
+/// process as the client, an unflipped hint marks it as the server, and no
+/// hint leaves the kind unset — it is never guessed `SERVER`.
+fn span_kind_from_hint(client: Option<bool>) -> Option<SpanKind> {
+    client.map(|flip| {
+        if flip {
+            SpanKind::Client
+        } else {
+            SpanKind::Server
+        }
+    })
+}
+
+/// Resource attributes stamped onto every eBPF-built OTLP span: who emitted
+/// the request (`service.name`), which host observed it (`host.name`, stamped
+/// by the flush caller the way `EdgeEntry::to_json` stamps `host`), and the
+/// producer's provenance. Built once per service per flush.
+fn otlp_resource_attributes(service: &str, host: &str) -> serde_json::Value {
+    serde_json::json!({
+        "service.name": service,
+        "host.name": host,
+        "telemetry.sdk.name": "edgepacer",
+        "telemetry.sdk.version": crate::common::VERSION,
+        "edgepacer.capture": "ebpf-l7",
+    })
+}
+
+/// Ship each service's accumulated L7 spans to its repo. Dual-ship: the
+/// `WireEbpfBatch` arm (`kind = REQUEST`) stays exactly as before, and the
+/// same records also render as OTLP spans through the Traces arm (gated by
+/// `spans_otlp`) — both arms build from the same entries, so a request's ids
+/// are identical in either arm. Best-effort, fire-and-forget. Drains
+/// `pending`. Durable buffering (like log lines) is a refinement.
 fn flush_spans(
-    pending: &mut HashMap<String, Vec<RequestSignal>>,
+    pending: &mut HashMap<String, Vec<PendingSpan>>,
     deliveries: &HashMap<String, TargetDelivery>,
+    spans_otlp: bool,
+    identity: &crate::identity::AgentIdentity,
 ) {
-    for (service, spans) in pending.drain() {
-        if spans.is_empty() {
+    let host = identity.current();
+    for (service, entries) in pending.drain() {
+        if entries.is_empty() {
             continue;
         }
         let Some(delivery) = deliveries.get(&service) else {
             continue; // no target for this service (raced with removal)
         };
         let shipper = delivery.flow_shipper.clone();
+
+        // Arm 1: the legacy RequestSignal batch, unchanged.
+        let signals: Vec<RequestSignal> = entries
+            .iter()
+            .map(|(record, ctx, _kind)| to_request_signal(record, ctx))
+            .collect();
+        let legacy_shipper = shipper.clone();
+        let legacy_service = service.clone();
         tokio::spawn(async move {
-            match shipper.encode_request_signal_batch(spans) {
-                Ok((encoded, count)) => match shipper.send_with_retry(&encoded).await {
-                    Ok(_) => debug!(service, spans = count, "eBPF L7: shipped span batch"),
-                    Err(e) => {
-                        warn!(service, error = %e, "eBPF L7: span batch ship failed (best-effort)")
+            match legacy_shipper.encode_request_signal_batch(signals) {
+                Ok((encoded, count)) => match legacy_shipper.send_with_retry(&encoded).await {
+                    Ok(_) => {
+                        debug!(
+                            service = legacy_service,
+                            spans = count,
+                            "eBPF L7: shipped span batch"
+                        )
                     }
+                    Err(e) => warn!(
+                        service = legacy_service,
+                        error = %e,
+                        "eBPF L7: span batch ship failed (best-effort)"
+                    ),
                 },
-                Err(e) => warn!(service, error = %e, "eBPF L7: span batch encode failed"),
+                Err(e) => {
+                    warn!(service = legacy_service, error = %e, "eBPF L7: span batch encode failed")
+                }
             }
         });
+
+        // Arm 2: the same records as OTLP spans on the Traces arm.
+        if spans_otlp {
+            let resource_attrs = otlp_resource_attributes(&service, &host);
+            let mut spans_json: Vec<Vec<u8>> = Vec::with_capacity(entries.len());
+            for (record, ctx, kind) in &entries {
+                let span = to_otlp_span(record, ctx, *kind);
+                let value = crate::trace_wire::span_to_json_value(&span, &service, &resource_attrs);
+                match serde_json::to_vec(&value) {
+                    Ok(bytes) => spans_json.push(bytes),
+                    Err(e) => warn!(service, error = %e, "eBPF L7: OTLP span render failed"),
+                }
+            }
+            let otlp_shipper = shipper.clone();
+            let otlp_service = service.clone();
+            tokio::spawn(async move {
+                match otlp_shipper.encode_trace_json_batch(spans_json) {
+                    Ok((encoded, count)) => match otlp_shipper.send_with_retry(&encoded).await {
+                        Ok(_) => debug!(
+                            service = otlp_service,
+                            spans = count,
+                            "eBPF L7: shipped OTLP span batch"
+                        ),
+                        Err(e) => warn!(
+                            service = otlp_service,
+                            error = %e,
+                            "eBPF L7: OTLP span batch ship failed (best-effort)"
+                        ),
+                    },
+                    Err(e) => warn!(
+                        service = otlp_service,
+                        error = %e,
+                        "eBPF L7: OTLP span batch encode failed"
+                    ),
+                }
+            });
+        }
     }
 }
 
@@ -2350,5 +2449,47 @@ mod tests {
 
         assert_eq!(stable.published_counts, vec![2]);
         assert_eq!(*fenced_counts.borrow(), vec![vec![1], vec![2]]);
+    }
+
+    #[test]
+    fn span_kind_from_hint_is_tri_state_and_never_guessed() {
+        // (port-hint client verdict, expected kind). The no-hint row is the
+        // contract: an unhinted flow must stay UNSPECIFIED, not become Server.
+        for (client, expected) in [
+            (Some(true), Some(SpanKind::Client)), // flip → monitored process is the client
+            (Some(false), Some(SpanKind::Server)), // hinted, no flip → it is the server
+            (None, None),                         // no hint → UNSPECIFIED, never guessed
+        ] {
+            assert_eq!(span_kind_from_hint(client), expected, "client={client:?}");
+        }
+    }
+
+    #[test]
+    fn otlp_resource_attributes_carry_identity_and_provenance() {
+        let attrs = otlp_resource_attributes("checkout", "edge-host-1");
+        let obj = attrs
+            .as_object()
+            .expect("resource attributes are an object");
+        assert_eq!(
+            obj.get("service.name").unwrap(),
+            &serde_json::json!("checkout")
+        );
+        assert_eq!(
+            obj.get("host.name").unwrap(),
+            &serde_json::json!("edge-host-1")
+        );
+        assert_eq!(
+            obj.get("telemetry.sdk.name").unwrap(),
+            &serde_json::json!("edgepacer")
+        );
+        assert_eq!(
+            obj.get("telemetry.sdk.version").unwrap(),
+            &serde_json::json!(crate::common::VERSION)
+        );
+        assert_eq!(
+            obj.get("edgepacer.capture").unwrap(),
+            &serde_json::json!("ebpf-l7")
+        );
+        assert_eq!(obj.len(), 5, "exactly the five identity/provenance keys");
     }
 }
