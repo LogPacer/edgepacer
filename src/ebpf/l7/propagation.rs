@@ -22,7 +22,6 @@ pub struct PropagatedContext {
 /// of any kind returns `None` — a bad header must never poison the span, it
 /// just falls back to minted ids. `trace_state` is left empty; the caller
 /// attaches the raw `tracestate` header separately when present.
-#[allow(dead_code)] // wired into the http parsers later in this slice
 pub fn parse_traceparent(value: &str) -> Option<PropagatedContext> {
     // Version-00 strict form: exactly four dash-separated fields — anything
     // before, after, or between them falls to None.

@@ -10,19 +10,22 @@
 
 use std::collections::VecDeque;
 
-use super::{DirBuf, L7Parser, L7Record, Protocol};
+use super::propagation::parse_traceparent;
+use super::{DirBuf, L7Parser, L7Record, PropagatedContext, Protocol};
 
 /// Header slots scanned while parsing a head. Headers aren't retained beyond
 /// Content-Length; this only bounds how many `httparse` walks before `\r\n\r\n`.
 const MAX_HEADERS: usize = 32;
 
 /// A parsed request head — method + path, plus the `Host` header (the service-map
-/// edge's destination authority and the API-classification key).
+/// edge's destination authority and the API-classification key) and any
+/// validated W3C trace context the request carried (`traceparent`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RequestHead {
     pub method: String,
     pub path: String,
     pub host: String,
+    pub propagated: Option<PropagatedContext>,
 }
 
 /// A parsed message plus the framing length the stream tracker uses to advance
@@ -72,6 +75,27 @@ fn host(headers: &[httparse::Header<'_>]) -> String {
         .unwrap_or_default()
 }
 
+/// W3C trace context from the request headers: a validated `traceparent`
+/// (case-insensitive name, like `host`), with the raw `tracestate` attached
+/// when present. An absent or invalid `traceparent` leaves the context
+/// `None` — a bad header must never poison the span, and `tracestate` only
+/// ever rides a valid one.
+fn propagated_context(headers: &[httparse::Header<'_>]) -> Option<PropagatedContext> {
+    let mut ctx = headers
+        .iter()
+        .find(|h| h.name.eq_ignore_ascii_case("traceparent"))
+        .and_then(|h| std::str::from_utf8(h.value).ok())
+        .and_then(|value| parse_traceparent(value.trim()))?;
+    if let Some(state) = headers
+        .iter()
+        .find(|h| h.name.eq_ignore_ascii_case("tracestate"))
+        .and_then(|h| std::str::from_utf8(h.value).ok())
+    {
+        ctx.trace_state = state.trim().to_string();
+    }
+    Some(ctx)
+}
+
 /// Parse an HTTP/1.x request head from `buf`.
 pub fn parse_request(buf: &[u8]) -> ParseOutcome<RequestHead> {
     let mut headers = [httparse::EMPTY_HEADER; MAX_HEADERS];
@@ -82,6 +106,7 @@ pub fn parse_request(buf: &[u8]) -> ParseOutcome<RequestHead> {
                 method: req.method.unwrap_or_default().to_string(),
                 path: req.path.unwrap_or_default().to_string(),
                 host: host(req.headers),
+                propagated: propagated_context(req.headers),
             },
             total_len: head_len + content_length(req.headers),
         }),
@@ -161,7 +186,7 @@ impl Http1Conn {
                 error: status >= 500,
                 start_unix_nano: req.start_unix_nano,
                 duration_nano: ts.saturating_sub(req.start_unix_nano).max(0),
-                propagated: None,
+                propagated: req.head.propagated,
             });
         }
     }
@@ -334,6 +359,7 @@ mod tests {
                 method: "GET".into(),
                 path: "/api/users".into(),
                 host: "checkout.io".into(),
+                propagated: None,
             },
             1_000,
         );
@@ -366,6 +392,7 @@ mod tests {
                 method: "GET".into(),
                 path: "/a".into(),
                 host: String::new(),
+                propagated: None,
             },
             10,
         );
@@ -374,6 +401,7 @@ mod tests {
                 method: "POST".into(),
                 path: "/b".into(),
                 host: String::new(),
+                propagated: None,
             },
             20,
         );
@@ -393,5 +421,83 @@ mod tests {
         let mut conn = Http1Conn::new();
         conn.on_response(200, 0); // no pending request
         assert!(conn.take_records().is_empty());
+    }
+
+    /// Header name casing follows `host`'s convention (httparse hands names
+    /// through verbatim), so a mixed-case `TraceParent` must still extract.
+    const TRACEPARENT: &str = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01";
+    const TRACE_ID: [u8; 16] = [
+        0x4b, 0xf9, 0x2f, 0x35, 0x77, 0xb3, 0x4d, 0xa6, 0xa3, 0xce, 0x92, 0x9d, 0x0e, 0x0e, 0x47,
+        0x36,
+    ];
+
+    #[test]
+    fn traceparent_header_yields_propagated_context_on_the_record() {
+        let buf = format!(
+            "GET /x HTTP/1.1\r\nHost: x\r\nTraceParent: {TRACEPARENT}\r\ntracestate: vendor=opaque\r\n\r\n"
+        );
+        let ParseOutcome::Complete(Framed { value, .. }) = parse_request(buf.as_bytes()) else {
+            panic!("expected Complete");
+        };
+        let ctx = value
+            .propagated
+            .as_ref()
+            .expect("a valid traceparent attaches the context");
+        assert_eq!(ctx.trace_id, TRACE_ID);
+        assert_eq!(ctx.trace_state, "vendor=opaque");
+
+        // The context rides the head onto the paired record.
+        let mut conn = Http1Conn::new();
+        conn.on_request(value, 1_000);
+        conn.on_response(200, 1_500);
+        let recs = conn.take_records();
+        assert_eq!(recs.len(), 1);
+        assert_eq!(
+            recs[0].propagated.as_ref().map(|c| c.trace_id),
+            Some(TRACE_ID)
+        );
+    }
+
+    #[test]
+    fn invalid_or_absent_traceparent_leaves_propagated_none() {
+        // Invalid header: rejected by validation, and the tracestate beside it
+        // must NOT ride along on its own.
+        let buf =
+            "GET /x HTTP/1.1\r\ntraceparent: 00-4BF92F3577B34DA6A3CE929D0E0E4736-00f067aa0ba902b7-01\r\ntracestate: vendor=opaque\r\n\r\n"
+                .to_string();
+        let ParseOutcome::Complete(Framed { value, .. }) = parse_request(buf.as_bytes()) else {
+            panic!("expected Complete");
+        };
+        assert!(
+            value.propagated.is_none(),
+            "an invalid traceparent (uppercase hex) must not attach a context"
+        );
+
+        // Absent header: minted-id path, no context.
+        let ParseOutcome::Complete(Framed { value, .. }) =
+            parse_request(b"GET /x HTTP/1.1\r\nHost: x\r\n\r\n")
+        else {
+            panic!("expected Complete");
+        };
+        assert!(value.propagated.is_none());
+    }
+
+    #[test]
+    fn traceparent_as_the_32nd_header_still_parses() {
+        // MAX_HEADERS bound: Host + 30 filler headers + traceparent = 32 slots.
+        let mut buf = String::from("GET /x HTTP/1.1\r\nHost: x\r\n");
+        for i in 0..30 {
+            buf.push_str(&format!("x-pad-{i:02}: {i}\r\n"));
+        }
+        buf.push_str(&format!("traceparent: {TRACEPARENT}\r\n\r\n"));
+
+        let ParseOutcome::Complete(Framed { value, .. }) = parse_request(buf.as_bytes()) else {
+            panic!("expected Complete at the MAX_HEADERS bound");
+        };
+        assert_eq!(
+            value.propagated.as_ref().map(|c| c.trace_id),
+            Some(TRACE_ID),
+            "the last header slot must still be scanned"
+        );
     }
 }
