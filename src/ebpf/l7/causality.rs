@@ -34,7 +34,6 @@ pub struct LocalSpan {
 /// `ctx.trace_id` so BOTH arms carry the shared id. A client that already
 /// carries a wire-extracted context is never overwritten, UNSPECIFIED spans
 /// never participate, and servers are never modified.
-#[allow(dead_code)] // wired into the runner's flush path later in this slice
 pub fn assign_local_parents(entries: &mut [LocalSpan]) {
     for i in 0..entries.len() {
         // Only bare CLIENT spans adopt: servers are never modified, a

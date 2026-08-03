@@ -30,7 +30,8 @@ use super::capture::{
 use super::cgroup_resolver::{self, CgroupRouting};
 use super::l7::{
     CapturedConnectionIdentity, CapturedSegment, ConnRegistry, EdgeAggregator, LocalSpan,
-    RedAggregator, SpanContext, ctx_trace_id, mint_id, to_otlp_span, to_request_signal,
+    RedAggregator, SpanContext, assign_local_parents, ctx_trace_id, mint_id, to_otlp_span,
+    to_request_signal,
 };
 use super::listener_snapshot;
 use super::listener_state::{DeltaOutcome, ListenerAssociation, ListenerSnapshot, ListenerState};
@@ -1684,6 +1685,22 @@ fn flush_spans(
             continue; // no target for this service (raced with removal)
         };
         let shipper = delivery.flow_shipper.clone();
+
+        // Local hierarchy before either arm converts: CLIENT spans nested in
+        // a same-thread SERVER window adopt its trace, so BOTH arms ship the
+        // adopted ids through the existing adoption machinery — parenting
+        // synthesizes the same PropagatedContext wire extraction produces.
+        let wire_propagated = entries
+            .iter()
+            .filter(|e| e.record.propagated.is_some())
+            .count();
+        assign_local_parents(&mut entries);
+        let parented = entries
+            .iter()
+            .filter(|e| e.record.propagated.is_some())
+            .count()
+            - wire_propagated;
+        counters.add_spans_parented(parented as u64);
 
         // Arm 1: the legacy RequestSignal batch, unchanged.
         let signals: Vec<RequestSignal> = entries

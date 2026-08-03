@@ -38,7 +38,7 @@ mod tds;
 #[cfg(test)]
 mod exports_demo;
 
-pub(crate) use causality::LocalSpan;
+pub(crate) use causality::{LocalSpan, assign_local_parents};
 pub(crate) use conn::CapturedConnectionIdentity;
 pub use conn::{CapturedSegment, ConnRegistry};
 pub use edge::EdgeAggregator;
