@@ -124,7 +124,7 @@ jobs:
           cache-on-failure: true
 
       - name: Install bpf-linker
-        uses: taiki-e/install-action@v2
+        uses: taiki-e/install-action@v2.85.5
         with:
           tool: bpf-linker@0.10.3
 
@@ -168,13 +168,13 @@ jobs:
               sh -s -- --default-toolchain none -y
           fi
 
-      - uses: taiki-e/install-action@v2
+      - uses: taiki-e/install-action@v2.85.5
         with:
           # Pinned: newer cargo-deny moved `-c`/`check`-level flags and breaks
           # the invocations below when installed unpinned.
           tool: cargo-deny@0.19.9
 
-      - uses: taiki-e/install-action@v2
+      - uses: taiki-e/install-action@v2.85.5
         with:
           tool: cargo-audit
 
