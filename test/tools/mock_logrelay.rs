@@ -37,13 +37,22 @@ fn dump_log_lines(stats: &Stats, request: &WireRequest) {
     };
     let mut file = dump.lock().expect("dump file lock");
     for batch in &request.batches {
-        let Some(routed_batch::Payload::Logs(logs)) = &batch.payload else {
-            continue;
-        };
-        for entry in &logs.entries {
-            if let Some(wire_log_event::Body::RawText(text)) = &entry.body {
-                let _ = writeln!(file, "{text}");
+        match &batch.payload {
+            Some(routed_batch::Payload::Logs(logs)) => {
+                for entry in &logs.entries {
+                    if let Some(wire_log_event::Body::RawText(text)) = &entry.body {
+                        let _ = writeln!(file, "{text}");
+                    }
+                }
             }
+            // Trace span JSON objects, one per line — lets an e2e harness
+            // assert on the exact span shape the agent shipped.
+            Some(routed_batch::Payload::Traces(traces)) => {
+                for entry in &traces.entries_json {
+                    let _ = writeln!(file, "{}", String::from_utf8_lossy(entry));
+                }
+            }
+            _ => {}
         }
     }
 }
