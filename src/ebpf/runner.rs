@@ -1677,7 +1677,7 @@ fn flush_spans(
     counters: &Arc<AgentCounters>,
 ) {
     let host = identity.current();
-    for (service, entries) in pending.drain() {
+    for (service, mut entries) in pending.drain() {
         if entries.is_empty() {
             continue;
         }
