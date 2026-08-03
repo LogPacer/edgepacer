@@ -66,10 +66,14 @@ fn clock_nanos(clock_id: libc::c_int) -> Option<i64> {
     }
     // SAFETY: the successful call above initialized the complete value.
     let timestamp = unsafe { timestamp.assume_init() };
-    let seconds = i64::try_from(timestamp.tv_sec).ok()?;
-    let nanoseconds = i64::try_from(timestamp.tv_nsec)
-        .ok()
-        .filter(|value| *value < 1_000_000_000)?;
+    // `tv_sec`/`tv_nsec` are already i64 on the shipped Linux targets
+    // (x86_64/aarch64), so no conversion — the kernel guarantees
+    // `0 <= tv_nsec < 1e9`, but validate rather than trust it.
+    let seconds: i64 = timestamp.tv_sec;
+    let nanoseconds: i64 = timestamp.tv_nsec;
+    if !(0..1_000_000_000).contains(&nanoseconds) {
+        return None;
+    }
     seconds.checked_mul(1_000_000_000)?.checked_add(nanoseconds)
 }
 
