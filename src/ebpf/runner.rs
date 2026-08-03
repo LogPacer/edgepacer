@@ -30,8 +30,8 @@ use super::capture::{
 use super::cgroup_resolver::{self, CgroupRouting};
 use super::l7::{
     CapturedConnectionIdentity, CapturedSegment, ConnEndpoints, ConnRegistry, EdgeAggregator,
-    LocalSpan, RedAggregator, SpanContext, assign_batch_hierarchy, assign_local_parents,
-    ctx_trace_id, mint_id, to_otlp_span, to_request_signal,
+    LocalSpan, RedAggregator, SpanContext, assign_batch_hierarchy, ctx_trace_id, mint_id,
+    to_otlp_span, to_request_signal,
 };
 use super::listener_snapshot;
 use super::listener_state::{DeltaOutcome, ListenerAssociation, ListenerSnapshot, ListenerState};
@@ -1657,12 +1657,13 @@ fn span_kind_from_hint(client: Option<bool>) -> Option<SpanKind> {
     })
 }
 
-/// Entries carrying a propagated context — the post-minus-pre count basis
-/// for hierarchy adoptions by origin.
-fn propagated_count(entries: &[LocalSpan]) -> usize {
+/// Propagated entries of one kind — the pre/post delta basis for hierarchy
+/// adoptions. Parenting only ever adds `propagated` to CLIENT entries and
+/// cross-linking only to SERVER entries, so the kind selects the origin.
+fn propagated_count_of_kind(entries: &[LocalSpan], kind: SpanKind) -> usize {
     entries
         .iter()
-        .filter(|e| e.record.propagated.is_some())
+        .filter(|e| e.kind == Some(kind) && e.record.propagated.is_some())
         .count()
 }
 
@@ -1699,20 +1700,26 @@ fn flush_spans(
 
     // Hierarchy runs once over the flattened whole-flush batch — cross-process
     // links span services, so per-service passes cannot see them — then the
-    // entries regroup by service for shipping. The intra-process pass runs
-    // first for its counter split; assign_batch_hierarchy re-enters it as a
-    // no-op (adopted clients are skipped, servers are never modified) and
-    // adds the cross-process link + transitive refresh.
+    // entries regroup by service for shipping. assign_batch_hierarchy is the
+    // single entry point (intra-process parenting, cross-process linking, and
+    // transitive refresh); a separate pre-pass would mark the clients it
+    // parents as wire-derived and exempt them from the refresh.
     let mut flat: Vec<LocalSpan> = pending.drain().flat_map(|(_, spans)| spans).collect();
     if flat.is_empty() {
         return;
     }
-    let pre = propagated_count(&flat);
-    assign_local_parents(&mut flat);
-    let after_intra = propagated_count(&flat);
-    counters.add_spans_parented((after_intra - pre) as u64);
+    // Parenting only ever adds `propagated` to CLIENT entries and cross-linking
+    // only to SERVER entries, so per-kind pre/post deltas attribute each
+    // adoption to its origin without a second pass.
+    let pre_clients = propagated_count_of_kind(&flat, SpanKind::Client);
+    let pre_servers = propagated_count_of_kind(&flat, SpanKind::Server);
     assign_batch_hierarchy(&mut flat);
-    counters.add_spans_cross_linked((propagated_count(&flat) - after_intra) as u64);
+    counters.add_spans_parented(
+        (propagated_count_of_kind(&flat, SpanKind::Client) - pre_clients) as u64,
+    );
+    counters.add_spans_cross_linked(
+        (propagated_count_of_kind(&flat, SpanKind::Server) - pre_servers) as u64,
+    );
 
     let mut by_service: HashMap<String, Vec<LocalSpan>> = HashMap::new();
     for entry in flat {
