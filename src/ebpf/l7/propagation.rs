@@ -2,10 +2,9 @@
 //! eBPF-captured server span can join the distributed trace an instrumented
 //! client started. Read-only: extraction never rewrites application bytes.
 //!
-//! The `#[ignore]`d acceptance tests below are the standing definition of the
-//! validation contract (W3C Trace Context, version-00 form). They are owned by
-//! the reviewer — implement until they pass with the `#[ignore]` attributes
-//! removed; any change to their expectations needs reviewer sign-off.
+//! The acceptance tests below are the standing definition of the validation
+//! contract (W3C Trace Context, version-00 form). They are owned by the
+//! reviewer; any change to their expectations needs reviewer sign-off.
 
 /// Trace context propagated from an instrumented caller: the ids to adopt in
 /// place of minted ones, the sampling flags, and the raw `tracestate` value
@@ -25,10 +24,46 @@ pub struct PropagatedContext {
 /// attaches the raw `tracestate` header separately when present.
 #[allow(dead_code)] // wired into the http parsers later in this slice
 pub fn parse_traceparent(value: &str) -> Option<PropagatedContext> {
-    // Slice 2 stub: the acceptance tests below define the contract and stay
-    // #[ignore]d red until this is implemented.
-    let _ = value;
-    None
+    // Version-00 strict form: exactly four dash-separated fields — anything
+    // before, after, or between them falls to None.
+    let mut fields = value.split('-');
+    let (version, trace_hex, parent_hex, flags_hex) = (
+        fields.next()?,
+        fields.next()?,
+        fields.next()?,
+        fields.next()?,
+    );
+    if fields.next().is_some() || version != "00" {
+        return None;
+    }
+    let trace_id = lowercase_hex_bytes::<16>(trace_hex)?;
+    let parent_span_id = lowercase_hex_bytes::<8>(parent_hex)?;
+    let trace_flags = lowercase_hex_bytes::<1>(flags_hex)?[0];
+    // All-zero ids are invalid per W3C — adopting them would masquerade as
+    // "no context" downstream.
+    if trace_id == [0; 16] || parent_span_id == [0; 8] {
+        return None;
+    }
+    Some(PropagatedContext {
+        trace_id,
+        parent_span_id,
+        trace_flags,
+        trace_state: String::new(),
+    })
+}
+
+/// Parse exactly `N` bytes from `2*N` lowercase hex characters; the W3C
+/// version-00 form is lowercase-only, and any other shape (length, case,
+/// non-hex) returns `None`.
+fn lowercase_hex_bytes<const N: usize>(s: &str) -> Option<[u8; N]> {
+    if s.len() != N * 2 || !s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')) {
+        return None;
+    }
+    let mut out = [0u8; N];
+    for (i, byte) in out.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&s[2 * i..2 * i + 2], 16).ok()?;
+    }
+    Some(out)
 }
 
 #[cfg(test)]
@@ -40,7 +75,6 @@ mod tests {
     /// The happy path: ids land as bytes, the sampled bit is preserved, and
     /// `trace_state` stays empty (the caller attaches `tracestate` itself).
     #[test]
-    #[ignore = "Slice 2 acceptance — implement parse_traceparent, then remove this ignore"]
     fn valid_header_yields_ids_and_flags() {
         let ctx = parse_traceparent(VALID_SAMPLED).expect("valid header must parse");
         assert_eq!(
@@ -69,7 +103,6 @@ mod tests {
     /// rejects everything (like the stub) fails here instead of passing
     /// vacuously.
     #[test]
-    #[ignore = "Slice 2 acceptance — implement parse_traceparent, then remove this ignore"]
     fn malformed_headers_never_poison_the_span() {
         assert!(
             parse_traceparent(VALID_SAMPLED).is_some(),
@@ -110,6 +143,28 @@ mod tests {
             assert!(
                 parse_traceparent(header).is_none(),
                 "{case}: {header:?} must not parse"
+            );
+        }
+    }
+
+    /// Beyond the W3C invalidity table: flag bits other than sampled pass
+    /// through untouched, and surrounding whitespace / stray separators are
+    /// rejected (the parsers hand us trimmed values, but stay strict).
+    #[test]
+    fn flag_bits_pass_through_and_whitespace_is_rejected() {
+        let ctx = parse_traceparent("00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-0f")
+            .expect("flags beyond the sampled bit parse");
+        assert_eq!(ctx.trace_flags, 0x0f);
+
+        for header in [
+            " 00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
+            "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01 ",
+            "-00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
+            "00--4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
+        ] {
+            assert!(
+                parse_traceparent(header).is_none(),
+                "{header:?} must not parse"
             );
         }
     }
