@@ -271,6 +271,15 @@ fn looks_like_any_request(bytes: &[u8]) -> bool {
         || pulsar::detect_pulsar(bytes).is_some()
 }
 
+/// Which side of a connection the monitored process is, decided from bytes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PeerRole {
+    /// It read the request: the monitored process serves this connection.
+    Server,
+    /// It wrote the request: the monitored process calls out on this connection.
+    Client,
+}
+
 /// State for one captured connection identity: buffers the inbound prefix until the
 /// protocol is recognised, then delegates each direction to the bound parser.
 #[derive(Debug, Default)]
@@ -282,6 +291,9 @@ struct ConnTracker {
     /// Bytes seen before detection, replayed into the parser once it binds.
     pre_inbound: Vec<u8>,
     pre_outbound: Vec<u8>,
+    /// Set when detection recognised an opener, naming the side that sent it.
+    /// `None` while undecided or when a port hint bound the parser instead.
+    byte_role: Option<PeerRole>,
 }
 
 impl ConnTracker {
@@ -405,6 +417,23 @@ impl ConnRegistry {
         tracker.take_records()
     }
 
+    /// Which side of a connection the monitored process turned out to be,
+    /// decided from the bytes: whoever sent the first recognisable request is
+    /// the client. `None` until a byte verdict exists (still buffering, a
+    /// port-hint-bound parser whose direction came from config, or a
+    /// mid-stream attach that never saw an opener) — the caller must then
+    /// leave the span kind unspecified rather than guess.
+    ///
+    /// Direct evidence, unlike the port table's inference: a connection is
+    /// client-side because the monitored process *wrote* the request, not
+    /// because a remote port looked well-known.
+    #[allow(dead_code)] // consumed by the runner's kind derivation in this slice
+    pub fn byte_role(&self, seg: &CapturedSegment) -> Option<PeerRole> {
+        self.conns
+            .get(&seg.connection_identity())
+            .and_then(|tracker| tracker.byte_role)
+    }
+
     /// Evict a connection (called on `close(2)` in the real wiring, and on a
     /// fatal parse error so the slot frees immediately).
     pub fn on_close(&mut self, pid: u32, fd: u32) {
@@ -460,6 +489,110 @@ mod tests {
             timestamp_nano: 0,
             bytes: bytes.to_vec(),
         }
+    }
+
+    // ── Byte-derived connection role (reviewer-owned acceptance) ────────────
+    //
+    // HTTP ports are deliberately absent from the port table, so an HTTP
+    // connection never carries a hint: today detection only consults the
+    // inbound prefix, so a monitored *client* is never recognised, produces no
+    // records at all, and its span kind can only be UNSPECIFIED. Whoever sends
+    // the first recognisable request names the roles — direct evidence, not the
+    // port table's inference.
+
+    const REQ: &[u8] = b"GET /api/users HTTP/1.1\r\nHost: api.internal\r\n\r\n";
+    const RESP: &[u8] = b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n";
+
+    /// The gap this slice closes: the monitored process wrote the request, so
+    /// the exchange must still reconstruct — with the record's request/response
+    /// sense taken from the bytes, not from an absent port hint.
+    #[test]
+    #[ignore = "acceptance — detect client-side openers, then remove this ignore"]
+    fn client_side_http_connection_yields_records() {
+        let mut reg = ConnRegistry::new();
+        assert!(
+            reg.on_segment(&seg(7, 3, Direction::Outbound, REQ))
+                .is_empty(),
+            "the request alone completes nothing"
+        );
+        let records = reg.on_segment(&seg(7, 3, Direction::Inbound, RESP));
+        assert_eq!(records.len(), 1, "the response completes the pair");
+        assert_eq!(records[0].operation, "GET /api/users");
+        assert_eq!(records[0].status_code, 200);
+    }
+
+    /// The verdict itself, both ways — one test so neither half can pass
+    /// vacuously against an implementation that always answers the same.
+    #[test]
+    #[ignore = "acceptance — detect client-side openers, then remove this ignore"]
+    fn byte_role_names_the_side_that_sent_the_request() {
+        let mut client = ConnRegistry::new();
+        let client_seg = seg(7, 3, Direction::Outbound, REQ);
+        client.on_segment(&client_seg);
+        client.on_segment(&seg(7, 3, Direction::Inbound, RESP));
+        assert_eq!(client.byte_role(&client_seg), Some(PeerRole::Client));
+
+        let mut server = ConnRegistry::new();
+        let server_seg = seg(8, 4, Direction::Inbound, REQ);
+        server.on_segment(&server_seg);
+        server.on_segment(&seg(8, 4, Direction::Outbound, RESP));
+        assert_eq!(server.byte_role(&server_seg), Some(PeerRole::Server));
+    }
+
+    /// Regression guard: the server path — every eBPF HTTP span today — must
+    /// reconstruct exactly as before.
+    #[test]
+    fn server_side_http_connection_is_unchanged() {
+        let mut reg = ConnRegistry::new();
+        assert!(
+            reg.on_segment(&seg(9, 5, Direction::Inbound, REQ))
+                .is_empty()
+        );
+        let records = reg.on_segment(&seg(9, 5, Direction::Outbound, RESP));
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].operation, "GET /api/users");
+        assert_eq!(records[0].status_code, 200);
+    }
+
+    /// Never a guessed role: attaching mid-stream (a response arrives with no
+    /// opener ever seen) yields no records and no verdict.
+    #[test]
+    fn mid_stream_attach_yields_no_records_and_no_role() {
+        let mut reg = ConnRegistry::new();
+        let first = seg(10, 6, Direction::Inbound, RESP);
+        assert!(reg.on_segment(&first).is_empty());
+        assert!(
+            reg.on_segment(&seg(10, 6, Direction::Outbound, RESP))
+                .is_empty(),
+            "no opener was ever seen, so nothing reconstructs"
+        );
+        assert_eq!(
+            reg.byte_role(&first),
+            None,
+            "an unrecognised connection must not be assigned a role"
+        );
+    }
+
+    /// A port hint keeps owning direction: its `flip` already encodes the role
+    /// from config, so byte detection must not second-guess it.
+    #[test]
+    fn port_hinted_connections_keep_their_configured_direction() {
+        let mut reg = ConnRegistry::new();
+        // Monitored process is a redis client: the hint names the protocol and
+        // flip says its writes are the requests.
+        let out = seg(11, 7, Direction::Outbound, b"*1\r\n$4\r\nPING\r\n");
+        reg.on_segment_hinted(&out, Some("redis"), true);
+        let records = reg.on_segment_hinted(
+            &seg(11, 7, Direction::Inbound, b"+PONG\r\n"),
+            Some("redis"),
+            true,
+        );
+        assert_eq!(records.len(), 1, "the hinted client path still works");
+        assert_eq!(
+            reg.byte_role(&out),
+            None,
+            "a hint-bound connection reports no byte verdict — the hint owns direction"
+        );
     }
 
     #[test]
