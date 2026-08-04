@@ -596,6 +596,22 @@ async fn run_local_mode(app_config: AppConfig) -> anyhow::Result<()> {
     // sink. No section (or a non-Linux build) leaves this inert.
     #[cfg(all(target_os = "linux", feature = "ebpf"))]
     let ebpf = {
+        // Capture authorization fails closed until container discovery has
+        // completed an initial scan; there is no control-plane discovery
+        // agent in local mode, so run the same census loop locally.
+        let scan_cache = discovery_cache.clone();
+        let mut scan_shutdown = shutdown.subscribe();
+        tokio::spawn(async move {
+            loop {
+                let census =
+                    discovery::discover_with_paths_and_runtime_processes(&[], &[], false).await;
+                scan_cache.write().await.update_all(&census);
+                tokio::select! {
+                    _ = tokio::time::sleep(Duration::from_secs(30)) => {}
+                    _ = scan_shutdown.changed() => return,
+                }
+            }
+        });
         let ebpf_status = ebpf::shared_status();
         ebpf::probe(&ebpf_status).await;
         spawn_ebpf_manager(
