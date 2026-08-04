@@ -82,7 +82,7 @@ enum Detect {
     Parser(Box<dyn L7Parser>),
     /// Enough bytes seen without a match — not a supported protocol; drop it.
     Unknown,
-    /// Inconclusive so far — wait for more inbound bytes.
+    /// Inconclusive so far — wait for more bytes.
     NeedMore,
 }
 
@@ -305,10 +305,14 @@ impl ConnTracker {
         protocol_hint: Option<&str>,
         flip: bool,
     ) {
-        // When the monitored process is the client of a known service (a remote
-        // protocol port), its writes are the requests — flip so the parser still
-        // sees inbound = request, outbound = response.
-        let dir = if flip { dir.opposite() } else { dir };
+        // When the monitored process is the client — the port hint's flip, or a
+        // byte verdict from an outbound opener — its writes are the requests:
+        // flip so the parser still sees inbound = request, outbound = response.
+        let dir = if flip || self.byte_role == Some(PeerRole::Client) {
+            dir.opposite()
+        } else {
+            dir
+        };
 
         if self.dead {
             // fd reuse / mid-stream resync: a fresh inbound request on a dead
@@ -333,26 +337,79 @@ impl ConnTracker {
             return;
         }
 
-        // Pre-detection: buffer each direction, then try to recognise the protocol
-        // from the inbound prefix.
+        // Pre-detection: buffer each direction, then try to recognise the
+        // protocol. The inbound prefix decides first; when it declines, the
+        // outbound prefix gets the same chance — a monitored client's first
+        // bytes are the request. Whichever side yields a parser first names
+        // the roles (issue #133: detection used to consult the inbound prefix
+        // only, so client-side HTTP was never recognised at all).
         match dir {
             Direction::Inbound => self.pre_inbound.extend_from_slice(bytes),
             Direction::Outbound => self.pre_outbound.extend_from_slice(bytes),
         }
-        match detect(&self.pre_inbound, protocol_hint) {
-            Detect::Parser(mut parser) => {
-                let inbound = std::mem::take(&mut self.pre_inbound);
-                let outbound = std::mem::take(&mut self.pre_outbound);
-                parser.on_inbound(&inbound, ts);
-                parser.on_outbound(&outbound, ts);
-                if parser.is_dead() {
-                    self.kill();
-                } else {
-                    self.parser = Some(parser);
-                }
+        let inbound = detect(&self.pre_inbound, protocol_hint);
+        // A port hint binds on the inbound arm even on an empty prefix, so the
+        // outbound chance only exists for byte detection.
+        let outbound = if protocol_hint.is_some() {
+            Detect::NeedMore
+        } else {
+            detect(&self.pre_outbound, None)
+        };
+        match (inbound, outbound) {
+            (Detect::Parser(parser), _) => {
+                // Inbound opener (or a port-hint bind): the monitored process
+                // read the request. A hint-bound parser carries no byte
+                // verdict — the hint owns direction where it exists.
+                self.bind(
+                    parser,
+                    protocol_hint.is_none().then_some(PeerRole::Server),
+                    false,
+                    ts,
+                );
             }
-            Detect::Unknown => self.kill(),
-            Detect::NeedMore => {}
+            (_, Detect::Parser(parser)) => {
+                // Outbound opener: the monitored process wrote the request —
+                // replay with request/response sense flipped and keep it
+                // flipped for the connection's life (byte_role above).
+                self.bind(parser, Some(PeerRole::Client), true, ts);
+            }
+            // An unrecognised inbound prefix keeps today's verdict: kill (the
+            // request side spoke first and said nothing supported — an fd
+            // reused for a fresh connection restarts from dead). An
+            // outbound-side Unknown must NOT kill while the inbound side may
+            // still be about to open: whoever answers a mid-stream attach
+            // gets its opener bound when it arrives.
+            (Detect::Unknown, _) => self.kill(),
+            (_, Detect::Unknown) => {}
+            _ => {}
+        }
+    }
+
+    /// Bind a detected parser, replaying the buffered prefixes in the
+    /// connection's request/response orientation: `flipped` feeds the buffered
+    /// OUTBOUND bytes to the parser's inbound (requests) and vice versa — the
+    /// port hint's flip, decided from bytes.
+    fn bind(
+        &mut self,
+        mut parser: Box<dyn L7Parser>,
+        role: Option<PeerRole>,
+        flipped: bool,
+        ts: i64,
+    ) {
+        let inbound = std::mem::take(&mut self.pre_inbound);
+        let outbound = std::mem::take(&mut self.pre_outbound);
+        if flipped {
+            parser.on_inbound(&outbound, ts);
+            parser.on_outbound(&inbound, ts);
+        } else {
+            parser.on_inbound(&inbound, ts);
+            parser.on_outbound(&outbound, ts);
+        }
+        if parser.is_dead() {
+            self.kill();
+        } else {
+            self.byte_role = role;
+            self.parser = Some(parser);
         }
     }
 
@@ -361,6 +418,8 @@ impl ConnTracker {
         self.parser = None;
         self.pre_inbound = Vec::new();
         self.pre_outbound = Vec::new();
+        // A restart (fd reuse) re-derives the role from fresh bytes.
+        self.byte_role = None;
     }
 
     fn take_records(&mut self) -> Vec<L7Record> {
@@ -507,7 +566,6 @@ mod tests {
     /// the exchange must still reconstruct — with the record's request/response
     /// sense taken from the bytes, not from an absent port hint.
     #[test]
-    #[ignore = "acceptance — detect client-side openers, then remove this ignore"]
     fn client_side_http_connection_yields_records() {
         let mut reg = ConnRegistry::new();
         assert!(
@@ -524,7 +582,6 @@ mod tests {
     /// The verdict itself, both ways — one test so neither half can pass
     /// vacuously against an implementation that always answers the same.
     #[test]
-    #[ignore = "acceptance — detect client-side openers, then remove this ignore"]
     fn byte_role_names_the_side_that_sent_the_request() {
         let mut client = ConnRegistry::new();
         let client_seg = seg(7, 3, Direction::Outbound, REQ);
