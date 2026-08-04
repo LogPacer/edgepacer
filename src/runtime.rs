@@ -588,12 +588,33 @@ async fn run_local_mode(app_config: AppConfig) -> anyhow::Result<()> {
 
     let shutdown = SharedShutdown::new();
     let data_dir = prepare_runtime_data_dir()?;
+    let counters = counters::AgentCounters::new();
+
+    // Local mode honors the full directive: an enabled `ebpf` section starts
+    // the same capture manager the control-plane path runs, so the Linux e2e
+    // and profiling lanes exercise the real span pipeline against a local
+    // sink. No section (or a non-Linux build) leaves this inert.
+    #[cfg(all(target_os = "linux", feature = "ebpf"))]
+    let ebpf = {
+        let ebpf_status = ebpf::shared_status();
+        ebpf::probe(&ebpf_status).await;
+        spawn_ebpf_manager(
+            shared_config.clone(),
+            discovery_cache.clone(),
+            ebpf_status,
+            data_dir.clone(),
+            identity.clone(),
+            counters.clone(),
+            shutdown.subscribe(),
+        )
+    };
+
     let orchestrator = spawn_orchestrator(
         shared_config,
         discovery_cache,
         data_dir,
         identity,
-        counters::AgentCounters::new(),
+        counters,
         Arc::new(error_collector::ErrorCollector::new()),
         shutdown.subscribe(),
     );
@@ -604,6 +625,8 @@ async fn run_local_mode(app_config: AppConfig) -> anyhow::Result<()> {
 
     shutdown.signal();
     wait_task(orchestrator, ShutdownBudgets::local().orchestrator).await;
+    #[cfg(all(target_os = "linux", feature = "ebpf"))]
+    wait_task(ebpf, ShutdownBudgets::local().orchestrator).await;
 
     info!("edgepacer stopped");
     Ok(())
