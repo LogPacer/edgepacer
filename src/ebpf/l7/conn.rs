@@ -348,12 +348,17 @@ impl ConnTracker {
             Direction::Outbound => self.pre_outbound.extend_from_slice(bytes),
         }
         let inbound = detect(&self.pre_inbound, protocol_hint);
-        // A port hint binds on the inbound arm even on an empty prefix, so the
-        // outbound chance only exists for byte detection.
-        let outbound = if protocol_hint.is_some() {
-            Detect::NeedMore
-        } else {
+        // First-speaker semantics: the outbound prefix is only considered
+        // while the peer has not spoken at all (pre_inbound empty) — whoever
+        // sent the first recognisable request names the roles, and a real
+        // client always satisfies that (its request precedes any inbound
+        // byte). Without the gate, a server whose inbound request is still
+        // partial could be mis-roled Client by an outbound segment that
+        // happens to match an opener signature.
+        let outbound = if protocol_hint.is_none() && self.pre_inbound.is_empty() {
             detect(&self.pre_outbound, None)
+        } else {
+            Detect::NeedMore
         };
         match (inbound, outbound) {
             (Detect::Parser(parser), _) => {
@@ -649,6 +654,100 @@ mod tests {
             reg.byte_role(&out),
             None,
             "a hint-bound connection reports no byte verdict — the hint owns direction"
+        );
+    }
+
+    /// HTTP/2 client-side opener (issue #133's gRPC case): the h2 client
+    /// preface is sent by the client, so a monitored client's FIRST outbound
+    /// bytes are the preface. The symmetric detection must bind h2 from the
+    /// outbound prefix, name the role Client, and never kill the connection.
+    #[test]
+    fn client_side_http2_preface_yields_client_role_and_records() {
+        let mut reg = ConnRegistry::new();
+
+        // The client's first outbound bytes: preface, then a request HEADERS
+        // block (END_HEADERS | END_STREAM). Frame header = 9 bytes: 3-byte
+        // length, type 0x1 (HEADERS), flags 0x5, 4-byte stream id 1. The
+        // HEADERS payload is HPACK indexed fields from the static table:
+        // 0x82 = :method GET, 0x86 = :scheme http, 0x84 = :path /.
+        let preface = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
+        let headers_block: &[u8] = &[0x82, 0x86, 0x84];
+        let mut headers_frame = vec![0x00, 0x00, headers_block.len() as u8, 0x1, 0x5];
+        headers_frame.extend_from_slice(&1u32.to_be_bytes());
+        headers_frame.extend_from_slice(headers_block);
+
+        let mut opener = preface.to_vec();
+        opener.extend_from_slice(&headers_frame);
+        let opener_seg = seg(12, 8, Direction::Outbound, &opener);
+        assert!(
+            reg.on_segment(&opener_seg).is_empty(),
+            "the request alone completes nothing"
+        );
+
+        // The server's response HEADERS (:status 200 = indexed 0x88), inbound.
+        let resp_block: &[u8] = &[0x88];
+        let mut resp_frame = vec![0x00, 0x00, resp_block.len() as u8, 0x1, 0x5];
+        resp_frame.extend_from_slice(&1u32.to_be_bytes());
+        resp_frame.extend_from_slice(resp_block);
+
+        let records = reg.on_segment(&seg(12, 8, Direction::Inbound, &resp_frame));
+        assert_eq!(records.len(), 1, "the response completes the pair");
+        assert_eq!(records[0].operation, "GET /");
+        assert_eq!(records[0].status_code, 200);
+        assert_eq!(
+            reg.byte_role(&opener_seg),
+            Some(PeerRole::Client),
+            "the client preface was sent outbound, so the role is Client"
+        );
+    }
+
+    /// First-speaker guard: while the peer's request is still partial, an
+    /// outbound segment that matches an opener signature must NOT flip the
+    /// connection to Client — whoever sent the first recognisable request
+    /// names the roles, and the peer (inbound) spoke first. Without the
+    /// pre_inbound-empty gate, the server below would be mis-roled Client.
+    #[test]
+    fn partial_inbound_is_not_misroled_by_an_opener_shaped_outbound() {
+        let mut reg = ConnRegistry::new();
+        // Three bytes: not yet a full "GET " token, so detection waits.
+        let first = seg(14, 10, Direction::Inbound, b"GET");
+        assert!(reg.on_segment(&first).is_empty());
+        // Outbound matching an opener signature: the first speaker must
+        // still decide the role, so no parser may bind here.
+        assert!(
+            reg.on_segment(&seg(14, 10, Direction::Outbound, REQ))
+                .is_empty(),
+            "no parser may bind while the peer's request is pending"
+        );
+        assert_eq!(
+            reg.byte_role(&first),
+            None,
+            "the outbound opener must not second-guess the first speaker"
+        );
+
+        // And the same shape with reply-shaped outbound reconstructs as
+        // Server once the request completes.
+        let mut reg = ConnRegistry::new();
+        let first = seg(15, 11, Direction::Inbound, b"GET");
+        assert!(reg.on_segment(&first).is_empty());
+        assert!(
+            reg.on_segment(&seg(15, 11, Direction::Outbound, RESP))
+                .is_empty()
+        );
+        assert_eq!(reg.byte_role(&first), None, "still undecided mid-request");
+        let records = reg.on_segment(&seg(
+            15,
+            11,
+            Direction::Inbound,
+            b" /x HTTP/1.1\r\nHost: x\r\n\r\n",
+        ));
+        assert_eq!(records.len(), 1, "the buffered reply pairs at bind time");
+        assert_eq!(records[0].operation, "GET /x");
+        assert_eq!(records[0].status_code, 200);
+        assert_eq!(
+            reg.byte_role(&first),
+            Some(PeerRole::Server),
+            "the completed request reconstructs as Server"
         );
     }
 
