@@ -491,7 +491,6 @@ impl ConnRegistry {
     /// Direct evidence, unlike the port table's inference: a connection is
     /// client-side because the monitored process *wrote* the request, not
     /// because a remote port looked well-known.
-    #[allow(dead_code)] // consumed by the runner's kind derivation in this slice
     pub fn byte_role(&self, seg: &CapturedSegment) -> Option<PeerRole> {
         self.conns
             .get(&seg.connection_identity())

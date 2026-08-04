@@ -30,7 +30,7 @@ use super::capture::{
 use super::cgroup_resolver::{self, CgroupRouting};
 use super::l7::{
     CapturedConnectionIdentity, CapturedSegment, ConnEndpoints, ConnRegistry, EdgeAggregator,
-    LocalSpan, RedAggregator, SpanContext, assign_batch_hierarchy, ctx_trace_id, mint_id,
+    LocalSpan, PeerRole, RedAggregator, SpanContext, assign_batch_hierarchy, ctx_trace_id, mint_id,
     to_otlp_span, to_request_signal,
 };
 use super::listener_snapshot;
@@ -1093,7 +1093,6 @@ pub async fn run_with_counters(
                     Some(h) => (Some(h.protocol), h.client),
                     None => (None, false),
                 };
-                let kind = span_kind_from_hint(hint.map(|h| h.client));
                 // The connection's peer endpoint — the service-map edge's other node.
                 let socket_peer = resolved.as_ref().map(|r| r.peer.clone());
                 // Both endpoints as the capturing process saw them — the
@@ -1103,7 +1102,18 @@ pub async fn run_with_counters(
                     local: r.local.clone(),
                     remote: r.peer.clone(),
                 });
-                for record in l7_conns.on_segment_hinted(&seg, proto, flip) {
+                let records = l7_conns.on_segment_hinted(&seg, proto, flip);
+                // Kind precedence: the port hint's verdict first (unchanged),
+                // then the connection's byte-derived role — HTTP carries no
+                // port hint, so this is where its CLIENT/SERVER verdict comes
+                // from. Unhinted and unrecognised stays UNSPECIFIED.
+                let hint_client = hint.map(|h| h.client);
+                let byte_role = l7_conns.byte_role(&seg);
+                let kind = span_kind_verdict(hint_client, byte_role);
+                if hint_client.is_none() && byte_role.is_some() {
+                    counters.add_spans_kind_from_bytes(records.len() as u64);
+                }
+                for record in records {
                     // Socket resolution fails for every cross-uid target (the
                     // /proc fd readlink is ptrace-gated) and for TLS pseudo-fds,
                     // so fall back to the peer the parsed protocol itself named
@@ -1654,6 +1664,19 @@ fn span_kind_from_hint(client: Option<bool>) -> Option<SpanKind> {
         } else {
             SpanKind::Server
         }
+    })
+}
+
+/// The full span-kind precedence for a segment's records: the port hint's
+/// client/server verdict first (the hint owns direction where it exists),
+/// then the connection's byte-derived role, then no verdict — an unhinted,
+/// unrecognised connection stays UNSPECIFIED, never a guess.
+fn span_kind_verdict(hint_client: Option<bool>, byte_role: Option<PeerRole>) -> Option<SpanKind> {
+    span_kind_from_hint(hint_client).or_else(|| {
+        byte_role.map(|role| match role {
+            PeerRole::Client => SpanKind::Client,
+            PeerRole::Server => SpanKind::Server,
+        })
     })
 }
 
@@ -2541,6 +2564,28 @@ mod tests {
             (None, None),                         // no hint → UNSPECIFIED, never guessed
         ] {
             assert_eq!(span_kind_from_hint(client), expected, "client={client:?}");
+        }
+    }
+
+    #[test]
+    fn span_kind_verdict_prefers_hint_then_byte_verdict_then_unspecified() {
+        // (port-hint client verdict, byte-derived role, expected kind). The
+        // hint owns direction where it exists; the byte verdict decides
+        // unhinted connections; unhinted + unrecognised stays UNSPECIFIED.
+        for (hint_client, byte_role, expected) in [
+            (Some(true), None, Some(SpanKind::Client)),
+            (Some(true), Some(PeerRole::Server), Some(SpanKind::Client)),
+            (Some(false), None, Some(SpanKind::Server)),
+            (Some(false), Some(PeerRole::Client), Some(SpanKind::Server)),
+            (None, Some(PeerRole::Client), Some(SpanKind::Client)),
+            (None, Some(PeerRole::Server), Some(SpanKind::Server)),
+            (None, None, None), // never a guess
+        ] {
+            assert_eq!(
+                span_kind_verdict(hint_client, byte_role),
+                expected,
+                "hint={hint_client:?} role={byte_role:?}"
+            );
         }
     }
 
