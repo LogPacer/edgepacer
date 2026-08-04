@@ -604,7 +604,12 @@ async fn run_local_mode(app_config: AppConfig) -> anyhow::Result<()> {
         tokio::spawn(async move {
             loop {
                 let census = discovery::discover_with_paths(&[], &[]).await;
-                scan_cache.write().await.update_all(&census);
+                let epoch = {
+                    let mut cache = scan_cache.write().await;
+                    cache.update_all(&census);
+                    cache.epoch()
+                };
+                info!(epoch, "local mode census applied");
                 tokio::select! {
                     _ = tokio::time::sleep(Duration::from_secs(30)) => {}
                     _ = scan_shutdown.changed() => return,
