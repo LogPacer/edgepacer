@@ -50,6 +50,10 @@ mod sock_diag;
 #[cfg(any(test, all(target_os = "linux", feature = "ebpf")))]
 #[allow(dead_code)]
 mod tls_libs;
+// Pure ktime→realtime conversion — testable everywhere; only its sampling
+// callers live in the Linux-gated capture loop.
+#[cfg(any(test, all(target_os = "linux", feature = "ebpf")))]
+mod clock;
 // The aya-backed executor and run loop link aya, so they compile only on Linux
 // with the feature on (never in the macOS test build).
 #[cfg(all(target_os = "linux", feature = "ebpf"))]

@@ -18,7 +18,7 @@ use std::sync::Arc;
 use logpacer_wire::{
     EbpfEventKind, EventEnvelope, NetworkFlow, RequestSignal, RoutedBatch, WireEbpfBatch,
     WireEbpfEvent, WireGraphBatch, WireJsonEvent, WireLogBatch, WireLogEvent, WireRequest,
-    WireResponse, routed_batch, wire_ebpf_event, wire_log_event,
+    WireResponse, WireTraceBatch, routed_batch, wire_ebpf_event, wire_log_event,
 };
 use prost::Message;
 use reqwest::header::{AUTHORIZATION, CONTENT_ENCODING, CONTENT_TYPE, HeaderValue};
@@ -756,6 +756,34 @@ impl Shipper {
         Ok((encoded, count))
     }
 
+    /// Encode pre-serialized OTLP span JSON objects as a `WireTraceBatch`
+    /// (the traces arm), one `entries_json` entry per span — the same payload
+    /// shape the OTLP proxy forwards. The resource identity the log/ebpf arms
+    /// carry in their envelopes lives inside each span object instead
+    /// (`resource_attributes`). Pair with `send_with_retry`.
+    pub fn encode_trace_json_batch(
+        &self,
+        spans_json: Vec<Vec<u8>>,
+    ) -> Result<(Vec<u8>, u32), EdgepacerError> {
+        let count = checked_wire_count("trace spans", spans_json.len())?;
+
+        let encoded = encode_single_batch(
+            &self.archive_id,
+            &self.repo_id,
+            routed_batch::Payload::Traces(WireTraceBatch {
+                entries_json: spans_json,
+            }),
+        )?;
+
+        debug!(
+            spans = count,
+            bytes = encoded.len(),
+            "encoded logpacer-wire trace span batch"
+        );
+
+        Ok((encoded, count))
+    }
+
     /// Send an already-encoded protobuf payload with retry.
     ///
     /// This is the retry loop — call `encode_batch` once, then pass the
@@ -981,6 +1009,25 @@ mod tests {
             panic!("expected request signal event");
         };
         assert_eq!(decoded_signal, &signal);
+    }
+
+    #[test]
+    fn encode_trace_json_batch_routes_to_traces_payload() {
+        let shipper = Shipper::new("http://localhost:8080", "arc_test", "repo_app", None).unwrap();
+        let span = br#"{"trace_id":"abab","span_id":"cdcd","name":"GET /cart"}"#.to_vec();
+
+        let (buf, count) = shipper.encode_trace_json_batch(vec![span.clone()]).unwrap();
+        assert_eq!(count, 1);
+
+        let decoded = WireRequest::decode(&buf[..]).unwrap();
+        assert_eq!(decoded.batches[0].archive_id, "arc_test");
+        assert_eq!(decoded.batches[0].repo_id, "repo_app");
+        assert_eq!(decoded.batches[0].schema_version, 1);
+        let Some(routed_batch::Payload::Traces(traces)) = &decoded.batches[0].payload else {
+            panic!("expected routed traces payload");
+        };
+        assert_eq!(traces.entries_json.len(), 1);
+        assert_eq!(traces.entries_json[0], span);
     }
 
     #[tokio::test]

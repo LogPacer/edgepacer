@@ -703,7 +703,7 @@ pub async fn discover_with_paths(scan_paths: &[&str], log_extensions: &[&str]) -
     discover_with_paths_and_runtime_processes(scan_paths, log_extensions, false).await
 }
 
-pub(crate) async fn discover_with_paths_and_runtime_processes(
+pub async fn discover_with_paths_and_runtime_processes(
     scan_paths: &[&str],
     log_extensions: &[&str],
     include_runtime_processes: bool,

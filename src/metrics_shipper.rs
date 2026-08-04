@@ -245,6 +245,16 @@ pub(crate) fn agent_metrics_to_map(
         ("samples_pending", counters.samples_pending as f64),
         ("samples_completed", counters.samples_completed as f64),
         ("errors_last_hour", errors_last_hour as f64),
+        ("spans_built", counters.spans_built as f64),
+        ("spans_ship_failed", counters.spans_ship_failed as f64),
+        ("spans_propagated", counters.spans_propagated as f64),
+        ("spans_minted", counters.spans_minted as f64),
+        ("spans_parented", counters.spans_parented as f64),
+        ("spans_cross_linked", counters.spans_cross_linked as f64),
+        (
+            "spans_kind_from_bytes",
+            counters.spans_kind_from_bytes as f64,
+        ),
     ]
     .into_iter()
     .map(|(key, value)| (format!("agent_{key}"), value))
@@ -519,17 +529,31 @@ mod tests {
             streams_active: 3,
             samples_pending: 1,
             samples_completed: 4,
+            spans_built: 6,
+            spans_ship_failed: 1,
+            spans_propagated: 2,
+            spans_minted: 9,
+            spans_parented: 4,
+            spans_cross_linked: 3,
+            spans_kind_from_bytes: 5,
         };
 
         let map = agent_metrics_to_map(&counters, 7, 12.5, 64, 300);
 
-        assert_eq!(map.len(), 9);
+        assert_eq!(map.len(), 16);
         assert!(map.keys().all(|k| k.starts_with("agent_")));
         assert_eq!(map["agent_cpu_percent"], 12.5);
         assert_eq!(map["agent_memory_mb"], 64.0);
         assert_eq!(map["agent_uptime_seconds"], 300.0);
         assert_eq!(map["agent_bytes_sent"], 5000.0);
         assert_eq!(map["agent_errors_last_hour"], 7.0);
+        assert_eq!(map["agent_spans_built"], 6.0);
+        assert_eq!(map["agent_spans_ship_failed"], 1.0);
+        assert_eq!(map["agent_spans_propagated"], 2.0);
+        assert_eq!(map["agent_spans_minted"], 9.0);
+        assert_eq!(map["agent_spans_parented"], 4.0);
+        assert_eq!(map["agent_spans_cross_linked"], 3.0);
+        assert_eq!(map["agent_spans_kind_from_bytes"], 5.0);
     }
 
     #[test]

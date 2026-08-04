@@ -350,6 +350,7 @@ impl AmqpParser {
                             error: m.error,
                             start_unix_nano: ts,
                             duration_nano: 0,
+                            propagated: None,
                         });
                     }
                     if inbound {

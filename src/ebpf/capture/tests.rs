@@ -14,6 +14,7 @@ fn enabled_section(network_flows_enabled: bool) -> EbpfSectionConfig {
         receiver_port: 4318,
         network_flows_enabled,
         network_cidrs: Vec::new(),
+        spans_otlp: true,
         targets: Vec::new(),
         service_map: None,
         config_hash: "capture-test".to_string(),

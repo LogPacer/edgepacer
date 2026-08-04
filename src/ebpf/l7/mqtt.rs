@@ -328,6 +328,7 @@ impl MqttParser {
             error: false,
             start_unix_nano: ts,
             duration_nano: 0,
+            propagated: None,
         });
     }
 
@@ -450,6 +451,7 @@ impl MqttParser {
                         error,
                         start_unix_nano: req.start_unix_nano,
                         duration_nano: ts.saturating_sub(req.start_unix_nano).max(0),
+                        propagated: None,
                     });
                 }
             }
@@ -472,6 +474,7 @@ impl MqttParser {
                         error,
                         start_unix_nano: req.start_unix_nano,
                         duration_nano: ts.saturating_sub(req.start_unix_nano).max(0),
+                        propagated: None,
                     });
                 }
             }

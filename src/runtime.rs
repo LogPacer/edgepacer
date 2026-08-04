@@ -588,12 +588,57 @@ async fn run_local_mode(app_config: AppConfig) -> anyhow::Result<()> {
 
     let shutdown = SharedShutdown::new();
     let data_dir = prepare_runtime_data_dir()?;
+    let counters = counters::AgentCounters::new();
+
+    // Local mode honors the full directive: an enabled `ebpf` section starts
+    // the same capture manager the control-plane path runs, so the Linux e2e
+    // and profiling lanes exercise the real span pipeline against a local
+    // sink. No section (or a non-Linux build) leaves this inert.
+    #[cfg(all(target_os = "linux", feature = "ebpf"))]
+    let ebpf = {
+        // Capture authorization fails closed until container discovery has
+        // completed an initial scan; there is no control-plane discovery
+        // agent in local mode, so run the same census loop locally.
+        let scan_cache = discovery_cache.clone();
+        let mut scan_shutdown = shutdown.subscribe();
+        tokio::spawn(async move {
+            loop {
+                // Runtime processes ON: they are what maps a target's
+                // systemd unit to the PIDs capture authorizes. Without them
+                // the lane attaches but authorizes nothing.
+                let census =
+                    discovery::discover_with_paths_and_runtime_processes(&[], &[], true).await;
+                let epoch = {
+                    let mut cache = scan_cache.write().await;
+                    cache.update_all(&census);
+                    cache.epoch()
+                };
+                info!(epoch, "local mode census applied");
+                tokio::select! {
+                    _ = tokio::time::sleep(Duration::from_secs(30)) => {}
+                    _ = scan_shutdown.changed() => return,
+                }
+            }
+        });
+        let ebpf_status = ebpf::shared_status();
+        ebpf::probe(&ebpf_status).await;
+        spawn_ebpf_manager(
+            shared_config.clone(),
+            discovery_cache.clone(),
+            ebpf_status,
+            data_dir.clone(),
+            identity.clone(),
+            counters.clone(),
+            shutdown.subscribe(),
+        )
+    };
+
     let orchestrator = spawn_orchestrator(
         shared_config,
         discovery_cache,
         data_dir,
         identity,
-        counters::AgentCounters::new(),
+        counters,
         Arc::new(error_collector::ErrorCollector::new()),
         shutdown.subscribe(),
     );
@@ -604,6 +649,8 @@ async fn run_local_mode(app_config: AppConfig) -> anyhow::Result<()> {
 
     shutdown.signal();
     wait_task(orchestrator, ShutdownBudgets::local().orchestrator).await;
+    #[cfg(all(target_os = "linux", feature = "ebpf"))]
+    wait_task(ebpf, ShutdownBudgets::local().orchestrator).await;
 
     info!("edgepacer stopped");
     Ok(())

@@ -252,6 +252,7 @@ impl L7Parser for DnsParser {
                     // (clock skew, segment reordering) would otherwise emit a
                     // negative duration and poison the latency histograms.
                     duration_nano: ts.saturating_sub(req.start_unix_nano).max(0),
+                    propagated: None,
                 });
             }
         }

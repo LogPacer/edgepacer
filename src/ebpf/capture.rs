@@ -27,6 +27,7 @@ use edgepacer_ebpf_common::{
 };
 
 use super::cgroup_resolver::{CgroupAnchor, CgroupRouting};
+use super::clock::KtimeCalibration;
 use super::l7::{CapturedSegment, Direction};
 use super::manager::{CaptureProgram, ListenerObservation};
 use super::pid_resolver::PidRouting;
@@ -988,6 +989,50 @@ fn ensure_listener_drain_running(running: &AtomicBool) -> Result<(), String> {
     }
 }
 
+/// How often each drain task re-samples its ktime calibration —
+/// suspend/resume shifts CLOCK_BOOTTIME against CLOCK_REALTIME, and a minute
+/// bounds the window a stale offset can skew timestamps.
+const CALIBRATION_RESAMPLE: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Wall-clock now in unix nanos — the fallback timestamp for chunks the
+/// kernel did not stamp (`observed_ktime_ns == 0`: synthetic tests, or a
+/// calibration that could not be sampled).
+fn wall_clock_nanos() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as i64)
+        .unwrap_or(0)
+}
+
+/// Per-drain-task calibration holder: converts kernel stamps to unix nanos,
+/// re-sampling on [`CALIBRATION_RESAMPLE`]. A failed sample keeps the prior
+/// offset (or falls back to wall clock when none was ever obtained).
+struct DrainCalibration {
+    calibration: Option<KtimeCalibration>,
+    last_sample: std::time::Instant,
+}
+
+impl DrainCalibration {
+    fn new() -> Self {
+        Self {
+            calibration: KtimeCalibration::sample(),
+            last_sample: std::time::Instant::now(),
+        }
+    }
+
+    fn timestamp_nano(&mut self, observed_ktime_ns: u64) -> i64 {
+        if self.last_sample.elapsed() >= CALIBRATION_RESAMPLE {
+            if let Some(fresh) = KtimeCalibration::sample() {
+                self.calibration = Some(fresh);
+            }
+            self.last_sample = std::time::Instant::now();
+        }
+        self.calibration
+            .and_then(|cal| cal.convert(observed_ktime_ns))
+            .unwrap_or_else(wall_clock_nanos)
+    }
+}
+
 /// Poll the `L7_EVENTS` ring async, decode each `L7Chunk`, and forward a
 /// direction-tagged `CapturedSegment` for userspace L7 reassembly + parsing.
 fn spawn_l7_drain(
@@ -1003,6 +1048,7 @@ fn spawn_l7_drain(
                 return;
             }
         };
+        let mut calibration = DrainCalibration::new();
 
         loop {
             let mut guard = match async_fd.readable_mut().await {
@@ -1026,13 +1072,12 @@ fn spawn_l7_drain(
                 } else {
                     Direction::Outbound
                 };
-                let timestamp_nano = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_nanos() as i64)
-                    .unwrap_or(0);
+                // Kernel-stamped when the object stamped it; wall clock otherwise.
+                let timestamp_nano = calibration.timestamp_nano(chunk.observed_ktime_ns);
                 let seg = CapturedSegment {
                     capture_generation,
                     pid: chunk.pid,
+                    tid: chunk.tid,
                     cgroup_id: chunk.cgroup_id,
                     scope_cgroup_id: chunk.scope_cgroup_id,
                     policy_generation: chunk.policy_generation,
@@ -1067,6 +1112,7 @@ fn spawn_tls_drain(
                 return;
             }
         };
+        let mut calibration = DrainCalibration::new();
 
         loop {
             let mut guard = match async_fd.readable_mut().await {
@@ -1090,13 +1136,12 @@ fn spawn_tls_drain(
                 } else {
                     Direction::Outbound
                 };
-                let timestamp_nano = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_nanos() as i64)
-                    .unwrap_or(0);
+                // Kernel-stamped when the object stamped it; wall clock otherwise.
+                let timestamp_nano = calibration.timestamp_nano(chunk.observed_ktime_ns);
                 let seg = CapturedSegment {
                     capture_generation,
                     pid: chunk.pid,
+                    tid: chunk.tid,
                     cgroup_id: chunk.cgroup_id,
                     scope_cgroup_id: chunk.scope_cgroup_id,
                     policy_generation: chunk.policy_generation,

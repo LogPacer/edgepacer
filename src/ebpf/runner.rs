@@ -18,6 +18,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use logpacer_wire::{NetworkFlow, RequestSignal};
+use opentelemetry_proto::tonic::trace::v1::span::SpanKind;
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 use tracing::{debug, error, info, warn};
@@ -28,8 +29,9 @@ use super::capture::{
 };
 use super::cgroup_resolver::{self, CgroupRouting};
 use super::l7::{
-    CapturedConnectionIdentity, CapturedSegment, ConnRegistry, EdgeAggregator, RedAggregator,
-    SpanContext, mint_id, to_request_signal,
+    CapturedConnectionIdentity, CapturedSegment, ConnEndpoints, ConnRegistry, EdgeAggregator,
+    LocalSpan, PeerRole, RedAggregator, SpanContext, assign_batch_hierarchy, ctx_trace_id, mint_id,
+    to_otlp_span, to_request_signal,
 };
 use super::listener_snapshot;
 use super::listener_state::{DeltaOutcome, ListenerAssociation, ListenerSnapshot, ListenerState};
@@ -208,7 +210,10 @@ pub async fn run_with_counters(
     // minting; cgroup enrichment, durable buffering, and real trace ids (vs. v1
     // spanlets) are refinements.
     let mut l7_conns = ConnRegistry::new();
-    let mut pending_spans: HashMap<String, Vec<RequestSignal>> = HashMap::new();
+    // Pre-conversion spans (record + context + kind + capturing tid): both
+    // span arms build from the same entries at flush time so they share
+    // identical trace/span ids.
+    let mut pending_spans: HashMap<String, Vec<LocalSpan>> = HashMap::new();
     let mut l7_red = RedAggregator::new();
     // Service-map edges aggregated across ALL services on this host, shipped to
     // the one account-level graph repo (`section.service_map`), not per-target.
@@ -461,7 +466,13 @@ pub async fn run_with_counters(
                 );
 
                 flush_flows(&mut pending_flows, &deliveries);
-                flush_spans(&mut pending_spans, &deliveries);
+                flush_spans(
+                    &mut pending_spans,
+                    &deliveries,
+                    section.spans_otlp,
+                    identity,
+                    &counters,
+                );
                 flush_red(&mut l7_red, &deliveries);
                 let edge_window_end_ms = unix_epoch_millis_i64();
                 flush_edges(
@@ -1077,13 +1088,32 @@ pub async fn run_with_counters(
                 let resolved = port_hints
                     .entry(seg.connection_identity())
                     .or_insert_with(|| socket_port::resolve(pid, seg.fd));
-                let (proto, flip) = match resolved.as_ref().and_then(|r| r.hint) {
+                let hint = resolved.as_ref().and_then(|r| r.hint);
+                let (proto, flip) = match hint {
                     Some(h) => (Some(h.protocol), h.client),
                     None => (None, false),
                 };
                 // The connection's peer endpoint — the service-map edge's other node.
                 let socket_peer = resolved.as_ref().map(|r| r.peer.clone());
-                for record in l7_conns.on_segment_hinted(&seg, proto, flip) {
+                // Both endpoints as the capturing process saw them — the
+                // cross-process linking key. None when resolution couldn't
+                // name the ends (TLS pseudo-fds): such spans never cross-link.
+                let conn = resolved.as_ref().map(|r| ConnEndpoints {
+                    local: r.local.clone(),
+                    remote: r.peer.clone(),
+                });
+                let records = l7_conns.on_segment_hinted(&seg, proto, flip);
+                // Kind precedence: the port hint's verdict first (unchanged),
+                // then the connection's byte-derived role — HTTP carries no
+                // port hint, so this is where its CLIENT/SERVER verdict comes
+                // from. Unhinted and unrecognised stays UNSPECIFIED.
+                let hint_client = hint.map(|h| h.client);
+                let byte_role = l7_conns.byte_role(&seg);
+                let kind = span_kind_verdict(hint_client, byte_role);
+                if hint_client.is_none() && byte_role.is_some() {
+                    counters.add_spans_kind_from_bytes(records.len() as u64);
+                }
+                for record in records {
                     // Socket resolution fails for every cross-uid target (the
                     // /proc fd readlink is ptrace-gated) and for TLS pseudo-fds,
                     // so fall back to the peer the parsed protocol itself named
@@ -1095,18 +1125,39 @@ pub async fn run_with_counters(
                     l7_red.observe(service, &record);
                     l7_edges.observe(service, peer.as_deref(), &record);
                     span_seq = span_seq.wrapping_add(1);
+                    // A valid propagated context replaces the minted trace
+                    // id — both span arms build from this same ctx, so they
+                    // stay identical. The counters record which origin won.
+                    let trace_id = ctx_trace_id(
+                        &record,
+                        mint_id(16, span_seq ^ ((pid as u64) << 32) ^ ts as u64),
+                    );
+                    if record.propagated.is_some() {
+                        counters.increment_spans_propagated();
+                    } else {
+                        counters.increment_spans_minted();
+                    }
                     let ctx = SpanContext {
                         service_name: service.to_string(),
                         pid,
                         cgroup_id: seg.cgroup_id,
-                        trace_id: mint_id(16, span_seq ^ ((pid as u64) << 32) ^ ts as u64),
+                        trace_id,
                         span_id: mint_id(8, span_seq.wrapping_mul(0x100_0000_01b3) ^ pid as u64),
                         peer: peer.clone(),
                     };
                     pending_spans
                         .entry(service.to_string())
                         .or_default()
-                        .push(to_request_signal(&record, &ctx));
+                        // The completing segment's thread — the causality key.
+                        // Right for thread-per-request runtimes; async runtimes
+                        // degrade to flat (never a guessed parent).
+                        .push(LocalSpan {
+                            record,
+                            ctx,
+                            kind,
+                            tid: seg.tid,
+                            conn: conn.clone(),
+                        });
                 }
             }
 
@@ -1603,32 +1654,183 @@ fn flush_flows(
     }
 }
 
-/// Ship each service's accumulated L7 spans to its repo as a `WireEbpfBatch`
-/// (`kind = REQUEST`, best-effort, fire-and-forget). Drains `pending`. Durable
-/// buffering (like log lines) is a refinement.
+/// The span kind from the port-hint verdict: a flip marks the monitored
+/// process as the client, an unflipped hint marks it as the server, and no
+/// hint leaves the kind unset — it is never guessed `SERVER`.
+fn span_kind_from_hint(client: Option<bool>) -> Option<SpanKind> {
+    client.map(|flip| {
+        if flip {
+            SpanKind::Client
+        } else {
+            SpanKind::Server
+        }
+    })
+}
+
+/// The full span-kind precedence for a segment's records: the port hint's
+/// client/server verdict first (the hint owns direction where it exists),
+/// then the connection's byte-derived role, then no verdict — an unhinted,
+/// unrecognised connection stays UNSPECIFIED, never a guess.
+fn span_kind_verdict(hint_client: Option<bool>, byte_role: Option<PeerRole>) -> Option<SpanKind> {
+    span_kind_from_hint(hint_client).or_else(|| {
+        byte_role.map(|role| match role {
+            PeerRole::Client => SpanKind::Client,
+            PeerRole::Server => SpanKind::Server,
+        })
+    })
+}
+
+/// Propagated entries of one kind — the pre/post delta basis for hierarchy
+/// adoptions. Parenting only ever adds `propagated` to CLIENT entries and
+/// cross-linking only to SERVER entries, so the kind selects the origin.
+fn propagated_count_of_kind(entries: &[LocalSpan], kind: SpanKind) -> usize {
+    entries
+        .iter()
+        .filter(|e| e.kind == Some(kind) && e.record.propagated.is_some())
+        .count()
+}
+
+/// Resource attributes stamped onto every eBPF-built OTLP span: who emitted
+/// the request (`service.name`), which host observed it (`host.name`, stamped
+/// by the flush caller the way `EdgeEntry::to_json` stamps `host`), and the
+/// producer's provenance. Built once per service per flush.
+fn otlp_resource_attributes(service: &str, host: &str) -> serde_json::Value {
+    serde_json::json!({
+        "service.name": service,
+        "host.name": host,
+        "telemetry.sdk.name": "edgepacer",
+        "telemetry.sdk.version": crate::common::VERSION,
+        "edgepacer.capture": "ebpf-l7",
+    })
+}
+
+/// Ship each service's accumulated L7 spans to its repo. Dual-ship: the
+/// `WireEbpfBatch` arm (`kind = REQUEST`) stays exactly as before, and the
+/// same records also render as OTLP spans through the Traces arm (gated by
+/// `spans_otlp`) — both arms build from the same entries, so a request's ids
+/// are identical in either arm. Before either arm converts, the whole-flush
+/// batch gets one hierarchy pass (cross-process links span services, so a
+/// per-service pass cannot see them). Best-effort, fire-and-forget. Drains
+/// `pending`. Durable buffering (like log lines) is a refinement.
 fn flush_spans(
-    pending: &mut HashMap<String, Vec<RequestSignal>>,
+    pending: &mut HashMap<String, Vec<LocalSpan>>,
     deliveries: &HashMap<String, TargetDelivery>,
+    spans_otlp: bool,
+    identity: &crate::identity::AgentIdentity,
+    counters: &Arc<AgentCounters>,
 ) {
-    for (service, spans) in pending.drain() {
-        if spans.is_empty() {
+    let host = identity.current();
+
+    // Hierarchy runs once over the flattened whole-flush batch — cross-process
+    // links span services, so per-service passes cannot see them — then the
+    // entries regroup by service for shipping. assign_batch_hierarchy is the
+    // single entry point (intra-process parenting, cross-process linking, and
+    // transitive refresh); a separate pre-pass would mark the clients it
+    // parents as wire-derived and exempt them from the refresh.
+    let mut flat: Vec<LocalSpan> = pending.drain().flat_map(|(_, spans)| spans).collect();
+    if flat.is_empty() {
+        return;
+    }
+    // Parenting only ever adds `propagated` to CLIENT entries and cross-linking
+    // only to SERVER entries, so per-kind pre/post deltas attribute each
+    // adoption to its origin without a second pass.
+    let pre_clients = propagated_count_of_kind(&flat, SpanKind::Client);
+    let pre_servers = propagated_count_of_kind(&flat, SpanKind::Server);
+    assign_batch_hierarchy(&mut flat);
+    counters.add_spans_parented(
+        (propagated_count_of_kind(&flat, SpanKind::Client) - pre_clients) as u64,
+    );
+    counters.add_spans_cross_linked(
+        (propagated_count_of_kind(&flat, SpanKind::Server) - pre_servers) as u64,
+    );
+
+    let mut by_service: HashMap<String, Vec<LocalSpan>> = HashMap::new();
+    for entry in flat {
+        by_service
+            .entry(entry.ctx.service_name.clone())
+            .or_default()
+            .push(entry);
+    }
+
+    for (service, entries) in by_service {
+        if entries.is_empty() {
             continue;
         }
         let Some(delivery) = deliveries.get(&service) else {
             continue; // no target for this service (raced with removal)
         };
         let shipper = delivery.flow_shipper.clone();
+
+        // Arm 1: the legacy RequestSignal batch, unchanged.
+        let signals: Vec<RequestSignal> = entries
+            .iter()
+            .map(|entry| to_request_signal(&entry.record, &entry.ctx))
+            .collect();
+        let legacy_shipper = shipper.clone();
+        let legacy_service = service.clone();
         tokio::spawn(async move {
-            match shipper.encode_request_signal_batch(spans) {
-                Ok((encoded, count)) => match shipper.send_with_retry(&encoded).await {
-                    Ok(_) => debug!(service, spans = count, "eBPF L7: shipped span batch"),
-                    Err(e) => {
-                        warn!(service, error = %e, "eBPF L7: span batch ship failed (best-effort)")
+            match legacy_shipper.encode_request_signal_batch(signals) {
+                Ok((encoded, count)) => match legacy_shipper.send_with_retry(&encoded).await {
+                    Ok(_) => {
+                        debug!(
+                            service = legacy_service,
+                            spans = count,
+                            "eBPF L7: shipped span batch"
+                        )
                     }
+                    Err(e) => warn!(
+                        service = legacy_service,
+                        error = %e,
+                        "eBPF L7: span batch ship failed (best-effort)"
+                    ),
                 },
-                Err(e) => warn!(service, error = %e, "eBPF L7: span batch encode failed"),
+                Err(e) => {
+                    warn!(service = legacy_service, error = %e, "eBPF L7: span batch encode failed")
+                }
             }
         });
+
+        // Arm 2: the same records as OTLP spans on the Traces arm.
+        if spans_otlp {
+            let resource_attrs = otlp_resource_attributes(&service, &host);
+            let mut spans_json: Vec<Vec<u8>> = Vec::with_capacity(entries.len());
+            for entry in &entries {
+                let span = to_otlp_span(&entry.record, &entry.ctx, entry.kind);
+                let value = crate::trace_wire::span_to_json_value(&span, &service, &resource_attrs);
+                match serde_json::to_vec(&value) {
+                    Ok(bytes) => spans_json.push(bytes),
+                    Err(e) => warn!(service, error = %e, "eBPF L7: OTLP span render failed"),
+                }
+            }
+            counters.add_spans_built(spans_json.len() as u64);
+            let otlp_shipper = shipper.clone();
+            let otlp_service = service.clone();
+            let otlp_counters = counters.clone();
+            tokio::spawn(async move {
+                match otlp_shipper.encode_trace_json_batch(spans_json) {
+                    Ok((encoded, count)) => match otlp_shipper.send_with_retry(&encoded).await {
+                        Ok(_) => debug!(
+                            service = otlp_service,
+                            spans = count,
+                            "eBPF L7: shipped OTLP span batch"
+                        ),
+                        Err(e) => {
+                            otlp_counters.increment_spans_ship_failed();
+                            warn!(
+                                service = otlp_service,
+                                error = %e,
+                                "eBPF L7: OTLP span batch ship failed (best-effort)"
+                            );
+                        }
+                    },
+                    Err(e) => warn!(
+                        service = otlp_service,
+                        error = %e,
+                        "eBPF L7: OTLP span batch encode failed"
+                    ),
+                }
+            });
+        }
     }
 }
 
@@ -2350,5 +2552,69 @@ mod tests {
 
         assert_eq!(stable.published_counts, vec![2]);
         assert_eq!(*fenced_counts.borrow(), vec![vec![1], vec![2]]);
+    }
+
+    #[test]
+    fn span_kind_from_hint_is_tri_state_and_never_guessed() {
+        // (port-hint client verdict, expected kind). The no-hint row is the
+        // contract: an unhinted flow must stay UNSPECIFIED, not become Server.
+        for (client, expected) in [
+            (Some(true), Some(SpanKind::Client)), // flip → monitored process is the client
+            (Some(false), Some(SpanKind::Server)), // hinted, no flip → it is the server
+            (None, None),                         // no hint → UNSPECIFIED, never guessed
+        ] {
+            assert_eq!(span_kind_from_hint(client), expected, "client={client:?}");
+        }
+    }
+
+    #[test]
+    fn span_kind_verdict_prefers_hint_then_byte_verdict_then_unspecified() {
+        // (port-hint client verdict, byte-derived role, expected kind). The
+        // hint owns direction where it exists; the byte verdict decides
+        // unhinted connections; unhinted + unrecognised stays UNSPECIFIED.
+        for (hint_client, byte_role, expected) in [
+            (Some(true), None, Some(SpanKind::Client)),
+            (Some(true), Some(PeerRole::Server), Some(SpanKind::Client)),
+            (Some(false), None, Some(SpanKind::Server)),
+            (Some(false), Some(PeerRole::Client), Some(SpanKind::Server)),
+            (None, Some(PeerRole::Client), Some(SpanKind::Client)),
+            (None, Some(PeerRole::Server), Some(SpanKind::Server)),
+            (None, None, None), // never a guess
+        ] {
+            assert_eq!(
+                span_kind_verdict(hint_client, byte_role),
+                expected,
+                "hint={hint_client:?} role={byte_role:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn otlp_resource_attributes_carry_identity_and_provenance() {
+        let attrs = otlp_resource_attributes("checkout", "edge-host-1");
+        let obj = attrs
+            .as_object()
+            .expect("resource attributes are an object");
+        assert_eq!(
+            obj.get("service.name").unwrap(),
+            &serde_json::json!("checkout")
+        );
+        assert_eq!(
+            obj.get("host.name").unwrap(),
+            &serde_json::json!("edge-host-1")
+        );
+        assert_eq!(
+            obj.get("telemetry.sdk.name").unwrap(),
+            &serde_json::json!("edgepacer")
+        );
+        assert_eq!(
+            obj.get("telemetry.sdk.version").unwrap(),
+            &serde_json::json!(crate::common::VERSION)
+        );
+        assert_eq!(
+            obj.get("edgepacer.capture").unwrap(),
+            &serde_json::json!("ebpf-l7")
+        );
+        assert_eq!(obj.len(), 5, "exactly the five identity/provenance keys");
     }
 }

@@ -78,6 +78,15 @@ pub struct LogChunk {
     pub pid: u32,
     pub fd: u32,
     pub len: u32,
+    /// `bpf_ktime_get_ns()` (CLOCK_BOOTTIME) at capture — userspace converts
+    /// to unix nanos with a sampled realtime−boottime offset so timing is
+    /// kernel-derived. Zero means "unstamped": userspace falls back to
+    /// wall-clock now.
+    pub observed_ktime_ns: u64,
+    /// The capturing thread id — the low half of `bpf_get_current_pid_tgid`
+    /// (`pid` above is the high half, tgid). Rides the struct for later
+    /// slices; userspace does not consume it yet.
+    pub tid: u32,
     pub data: [u8; CHUNK_LEN],
 }
 
@@ -127,6 +136,10 @@ pub struct L7Chunk {
     pub fd: u32,
     pub len: u32,
     pub direction: u8,
+    /// Kernel capture timestamp — see `LogChunk::observed_ktime_ns`.
+    pub observed_ktime_ns: u64,
+    /// The capturing thread id — see `LogChunk::tid`.
+    pub tid: u32,
     pub data: [u8; L7_CHUNK_LEN],
 }
 
@@ -149,5 +162,9 @@ pub struct TlsChunk {
     pub pid: u32,
     pub len: u32,
     pub direction: u8,
+    /// Kernel capture timestamp — see `LogChunk::observed_ktime_ns`.
+    pub observed_ktime_ns: u64,
+    /// The capturing thread id — see `LogChunk::tid`.
+    pub tid: u32,
     pub data: [u8; L7_CHUNK_LEN],
 }

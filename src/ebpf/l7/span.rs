@@ -62,6 +62,18 @@ fn span_attributes(
     attributes
 }
 
+/// The trace id a new spanlet's context carries: the propagated trace id
+/// when the request carried a valid trace context, else the freshly minted
+/// one. Both span arms build from this same context, so a propagated trace
+/// stays identical in either arm.
+pub fn ctx_trace_id(record: &L7Record, minted: Vec<u8>) -> Vec<u8> {
+    record
+        .propagated
+        .as_ref()
+        .map(|p| p.trace_id.to_vec())
+        .unwrap_or(minted)
+}
+
 /// Mint a span/trace id without a crypto RNG: spread a monotonic `seed` with a
 /// splitmix64 finalizer, repeated to fill `len` bytes. v1 emits spanlets, so ids
 /// only need to be unique per agent run; cryptographic randomness + propagated
@@ -94,6 +106,7 @@ mod tests {
             error: true,
             start_unix_nano: 1_000,
             duration_nano: 250,
+            propagated: None,
         }
     }
 
@@ -130,6 +143,45 @@ mod tests {
             sig.attributes.get("peer.address").map(String::as_str),
             Some("10.0.0.5:5432")
         );
+    }
+
+    #[test]
+    fn ctx_trace_id_prefers_propagated_over_minted() {
+        let minted = vec![0x11; 16];
+        assert_eq!(ctx_trace_id(&record(), minted.clone()), minted);
+
+        let propagated = L7Record {
+            propagated: Some(crate::ebpf::l7::PropagatedContext {
+                trace_id: [0x4b; 16],
+                parent_span_id: [0xf0; 8],
+                trace_flags: 0x01,
+                trace_state: String::new(),
+            }),
+            ..record()
+        };
+        assert_eq!(
+            ctx_trace_id(&propagated, minted),
+            vec![0x4b; 16],
+            "a valid propagated context replaces the minted trace id"
+        );
+    }
+
+    #[test]
+    fn request_signal_never_adopts_a_remote_parent() {
+        // The RequestSignal contract has no remote-parent semantics: even a
+        // propagated record ships an empty parent_span_id (the OTLP arm is
+        // the one that joins the caller's trace).
+        let propagated = L7Record {
+            propagated: Some(crate::ebpf::l7::PropagatedContext {
+                trace_id: [0x4b; 16],
+                parent_span_id: [0xf0; 8],
+                trace_flags: 0x01,
+                trace_state: "vendor=opaque".to_string(),
+            }),
+            ..record()
+        };
+        let sig = to_request_signal(&propagated, &ctx());
+        assert!(sig.parent_span_id.is_empty());
     }
 
     #[test]

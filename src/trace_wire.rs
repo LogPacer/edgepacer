@@ -99,6 +99,11 @@ pub fn span_to_json_value(span: &Span, service_name: &str, resource_attributes: 
         obj.insert("status".into(), status_to_json(status));
     }
 
+    // Trace state: pass through verbatim, omit when empty.
+    if !span.trace_state.is_empty() {
+        obj.insert("trace_state".into(), json!(span.trace_state));
+    }
+
     // Service name: omit when empty.
     if !service_name.is_empty() {
         obj.insert("service_name".into(), json!(service_name));
@@ -283,6 +288,39 @@ mod tests {
         assert_eq!(value["attributes"], json!({}));
         assert_eq!(value["kind"], json!("INTERNAL"));
         assert_eq!(value["duration_ms"], json!(0));
+    }
+
+    /// `trace_state` passthrough: rendered verbatim when the span carries one,
+    /// omitted entirely when empty. Both halves asserted so the omission half
+    /// can't pass vacuously against a renderer that never emits the field.
+    /// Reviewer-owned Slice 2 acceptance (additive field; logrelay stores span
+    /// JSON verbatim, so downstream is unaffected until it opts in).
+    #[test]
+    fn trace_state_renders_when_present_and_is_omitted_when_empty() {
+        let mut span = Span {
+            trace_id: vec![0x01; 16],
+            span_id: vec![0x02; 8],
+            name: "GET /x".into(),
+            kind: span::SpanKind::Server as i32,
+            start_time_unix_nano: 1_000_000,
+            end_time_unix_nano: 2_000_000,
+            trace_state: "vendor=opaque,other=1".into(),
+            ..Default::default()
+        };
+
+        let with_state = span_to_json_value(&span, "svc", &json!({}));
+        assert_eq!(
+            with_state["trace_state"],
+            json!("vendor=opaque,other=1"),
+            "non-empty tracestate passes through verbatim"
+        );
+
+        span.trace_state = String::new();
+        let without = span_to_json_value(&span, "svc", &json!({}));
+        assert!(
+            !without.as_object().unwrap().contains_key("trace_state"),
+            "empty tracestate omits the field (omit-if-empty contract)"
+        );
     }
 
     #[test]

@@ -19,11 +19,14 @@ pub struct PortHint {
     pub client: bool,
 }
 
-/// A resolved connection: the port-derived protocol hint (for detection) and the
-/// peer endpoint `"ip:port"` — the service-map edge's other node.
+/// A resolved connection: the port-derived protocol hint (for detection) and
+/// the connection's endpoints as `"ip:port"` — `peer` (the remote, the
+/// service-map edge's other node) and `local` (the capturing process's own
+/// end — the same-host cross-process linking key).
 pub struct ResolvedConn {
     pub hint: Option<PortHint>,
     pub peer: String,
+    pub local: String,
 }
 
 /// Well-known TCP port → wire protocol. Only ports with an unambiguous default
@@ -92,20 +95,23 @@ fn parse_hex_ip(hex: &str) -> Option<String> {
     }
 }
 
-/// Parse `(local_port, remote_ip, remote_port)` of the row with `inode` from a
-/// `/proc/net/tcp(6)` table. Columns: `sl local_address rem_address st … inode`;
-/// addresses are `HEXIP:HEXPORT`, the inode is column 9.
-fn endpoints_for_inode(table: &str, inode: &str) -> Option<(u16, String, u16)> {
+/// Parse `(local_ip, local_port, remote_ip, remote_port)` of the row with
+/// `inode` from a `/proc/net/tcp(6)` table. Columns:
+/// `sl local_address rem_address st … inode`; addresses are `HEXIP:HEXPORT`,
+/// the inode is column 9.
+fn endpoints_for_inode(table: &str, inode: &str) -> Option<(String, u16, String, u16)> {
     for line in table.lines().skip(1) {
         let cols: Vec<&str> = line.split_whitespace().collect();
         if cols.len() < 10 || cols[9] != inode {
             continue;
         }
-        let local_port = u16::from_str_radix(cols[1].split(':').nth(1)?, 16).ok()?;
+        let (lip, lport) = cols[1].split_once(':')?;
+        let local_ip = parse_hex_ip(lip)?;
+        let local_port = u16::from_str_radix(lport, 16).ok()?;
         let (rip, rport) = cols[2].split_once(':')?;
         let remote_ip = parse_hex_ip(rip)?;
         let remote_port = u16::from_str_radix(rport, 16).ok()?;
-        return Some((local_port, remote_ip, remote_port));
+        return Some((local_ip, local_port, remote_ip, remote_port));
     }
     None
 }
@@ -125,10 +131,11 @@ pub fn resolve(pid: u32, fd: u32) -> Option<ResolvedConn> {
         let Ok(content) = std::fs::read_to_string(format!("/proc/{pid}/net/{table}")) else {
             continue;
         };
-        if let Some((local, remote_ip, remote)) = endpoints_for_inode(&content, &inode) {
+        if let Some((local_ip, local, remote_ip, remote)) = endpoints_for_inode(&content, &inode) {
             return Some(ResolvedConn {
                 hint: hint_from_ports(local, remote),
                 peer: format!("{remote_ip}:{remote}"),
+                local: format!("{local_ip}:{local}"),
             });
         }
     }
@@ -142,14 +149,36 @@ mod tests {
     const SAMPLE: &str = "\
   sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode
    0: 0100007F:1538 0100007F:E4D2 01 00000000:00000000 00:00000000 00000000  1000        0 98765 1
-   1: 0100007F:A1B2 0100007F:0050 06 00000000:00000000 00:00000000 00000000     0        0 11223 1";
+   1: 0100007F:A1B2 0100007F:0050 06 00000000:00000000 00:00000000 00000000     0        0 11223 1
+   2: 0F00A8C0:D3D2 0100007F:1F40 01 00000000:00000000 00:00000000 00000000  1000        0 55443 1";
 
     #[test]
     fn parses_endpoints_for_a_matching_inode() {
-        // local 0x1538=5432 (postgres); remote 127.0.0.1 (0100007F LE) : 0xE4D2.
+        // local 127.0.0.1 (0100007F LE) : 0x1538=5432 (postgres);
+        // remote 127.0.0.1 : 0xE4D2.
         assert_eq!(
             endpoints_for_inode(SAMPLE, "98765"),
-            Some((0x1538, "127.0.0.1".to_string(), 0xE4D2))
+            Some((
+                "127.0.0.1".to_string(),
+                0x1538,
+                "127.0.0.1".to_string(),
+                0xE4D2
+            ))
+        );
+    }
+
+    #[test]
+    fn parses_local_endpoint_from_a_distinct_local_address_row() {
+        // A row with a different local address proves the local column is
+        // read per row, not assumed: 0F00A8C0 = 192.168.0.15 (LE), 0xD3D2.
+        assert_eq!(
+            endpoints_for_inode(SAMPLE, "55443"),
+            Some((
+                "192.168.0.15".to_string(),
+                0xD3D2,
+                "127.0.0.1".to_string(),
+                0x1F40
+            ))
         );
     }
 

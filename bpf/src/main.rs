@@ -341,6 +341,8 @@ fn try_capture(ctx: &TracePointContext) -> Result<(), i64> {
         } else {
             count as u32
         };
+        (*record).observed_ktime_ns = bpf_ktime_get_ns();
+        (*record).tid = bpf_get_current_pid_tgid() as u32;
         // Fixed-size read keeps the verifier happy; a short user buffer near a
         // page boundary can fault, in which case we drop this event.
         if bpf_probe_read_user_buf(buf, &mut (*record).data).is_err() {
@@ -407,6 +409,8 @@ fn try_capture_writev(ctx: &TracePointContext) -> Result<(), i64> {
         } else {
             iov_len as u32
         };
+        (*record).observed_ktime_ns = bpf_ktime_get_ns();
+        (*record).tid = bpf_get_current_pid_tgid() as u32;
         if bpf_probe_read_user_buf(iov_base as *const u8, &mut (*record).data).is_err() {
             entry.discard(0);
             return Ok(());
@@ -614,6 +618,8 @@ fn emit_l7(
         } else {
             count as u32
         };
+        (*record).observed_ktime_ns = bpf_ktime_get_ns();
+        (*record).tid = bpf_get_current_pid_tgid() as u32;
         if bpf_probe_read_user_buf(buf, &mut (*record).data).is_err() {
             entry.discard(0);
             return Ok(());
@@ -784,6 +790,8 @@ fn emit_tls(
         } else {
             count as u32
         };
+        (*record).observed_ktime_ns = bpf_ktime_get_ns();
+        (*record).tid = bpf_get_current_pid_tgid() as u32;
         if bpf_probe_read_user_buf(buf, &mut (*record).data).is_err() {
             entry.discard(0);
             return Ok(());

@@ -12,6 +12,7 @@
 mod amqp;
 mod amqp1;
 mod cassandra;
+mod causality;
 mod clickhouse;
 mod conn;
 mod dns;
@@ -24,7 +25,9 @@ mod mongodb;
 mod mqtt;
 mod mysql;
 mod nats;
+mod otlp;
 mod postgres;
+mod propagation;
 mod pulsar;
 mod red;
 mod redis;
@@ -35,11 +38,14 @@ mod tds;
 #[cfg(test)]
 mod exports_demo;
 
+pub(crate) use causality::{ConnEndpoints, LocalSpan, assign_batch_hierarchy};
 pub(crate) use conn::CapturedConnectionIdentity;
-pub use conn::{CapturedSegment, ConnRegistry};
+pub use conn::{CapturedSegment, ConnRegistry, PeerRole};
 pub use edge::EdgeAggregator;
+pub(crate) use otlp::to_otlp_span;
+pub use propagation::PropagatedContext;
 pub use red::RedAggregator;
-pub use span::{SpanContext, mint_id, to_request_signal};
+pub use span::{SpanContext, ctx_trace_id, mint_id, to_request_signal};
 
 /// Direction of a captured socket segment, from the monitored server's view:
 /// `Inbound` = bytes it read (requests), `Outbound` = bytes it wrote (responses).
@@ -125,12 +131,19 @@ pub struct L7Record {
     /// When the request was received (unix nanos). The span's start time.
     pub start_unix_nano: i64,
     /// Server latency: response-observed minus request-observed (unix-nano diff).
-    /// Approximate (segment arrival times, not kernel ktime) — a refinement.
+    /// Kernel-derived when the BPF object stamps segments (capture ktime,
+    /// converted to unix nanos in the drain); wall-clock arrival times
+    /// otherwise (synthetic tests, unstamped chunks).
     pub duration_nano: i64,
     /// Protocol-specific span enrichment (e.g. HTTP `host`, `llm.model`) merged
     /// into the exported `RequestSignal.attributes`. Empty for parsers that encode
     /// everything in `operation`.
     pub attributes: Vec<(String, String)>,
+    /// Trace context extracted from the request's propagation headers —
+    /// `None` for protocols without propagation headers, requests lacking
+    /// them, and headers that failed validation. Only the http family
+    /// extracts; every other parser leaves this `None`.
+    pub propagated: Option<PropagatedContext>,
 }
 
 impl L7Record {
@@ -215,6 +228,7 @@ mod tests {
             start_unix_nano: 0,
             duration_nano: 0,
             attributes,
+            propagated: None,
         }
     }
 

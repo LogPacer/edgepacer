@@ -333,6 +333,7 @@ impl NatsParser {
             error: false,
             start_unix_nano: ts,
             duration_nano: 0,
+            propagated: None,
         });
     }
 
@@ -427,6 +428,7 @@ impl NatsParser {
                         error: false,
                         start_unix_nano: ping.start_unix_nano,
                         duration_nano: ts.saturating_sub(ping.start_unix_nano).max(0),
+                        propagated: None,
                     });
                 }
             }
@@ -439,6 +441,7 @@ impl NatsParser {
                 error: true,
                 start_unix_nano: ts,
                 duration_nano: 0,
+                propagated: None,
             }),
             // Server deliveries / acks / banner: out-of-band, no record.
             Msg::ClientOp(_) | Msg::Ping | Msg::Ignored => {}

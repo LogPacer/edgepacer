@@ -137,6 +137,7 @@ mod tests {
             error: status >= 500,
             start_unix_nano: 0,
             duration_nano: duration,
+            propagated: None,
         }
     }
 

@@ -37,6 +37,9 @@ pub struct CapturedSegment {
     /// Atomically selected cgroup or PID authorization-policy generation.
     pub policy_generation: u64,
     pub pid: u32,
+    /// The kernel-reported thread that captured this segment — the causality
+    /// key for local span parenting. Zero for synthetic segments.
+    pub tid: u32,
     /// The capturing task's v2 cgroup id — the container/service identity key.
     pub cgroup_id: u64,
     /// The configured workload anchor that authorized capture. This may be an
@@ -79,7 +82,7 @@ enum Detect {
     Parser(Box<dyn L7Parser>),
     /// Enough bytes seen without a match — not a supported protocol; drop it.
     Unknown,
-    /// Inconclusive so far — wait for more inbound bytes.
+    /// Inconclusive so far — wait for more bytes.
     NeedMore,
 }
 
@@ -268,6 +271,15 @@ fn looks_like_any_request(bytes: &[u8]) -> bool {
         || pulsar::detect_pulsar(bytes).is_some()
 }
 
+/// Which side of a connection the monitored process is, decided from bytes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PeerRole {
+    /// It read the request: the monitored process serves this connection.
+    Server,
+    /// It wrote the request: the monitored process calls out on this connection.
+    Client,
+}
+
 /// State for one captured connection identity: buffers the inbound prefix until the
 /// protocol is recognised, then delegates each direction to the bound parser.
 #[derive(Debug, Default)]
@@ -279,6 +291,9 @@ struct ConnTracker {
     /// Bytes seen before detection, replayed into the parser once it binds.
     pre_inbound: Vec<u8>,
     pre_outbound: Vec<u8>,
+    /// Set when detection recognised an opener, naming the side that sent it.
+    /// `None` while undecided or when a port hint bound the parser instead.
+    byte_role: Option<PeerRole>,
 }
 
 impl ConnTracker {
@@ -290,17 +305,25 @@ impl ConnTracker {
         protocol_hint: Option<&str>,
         flip: bool,
     ) {
-        // When the monitored process is the client of a known service (a remote
-        // protocol port), its writes are the requests — flip so the parser still
-        // sees inbound = request, outbound = response.
-        let dir = if flip { dir.opposite() } else { dir };
+        // When the monitored process is the client — the port hint's flip, or a
+        // byte verdict from an outbound opener — its writes are the requests:
+        // flip so the parser still sees inbound = request, outbound = response.
+        let dir = if flip || self.byte_role == Some(PeerRole::Client) {
+            dir.opposite()
+        } else {
+            dir
+        };
 
         if self.dead {
-            // fd reuse / mid-stream resync: a fresh inbound request on a dead
-            // connection restarts it. The prior stream killed it — e.g. a file
-            // closed on the same fd, then reopened as a socket, or corrupt bytes.
+            // fd reuse / mid-stream resync: a fresh request OPENER on a dead
+            // connection restarts it — in either direction: fds are recycled
+            // by number (the hooks see file I/O too, so unparseable bytes
+            // routinely kill a tracker), and a client connection on a
+            // recycled fd opens with an OUTBOUND request. A response never
+            // resurrects. The prior stream killed it — e.g. a file closed on
+            // the same fd, then reopened as a socket, or corrupt bytes.
             // Eviction on close(2) is the cleaner fix and a planned refinement.
-            if dir == Direction::Inbound && looks_like_any_request(bytes) {
+            if looks_like_any_request(bytes) {
                 *self = ConnTracker::default();
             } else {
                 return;
@@ -318,26 +341,84 @@ impl ConnTracker {
             return;
         }
 
-        // Pre-detection: buffer each direction, then try to recognise the protocol
-        // from the inbound prefix.
+        // Pre-detection: buffer each direction, then try to recognise the
+        // protocol. The inbound prefix decides first; when it declines, the
+        // outbound prefix gets the same chance — a monitored client's first
+        // bytes are the request. Whichever side yields a parser first names
+        // the roles (issue #133: detection used to consult the inbound prefix
+        // only, so client-side HTTP was never recognised at all).
         match dir {
             Direction::Inbound => self.pre_inbound.extend_from_slice(bytes),
             Direction::Outbound => self.pre_outbound.extend_from_slice(bytes),
         }
-        match detect(&self.pre_inbound, protocol_hint) {
-            Detect::Parser(mut parser) => {
-                let inbound = std::mem::take(&mut self.pre_inbound);
-                let outbound = std::mem::take(&mut self.pre_outbound);
-                parser.on_inbound(&inbound, ts);
-                parser.on_outbound(&outbound, ts);
-                if parser.is_dead() {
-                    self.kill();
-                } else {
-                    self.parser = Some(parser);
-                }
+        let inbound = detect(&self.pre_inbound, protocol_hint);
+        // First-speaker semantics: the outbound prefix is only considered
+        // while the peer has not spoken at all (pre_inbound empty) — whoever
+        // sent the first recognisable request names the roles, and a real
+        // client always satisfies that (its request precedes any inbound
+        // byte). Without the gate, a server whose inbound request is still
+        // partial could be mis-roled Client by an outbound segment that
+        // happens to match an opener signature.
+        let outbound = if protocol_hint.is_none() && self.pre_inbound.is_empty() {
+            detect(&self.pre_outbound, None)
+        } else {
+            Detect::NeedMore
+        };
+        match (inbound, outbound) {
+            (Detect::Parser(parser), _) => {
+                // Inbound opener (or a port-hint bind): the monitored process
+                // read the request. A hint-bound parser carries no byte
+                // verdict — the hint owns direction where it exists.
+                self.bind(
+                    parser,
+                    protocol_hint.is_none().then_some(PeerRole::Server),
+                    false,
+                    ts,
+                );
             }
-            Detect::Unknown => self.kill(),
-            Detect::NeedMore => {}
+            (_, Detect::Parser(parser)) => {
+                // Outbound opener: the monitored process wrote the request —
+                // replay with request/response sense flipped and keep it
+                // flipped for the connection's life (byte_role above).
+                self.bind(parser, Some(PeerRole::Client), true, ts);
+            }
+            // An unrecognised inbound prefix keeps today's verdict: kill (the
+            // request side spoke first and said nothing supported — an fd
+            // reused for a fresh connection restarts from dead). An
+            // outbound-side Unknown must NOT kill while the inbound side may
+            // still be about to open: whoever answers a mid-stream attach
+            // gets its opener bound when it arrives.
+            (Detect::Unknown, _) => self.kill(),
+            (_, Detect::Unknown) => {}
+            _ => {}
+        }
+    }
+
+    /// Bind a detected parser, replaying the buffered prefixes in the
+    /// connection's request/response orientation: `flipped` feeds the buffered
+    /// OUTBOUND bytes to the parser's inbound (requests) and vice versa — the
+    /// port hint's flip, decided from bytes.
+    fn bind(
+        &mut self,
+        mut parser: Box<dyn L7Parser>,
+        role: Option<PeerRole>,
+        flipped: bool,
+        ts: i64,
+    ) {
+        let inbound = std::mem::take(&mut self.pre_inbound);
+        let outbound = std::mem::take(&mut self.pre_outbound);
+        if flipped {
+            parser.on_inbound(&outbound, ts);
+            parser.on_outbound(&inbound, ts);
+        } else {
+            parser.on_inbound(&inbound, ts);
+            parser.on_outbound(&outbound, ts);
+        }
+        if parser.is_dead() {
+            self.kill();
+        } else {
+            self.byte_role = role;
+            self.parser = Some(parser);
         }
     }
 
@@ -346,6 +427,8 @@ impl ConnTracker {
         self.parser = None;
         self.pre_inbound = Vec::new();
         self.pre_outbound = Vec::new();
+        // A restart (fd reuse) re-derives the role from fresh bytes.
+        self.byte_role = None;
     }
 
     fn take_records(&mut self) -> Vec<L7Record> {
@@ -402,6 +485,22 @@ impl ConnRegistry {
         tracker.take_records()
     }
 
+    /// Which side of a connection the monitored process turned out to be,
+    /// decided from the bytes: whoever sent the first recognisable request is
+    /// the client. `None` until a byte verdict exists (still buffering, a
+    /// port-hint-bound parser whose direction came from config, or a
+    /// mid-stream attach that never saw an opener) — the caller must then
+    /// leave the span kind unspecified rather than guess.
+    ///
+    /// Direct evidence, unlike the port table's inference: a connection is
+    /// client-side because the monitored process *wrote* the request, not
+    /// because a remote port looked well-known.
+    pub fn byte_role(&self, seg: &CapturedSegment) -> Option<PeerRole> {
+        self.conns
+            .get(&seg.connection_identity())
+            .and_then(|tracker| tracker.byte_role)
+    }
+
     /// Evict a connection (called on `close(2)` in the real wiring, and on a
     /// fatal parse error so the slot frees immediately).
     pub fn on_close(&mut self, pid: u32, fd: u32) {
@@ -427,6 +526,7 @@ mod tests {
             capture_generation: 0,
             policy_generation: 0,
             pid,
+            tid: 0,
             cgroup_id: 0,
             scope_cgroup_id: 0,
             fd,
@@ -448,6 +548,7 @@ mod tests {
             capture_generation: 1,
             policy_generation: 1,
             pid,
+            tid: 0,
             cgroup_id,
             scope_cgroup_id,
             fd,
@@ -455,6 +556,250 @@ mod tests {
             timestamp_nano: 0,
             bytes: bytes.to_vec(),
         }
+    }
+
+    // ── Byte-derived connection role (reviewer-owned acceptance) ────────────
+    //
+    // HTTP ports are deliberately absent from the port table, so an HTTP
+    // connection never carries a hint: today detection only consults the
+    // inbound prefix, so a monitored *client* is never recognised, produces no
+    // records at all, and its span kind can only be UNSPECIFIED. Whoever sends
+    // the first recognisable request names the roles — direct evidence, not the
+    // port table's inference.
+
+    const REQ: &[u8] = b"GET /api/users HTTP/1.1\r\nHost: api.internal\r\n\r\n";
+    const RESP: &[u8] = b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n";
+
+    /// Why symmetric detection alone was not enough in live capture: the L7
+    /// hooks fire for every `read`/`write` an authorized process makes, files
+    /// included, so unparseable bytes routinely kill the tracker for an fd
+    /// number. fds are then recycled as sockets — and resurrection only ever
+    /// accepted an INBOUND request, so a server connection landing on a
+    /// recycled fd recovers while a CLIENT connection on one stays invisible
+    /// forever. That asymmetry is exactly what live capture showed: HTTP
+    /// server spans flowing, client spans never appearing, with the unit
+    /// tests green because a fresh tracker is never dead.
+    #[test]
+    fn recycled_fd_resurrects_for_a_client_connection() {
+        let mut reg = ConnRegistry::new();
+        // A file read on this fd: unparseable, so the tracker is killed.
+        reg.on_segment(&seg(20, 9, Direction::Inbound, &[0xff; 16]));
+        // The fd is recycled as a client socket — our request goes out first.
+        assert!(
+            reg.on_segment(&seg(20, 9, Direction::Outbound, REQ))
+                .is_empty(),
+            "the request alone completes nothing"
+        );
+        let records = reg.on_segment(&seg(20, 9, Direction::Inbound, RESP));
+        assert_eq!(
+            records.len(),
+            1,
+            "a recycled fd must not stay dead for client connections"
+        );
+        assert_eq!(records[0].operation, "GET /api/users");
+        assert_eq!(
+            reg.byte_role(&seg(20, 9, Direction::Outbound, REQ)),
+            Some(PeerRole::Client)
+        );
+    }
+
+    /// The server half of the same rule, green today — a guard so the
+    /// outbound resurrection cannot regress it.
+    #[test]
+    fn recycled_fd_still_resurrects_for_a_server_connection() {
+        let mut reg = ConnRegistry::new();
+        reg.on_segment(&seg(21, 9, Direction::Inbound, &[0xff; 16]));
+        assert!(
+            reg.on_segment(&seg(21, 9, Direction::Inbound, REQ))
+                .is_empty()
+        );
+        let records = reg.on_segment(&seg(21, 9, Direction::Outbound, RESP));
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].operation, "GET /api/users");
+    }
+
+    /// The gap this slice closes: the monitored process wrote the request, so
+    /// the exchange must still reconstruct — with the record's request/response
+    /// sense taken from the bytes, not from an absent port hint.
+    #[test]
+    fn client_side_http_connection_yields_records() {
+        let mut reg = ConnRegistry::new();
+        assert!(
+            reg.on_segment(&seg(7, 3, Direction::Outbound, REQ))
+                .is_empty(),
+            "the request alone completes nothing"
+        );
+        let records = reg.on_segment(&seg(7, 3, Direction::Inbound, RESP));
+        assert_eq!(records.len(), 1, "the response completes the pair");
+        assert_eq!(records[0].operation, "GET /api/users");
+        assert_eq!(records[0].status_code, 200);
+    }
+
+    /// The verdict itself, both ways — one test so neither half can pass
+    /// vacuously against an implementation that always answers the same.
+    #[test]
+    fn byte_role_names_the_side_that_sent_the_request() {
+        let mut client = ConnRegistry::new();
+        let client_seg = seg(7, 3, Direction::Outbound, REQ);
+        client.on_segment(&client_seg);
+        client.on_segment(&seg(7, 3, Direction::Inbound, RESP));
+        assert_eq!(client.byte_role(&client_seg), Some(PeerRole::Client));
+
+        let mut server = ConnRegistry::new();
+        let server_seg = seg(8, 4, Direction::Inbound, REQ);
+        server.on_segment(&server_seg);
+        server.on_segment(&seg(8, 4, Direction::Outbound, RESP));
+        assert_eq!(server.byte_role(&server_seg), Some(PeerRole::Server));
+    }
+
+    /// Regression guard: the server path — every eBPF HTTP span today — must
+    /// reconstruct exactly as before.
+    #[test]
+    fn server_side_http_connection_is_unchanged() {
+        let mut reg = ConnRegistry::new();
+        assert!(
+            reg.on_segment(&seg(9, 5, Direction::Inbound, REQ))
+                .is_empty()
+        );
+        let records = reg.on_segment(&seg(9, 5, Direction::Outbound, RESP));
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].operation, "GET /api/users");
+        assert_eq!(records[0].status_code, 200);
+    }
+
+    /// Never a guessed role: attaching mid-stream (a response arrives with no
+    /// opener ever seen) yields no records and no verdict.
+    #[test]
+    fn mid_stream_attach_yields_no_records_and_no_role() {
+        let mut reg = ConnRegistry::new();
+        let first = seg(10, 6, Direction::Inbound, RESP);
+        assert!(reg.on_segment(&first).is_empty());
+        assert!(
+            reg.on_segment(&seg(10, 6, Direction::Outbound, RESP))
+                .is_empty(),
+            "no opener was ever seen, so nothing reconstructs"
+        );
+        assert_eq!(
+            reg.byte_role(&first),
+            None,
+            "an unrecognised connection must not be assigned a role"
+        );
+    }
+
+    /// A port hint keeps owning direction: its `flip` already encodes the role
+    /// from config, so byte detection must not second-guess it.
+    #[test]
+    fn port_hinted_connections_keep_their_configured_direction() {
+        let mut reg = ConnRegistry::new();
+        // Monitored process is a redis client: the hint names the protocol and
+        // flip says its writes are the requests.
+        let out = seg(11, 7, Direction::Outbound, b"*1\r\n$4\r\nPING\r\n");
+        reg.on_segment_hinted(&out, Some("redis"), true);
+        let records = reg.on_segment_hinted(
+            &seg(11, 7, Direction::Inbound, b"+PONG\r\n"),
+            Some("redis"),
+            true,
+        );
+        assert_eq!(records.len(), 1, "the hinted client path still works");
+        assert_eq!(
+            reg.byte_role(&out),
+            None,
+            "a hint-bound connection reports no byte verdict — the hint owns direction"
+        );
+    }
+
+    /// HTTP/2 client-side opener (issue #133's gRPC case): the h2 client
+    /// preface is sent by the client, so a monitored client's FIRST outbound
+    /// bytes are the preface. The symmetric detection must bind h2 from the
+    /// outbound prefix, name the role Client, and never kill the connection.
+    #[test]
+    fn client_side_http2_preface_yields_client_role_and_records() {
+        let mut reg = ConnRegistry::new();
+
+        // The client's first outbound bytes: preface, then a request HEADERS
+        // block (END_HEADERS | END_STREAM). Frame header = 9 bytes: 3-byte
+        // length, type 0x1 (HEADERS), flags 0x5, 4-byte stream id 1. The
+        // HEADERS payload is HPACK indexed fields from the static table:
+        // 0x82 = :method GET, 0x86 = :scheme http, 0x84 = :path /.
+        let preface = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
+        let headers_block: &[u8] = &[0x82, 0x86, 0x84];
+        let mut headers_frame = vec![0x00, 0x00, headers_block.len() as u8, 0x1, 0x5];
+        headers_frame.extend_from_slice(&1u32.to_be_bytes());
+        headers_frame.extend_from_slice(headers_block);
+
+        let mut opener = preface.to_vec();
+        opener.extend_from_slice(&headers_frame);
+        let opener_seg = seg(12, 8, Direction::Outbound, &opener);
+        assert!(
+            reg.on_segment(&opener_seg).is_empty(),
+            "the request alone completes nothing"
+        );
+
+        // The server's response HEADERS (:status 200 = indexed 0x88), inbound.
+        let resp_block: &[u8] = &[0x88];
+        let mut resp_frame = vec![0x00, 0x00, resp_block.len() as u8, 0x1, 0x5];
+        resp_frame.extend_from_slice(&1u32.to_be_bytes());
+        resp_frame.extend_from_slice(resp_block);
+
+        let records = reg.on_segment(&seg(12, 8, Direction::Inbound, &resp_frame));
+        assert_eq!(records.len(), 1, "the response completes the pair");
+        assert_eq!(records[0].operation, "GET /");
+        assert_eq!(records[0].status_code, 200);
+        assert_eq!(
+            reg.byte_role(&opener_seg),
+            Some(PeerRole::Client),
+            "the client preface was sent outbound, so the role is Client"
+        );
+    }
+
+    /// First-speaker guard: while the peer's request is still partial, an
+    /// outbound segment that matches an opener signature must NOT flip the
+    /// connection to Client — whoever sent the first recognisable request
+    /// names the roles, and the peer (inbound) spoke first. Without the
+    /// pre_inbound-empty gate, the server below would be mis-roled Client.
+    #[test]
+    fn partial_inbound_is_not_misroled_by_an_opener_shaped_outbound() {
+        let mut reg = ConnRegistry::new();
+        // Three bytes: not yet a full "GET " token, so detection waits.
+        let first = seg(14, 10, Direction::Inbound, b"GET");
+        assert!(reg.on_segment(&first).is_empty());
+        // Outbound matching an opener signature: the first speaker must
+        // still decide the role, so no parser may bind here.
+        assert!(
+            reg.on_segment(&seg(14, 10, Direction::Outbound, REQ))
+                .is_empty(),
+            "no parser may bind while the peer's request is pending"
+        );
+        assert_eq!(
+            reg.byte_role(&first),
+            None,
+            "the outbound opener must not second-guess the first speaker"
+        );
+
+        // And the same shape with reply-shaped outbound reconstructs as
+        // Server once the request completes.
+        let mut reg = ConnRegistry::new();
+        let first = seg(15, 11, Direction::Inbound, b"GET");
+        assert!(reg.on_segment(&first).is_empty());
+        assert!(
+            reg.on_segment(&seg(15, 11, Direction::Outbound, RESP))
+                .is_empty()
+        );
+        assert_eq!(reg.byte_role(&first), None, "still undecided mid-request");
+        let records = reg.on_segment(&seg(
+            15,
+            11,
+            Direction::Inbound,
+            b" /x HTTP/1.1\r\nHost: x\r\n\r\n",
+        ));
+        assert_eq!(records.len(), 1, "the buffered reply pairs at bind time");
+        assert_eq!(records[0].operation, "GET /x");
+        assert_eq!(records[0].status_code, 200);
+        assert_eq!(
+            reg.byte_role(&first),
+            Some(PeerRole::Server),
+            "the completed request reconstructs as Server"
+        );
     }
 
     #[test]
