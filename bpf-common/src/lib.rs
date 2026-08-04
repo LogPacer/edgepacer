@@ -60,9 +60,20 @@ pub struct ListenerEvent {
 /// through the ring buffer, large enough to carry a typical log line prefix.
 pub const CHUNK_LEN: usize = 128;
 
+/// Clamp a userspace I/O length to the destination carried by a capture event.
+/// The BPF probes use this value for both the helper read and the recorded
+/// prefix length, so a short valid buffer is never over-read.
+#[inline(always)]
+pub const fn bounded_capture_len(count: u64, capacity: usize) -> u32 {
+    if count > capacity as u64 {
+        capacity as u32
+    } else {
+        count as u32
+    }
+}
+
 /// A captured `write(2)` payload (ADR-002 Level 1 log capture). `len` is the
-/// real write size (may exceed CHUNK_LEN); `data[..min(len, CHUNK_LEN)]` is the
-/// captured prefix.
+/// captured prefix length and never exceeds `CHUNK_LEN`.
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct LogChunk {
@@ -119,9 +130,9 @@ pub const L7_DIR_INBOUND: u8 = 0; // read/recv — request bytes
 pub const L7_DIR_OUTBOUND: u8 = 1; // write/send — response bytes
 
 /// A captured socket payload for L7 protocol parsing (the zero-code APM path,
-/// ADR-002 Level 3). `len` is the real I/O size (may exceed L7_CHUNK_LEN);
-/// `data[..min(len, L7_CHUNK_LEN)]` is the captured prefix. `direction` tags
-/// request vs response bytes so userspace can reassemble each side of a connection.
+/// ADR-002 Level 3). `len` is the captured prefix length and never exceeds
+/// `L7_CHUNK_LEN`. `direction` tags request vs response bytes so userspace can
+/// reassemble each side of a connection.
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct L7Chunk {
@@ -167,4 +178,18 @@ pub struct TlsChunk {
     /// The capturing thread id — see `LogChunk::tid`.
     pub tid: u32,
     pub data: [u8; L7_CHUNK_LEN],
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn capture_length_is_exact_until_the_destination_limit() {
+        assert_eq!(bounded_capture_len(0, CHUNK_LEN), 0);
+        assert_eq!(bounded_capture_len(37, CHUNK_LEN), 37);
+        assert_eq!(bounded_capture_len(CHUNK_LEN as u64, CHUNK_LEN), 128);
+        assert_eq!(bounded_capture_len(CHUNK_LEN as u64 + 1, CHUNK_LEN), 128);
+        assert_eq!(bounded_capture_len(u64::MAX, L7_CHUNK_LEN), 1024);
+    }
 }

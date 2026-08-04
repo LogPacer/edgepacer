@@ -8,7 +8,6 @@
 #![no_main]
 
 use aya_ebpf::{
-    EbpfContext,
     bindings::BPF_TCP_LISTEN,
     helpers::{
         bpf_get_current_ancestor_cgroup_id, bpf_get_current_cgroup_id, bpf_get_current_pid_tgid,
@@ -17,12 +16,13 @@ use aya_ebpf::{
     macros::{map, tracepoint, uprobe, uretprobe},
     maps::{Array, HashMap, PerCpuArray, RingBuf},
     programs::{ProbeContext, RetProbeContext, TracePointContext},
+    EbpfContext,
 };
 use edgepacer_ebpf_common::{
+    bounded_capture_len, ConnectEvent, ExecEvent, L7Chunk, ListenerEvent, LogChunk, TlsChunk,
     CGROUP_LEVEL_FIELD_MASK, CGROUP_LEVEL_MASK, CGROUP_MAX_LEVEL_SHIFT, CGROUP_MIN_LEVEL_SHIFT,
-    CGROUP_SELECTOR_GENERATION_MASK, CGROUP_SELECTOR_SLOT_SHIFT, CHUNK_LEN, ConnectEvent,
-    ExecEvent, L7_CHUNK_LEN, L7_DIR_INBOUND, L7_DIR_OUTBOUND, L7Chunk, ListenerEvent, LogChunk,
-    MAX_ALLOWED_CGROUPS, MAX_CGROUP_ANCESTOR_LEVEL, TlsChunk,
+    CGROUP_SELECTOR_GENERATION_MASK, CGROUP_SELECTOR_SLOT_SHIFT, L7_DIR_INBOUND, L7_DIR_OUTBOUND,
+    MAX_ALLOWED_CGROUPS, MAX_CGROUP_ANCESTOR_LEVEL,
 };
 
 // 256 KiB ring buffer (power of two, page-aligned) shared with userspace.
@@ -227,6 +227,11 @@ static LISTENER_DROPS: PerCpuArray<u64> = PerCpuArray::with_max_entries(1, 0);
 #[map]
 static LISTENER_PUBLISHED: PerCpuArray<u64> = PerCpuArray::with_max_entries(1, 0);
 
+// Per-CPU count of user-buffer reads that faulted after capture authorization.
+// Userspace sums deltas into the agent's lifetime self-telemetry counter.
+#[map]
+static CAPTURE_READ_FAULTS: PerCpuArray<u64> = PerCpuArray::with_max_entries(1, 0);
+
 // inet_sock_set_state announces TCP_LISTEN before listen(2) has completed.
 // Stage the candidate per calling thread; sys_exit_listen emits it only when
 // the syscall succeeds and removes it on every exit.
@@ -336,18 +341,15 @@ fn try_capture(ctx: &TracePointContext) -> Result<(), i64> {
         (*record).policy_generation = scope.policy_generation;
         (*record).pid = pid;
         (*record).fd = fd as u32;
-        (*record).len = if count > CHUNK_LEN as u64 {
-            CHUNK_LEN as u32
-        } else {
-            count as u32
-        };
         (*record).observed_ktime_ns = bpf_ktime_get_ns();
         (*record).tid = bpf_get_current_pid_tgid() as u32;
-        // Fixed-size read keeps the verifier happy; a short user buffer near a
-        // page boundary can fault, in which case we drop this event.
-        if bpf_probe_read_user_buf(buf, &mut (*record).data).is_err() {
-            entry.discard(0);
-            return Ok(());
+        match read_user_prefix(buf, &mut (*record).data, count) {
+            Ok(len) => (*record).len = len,
+            Err(_) => {
+                record_capture_read_fault();
+                entry.discard(0);
+                return Ok(());
+            }
         }
     }
     entry.submit(0);
@@ -384,6 +386,7 @@ fn try_capture_writev(ctx: &TracePointContext) -> Result<(), i64> {
     // Read the first iovec { void *iov_base; size_t iov_len } (16 bytes on 64-bit).
     let mut iov = [0u8; 16];
     if unsafe { bpf_probe_read_user_buf(vec as *const u8, &mut iov) }.is_err() {
+        record_capture_read_fault();
         return Ok(());
     }
     let iov_base = u64::from_ne_bytes([
@@ -404,16 +407,15 @@ fn try_capture_writev(ctx: &TracePointContext) -> Result<(), i64> {
         (*record).policy_generation = scope.policy_generation;
         (*record).pid = pid;
         (*record).fd = fd as u32;
-        (*record).len = if iov_len > CHUNK_LEN as u64 {
-            CHUNK_LEN as u32
-        } else {
-            iov_len as u32
-        };
         (*record).observed_ktime_ns = bpf_ktime_get_ns();
         (*record).tid = bpf_get_current_pid_tgid() as u32;
-        if bpf_probe_read_user_buf(iov_base as *const u8, &mut (*record).data).is_err() {
-            entry.discard(0);
-            return Ok(());
+        match read_user_prefix(iov_base as *const u8, &mut (*record).data, iov_len) {
+            Ok(len) => (*record).len = len,
+            Err(_) => {
+                record_capture_read_fault();
+                entry.discard(0);
+                return Ok(());
+            }
         }
     }
     entry.submit(0);
@@ -550,7 +552,7 @@ fn try_listen_exit(ctx: &TracePointContext) -> Result<(), i64> {
         return Err(0);
     };
 
-    let Some(sequence) = increment_listener_counter(&LISTENER_PUBLISHED) else {
+    let Some(sequence) = increment_per_cpu_counter(&LISTENER_PUBLISHED) else {
         entry.discard(0);
         record_listener_drop();
         return Err(0);
@@ -567,11 +569,16 @@ fn try_listen_exit(ctx: &TracePointContext) -> Result<(), i64> {
 
 #[inline(always)]
 fn record_listener_drop() {
-    let _ = increment_listener_counter(&LISTENER_DROPS);
+    let _ = increment_per_cpu_counter(&LISTENER_DROPS);
 }
 
 #[inline(always)]
-fn increment_listener_counter(counter: &PerCpuArray<u64>) -> Option<u64> {
+fn record_capture_read_fault() {
+    let _ = increment_per_cpu_counter(&CAPTURE_READ_FAULTS);
+}
+
+#[inline(always)]
+fn increment_per_cpu_counter(counter: &PerCpuArray<u64>) -> Option<u64> {
     let Some(value) = counter.get_ptr_mut(0) else {
         return None;
     };
@@ -580,6 +587,21 @@ fn increment_listener_counter(counter: &PerCpuArray<u64>) -> Option<u64> {
         *value = (*value).wrapping_add(1);
         Some(*value)
     }
+}
+
+#[inline(always)]
+unsafe fn read_user_prefix<const N: usize>(
+    src: *const u8,
+    dst: &mut [u8; N],
+    count: u64,
+) -> Result<u32, i64> {
+    let len = bounded_capture_len(count, N);
+    if len == 0 {
+        return Ok(0);
+    }
+    let prefix = unsafe { core::slice::from_raw_parts_mut(dst.as_mut_ptr(), len as usize) };
+    unsafe { bpf_probe_read_user_buf(src, prefix)? };
+    Ok(len)
 }
 
 // ── L7 socket capture (ADR-002 Level 3, the zero-code APM path) ──────────────
@@ -613,16 +635,15 @@ fn emit_l7(
         (*record).pid = pid;
         (*record).fd = fd;
         (*record).direction = direction;
-        (*record).len = if count > L7_CHUNK_LEN as u64 {
-            L7_CHUNK_LEN as u32
-        } else {
-            count as u32
-        };
         (*record).observed_ktime_ns = bpf_ktime_get_ns();
         (*record).tid = bpf_get_current_pid_tgid() as u32;
-        if bpf_probe_read_user_buf(buf, &mut (*record).data).is_err() {
-            entry.discard(0);
-            return Ok(());
+        match read_user_prefix(buf, &mut (*record).data, count) {
+            Ok(len) => (*record).len = len,
+            Err(_) => {
+                record_capture_read_fault();
+                entry.discard(0);
+                return Ok(());
+            }
         }
     }
     entry.submit(0);
@@ -679,6 +700,7 @@ fn try_l7_writev(ctx: &TracePointContext) -> Result<(), i64> {
     // Read the first iovec { void *iov_base; size_t iov_len } (16 bytes on 64-bit).
     let mut iov = [0u8; 16];
     if unsafe { bpf_probe_read_user_buf(vec as *const u8, &mut iov) }.is_err() {
+        record_capture_read_fault();
         return Ok(());
     }
     let iov_base = u64::from_ne_bytes([
@@ -785,16 +807,15 @@ fn emit_tls(
         (*record).ssl = ssl;
         (*record).pid = pid;
         (*record).direction = direction;
-        (*record).len = if count > L7_CHUNK_LEN as u64 {
-            L7_CHUNK_LEN as u32
-        } else {
-            count as u32
-        };
         (*record).observed_ktime_ns = bpf_ktime_get_ns();
         (*record).tid = bpf_get_current_pid_tgid() as u32;
-        if bpf_probe_read_user_buf(buf, &mut (*record).data).is_err() {
-            entry.discard(0);
-            return Ok(());
+        match read_user_prefix(buf, &mut (*record).data, count) {
+            Ok(len) => (*record).len = len,
+            Err(_) => {
+                record_capture_read_fault();
+                entry.discard(0);
+                return Ok(());
+            }
         }
     }
     entry.submit(0);

@@ -9,6 +9,7 @@
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 
 use aya::Ebpf;
 use aya::maps::{
@@ -33,6 +34,7 @@ use super::manager::{CaptureProgram, ListenerObservation};
 use super::pid_resolver::PidRouting;
 use super::tls_libs;
 use crate::config::EbpfSectionConfig;
+use crate::counters::AgentCounters;
 
 /// The embedded BPF object, built from the top-level `bpf/` crate via
 /// `scripts/regen-bpf-object.sh` and checked in so the agent's musl/cross build
@@ -182,6 +184,53 @@ struct PerCpuListenerSequence {
 }
 
 #[derive(Default)]
+struct PerCpuCounterDelta {
+    previous: Vec<u64>,
+}
+
+impl PerCpuCounterDelta {
+    fn observe(&mut self, current: &[u64]) -> u64 {
+        let delta = current
+            .iter()
+            .enumerate()
+            .fold(0_u64, |total, (cpu, value)| {
+                total.wrapping_add(value.wrapping_sub(self.previous.get(cpu).copied().unwrap_or(0)))
+            });
+        self.previous.clear();
+        self.previous.extend_from_slice(current);
+        delta
+    }
+}
+
+struct CaptureFaultPoll {
+    faults: PerCpuArray<MapData, u64>,
+    counters: Arc<AgentCounters>,
+    previous: PerCpuCounterDelta,
+}
+
+impl CaptureFaultPoll {
+    fn observe(&mut self) {
+        match self.faults.get(&0, 0) {
+            Ok(values) => {
+                let delta = self.previous.observe(&values);
+                if delta != 0 {
+                    self.counters.add_ebpf_capture_read_faults(delta);
+                }
+            }
+            Err(error) => {
+                warn!(%error, "eBPF: cannot read CAPTURE_READ_FAULTS map");
+            }
+        }
+    }
+}
+
+impl Drop for CaptureFaultPoll {
+    fn drop(&mut self) {
+        self.observe();
+    }
+}
+
+#[derive(Default)]
 struct ListenerSequences {
     by_cpu: HashMap<u32, PerCpuListenerSequence>,
     outstanding: usize,
@@ -215,6 +264,7 @@ pub struct AyaCaptureProgram {
     l7_tx: mpsc::Sender<CapturedSegment>,
     listener_tx: mpsc::Sender<CapturedListener>,
     listener_health_tx: watch::Sender<ListenerDrainHealth>,
+    counters: Arc<AgentCounters>,
     next_listener_generation: u64,
     loaded: Option<Loaded>,
 }
@@ -226,6 +276,7 @@ impl AyaCaptureProgram {
         l7_tx: mpsc::Sender<CapturedSegment>,
         listener_tx: mpsc::Sender<CapturedListener>,
         listener_health_tx: watch::Sender<ListenerDrainHealth>,
+        counters: Arc<AgentCounters>,
     ) -> Self {
         Self {
             captured_tx,
@@ -233,6 +284,7 @@ impl AyaCaptureProgram {
             l7_tx,
             listener_tx,
             listener_health_tx,
+            counters,
             next_listener_generation: 0,
             loaded: None,
         }
@@ -277,6 +329,11 @@ impl CaptureProgram for AyaCaptureProgram {
             .ok_or("BPF map LISTENER_PUBLISHED not found")?;
         let listener_published = PerCpuArray::try_from(listener_published)
             .map_err(|e| format!("open LISTENER_PUBLISHED map: {e}"))?;
+        let capture_read_faults = ebpf
+            .take_map("CAPTURE_READ_FAULTS")
+            .ok_or("BPF map CAPTURE_READ_FAULTS not found")?;
+        let capture_read_faults = PerCpuArray::try_from(capture_read_faults)
+            .map_err(|e| format!("open CAPTURE_READ_FAULTS map: {e}"))?;
 
         // Network flows are an independent sub-toggle: attach + open only then.
         let flow_ring = if section.network_flows_enabled {
@@ -386,7 +443,11 @@ impl CaptureProgram for AyaCaptureProgram {
             listener_generation,
             listener_fence_rx,
         )?;
-        let mut drains = Vec::with_capacity(5);
+        let mut drains = Vec::with_capacity(6);
+        drains.push(spawn_capture_fault_poll(
+            capture_read_faults,
+            Arc::clone(&self.counters),
+        ));
         drains.push(spawn_drain(
             ring,
             self.captured_tx.clone(),
@@ -623,6 +684,28 @@ impl CaptureProgram for AyaCaptureProgram {
             .map_err(|error| format!("request listener drain fence: {error}"))?;
         Ok(receiver)
     }
+}
+
+/// Poll the per-CPU capture-fault map and fold kernel deltas into the agent's
+/// lifetime counter. A fresh poller starts with zero because every BPF load
+/// creates a fresh map; the shared agent counter intentionally survives loads.
+fn spawn_capture_fault_poll(
+    faults: PerCpuArray<MapData, u64>,
+    counters: Arc<AgentCounters>,
+) -> JoinHandle<()> {
+    let mut poll = CaptureFaultPoll {
+        faults,
+        counters,
+        previous: PerCpuCounterDelta::default(),
+    };
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(1));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            interval.tick().await;
+            poll.observe();
+        }
+    })
 }
 
 /// Poll the `LOG_EVENTS` ring async, decode each `LogChunk`, and forward a
