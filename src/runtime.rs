@@ -603,7 +603,11 @@ async fn run_local_mode(app_config: AppConfig) -> anyhow::Result<()> {
         let mut scan_shutdown = shutdown.subscribe();
         tokio::spawn(async move {
             loop {
-                let census = discovery::discover_with_paths(&[], &[]).await;
+                // Runtime processes ON: they are what maps a target's
+                // systemd unit to the PIDs capture authorizes. Without them
+                // the lane attaches but authorizes nothing.
+                let census =
+                    discovery::discover_with_paths_and_runtime_processes(&[], &[], true).await;
                 let epoch = {
                     let mut cache = scan_cache.write().await;
                     cache.update_all(&census);
