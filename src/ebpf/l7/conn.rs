@@ -315,11 +315,15 @@ impl ConnTracker {
         };
 
         if self.dead {
-            // fd reuse / mid-stream resync: a fresh inbound request on a dead
-            // connection restarts it. The prior stream killed it — e.g. a file
-            // closed on the same fd, then reopened as a socket, or corrupt bytes.
+            // fd reuse / mid-stream resync: a fresh request OPENER on a dead
+            // connection restarts it — in either direction: fds are recycled
+            // by number (the hooks see file I/O too, so unparseable bytes
+            // routinely kill a tracker), and a client connection on a
+            // recycled fd opens with an OUTBOUND request. A response never
+            // resurrects. The prior stream killed it — e.g. a file closed on
+            // the same fd, then reopened as a socket, or corrupt bytes.
             // Eviction on close(2) is the cleaner fix and a planned refinement.
-            if dir == Direction::Inbound && looks_like_any_request(bytes) {
+            if looks_like_any_request(bytes) {
                 *self = ConnTracker::default();
             } else {
                 return;
@@ -576,7 +580,6 @@ mod tests {
     /// server spans flowing, client spans never appearing, with the unit
     /// tests green because a fresh tracker is never dead.
     #[test]
-    #[ignore = "acceptance — resurrect on an outbound opener, then remove this ignore"]
     fn recycled_fd_resurrects_for_a_client_connection() {
         let mut reg = ConnRegistry::new();
         // A file read on this fd: unparseable, so the tracker is killed.
