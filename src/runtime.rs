@@ -603,8 +603,7 @@ async fn run_local_mode(app_config: AppConfig) -> anyhow::Result<()> {
         let mut scan_shutdown = shutdown.subscribe();
         tokio::spawn(async move {
             loop {
-                let census =
-                    discovery::discover_with_paths_and_runtime_processes(&[], &[], false).await;
+                let census = discovery::discover_with_paths(&[], &[]).await;
                 scan_cache.write().await.update_all(&census);
                 tokio::select! {
                     _ = tokio::time::sleep(Duration::from_secs(30)) => {}
