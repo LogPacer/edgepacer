@@ -9,6 +9,7 @@ use std::process::{Child, Stdio};
 use std::time::Duration;
 
 mod d1;
+mod d2;
 
 fn enabled_section(network_flows_enabled: bool) -> EbpfSectionConfig {
     EbpfSectionConfig {
@@ -706,6 +707,14 @@ t.join()
     let record = tokio::time::timeout(Duration::from_secs(15), async {
         loop {
             let seg = l7_rx.recv().await.expect("L7 channel closed");
+            if seg.pid == pid
+                && (seg.bytes.starts_with(b"GET /tls ") || seg.bytes.starts_with(b"HTTP/1.1 200 "))
+            {
+                assert!(
+                    !seg.stream_gap,
+                    "complete TLS request/response should not be gap flagged"
+                );
+            }
             if let Some(rec) = conns
                 .on_segment(&seg)
                 .into_iter()

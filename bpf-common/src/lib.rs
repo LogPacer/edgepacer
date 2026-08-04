@@ -129,6 +129,39 @@ pub const L7_CHUNK_LEN: usize = 1024;
 pub const L7_DIR_INBOUND: u8 = 0; // read/recv — request bytes
 pub const L7_DIR_OUTBOUND: u8 = 1; // write/send — response bytes
 
+/// The captured prefix omits bytes that the operation successfully transferred.
+pub const L7_FLAG_STREAM_GAP: u8 = 1;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct L7CaptureOutcome {
+    pub len: u32,
+    pub flags: u8,
+}
+
+/// Decide how much of a successful stream operation can be represented by one
+/// event. `contiguous_len` is the source prefix available to the probe (the
+/// first iovec for `writev`); `stream_len` is the operation's successful byte
+/// count. The gap flag means some successfully transferred bytes are absent.
+#[inline(always)]
+pub const fn l7_capture_outcome(
+    stream_len: u64,
+    contiguous_len: u64,
+    capacity: usize,
+) -> L7CaptureOutcome {
+    let readable_len = if stream_len < contiguous_len {
+        stream_len
+    } else {
+        contiguous_len
+    };
+    let len = bounded_capture_len(readable_len, capacity);
+    let flags = if stream_len > len as u64 {
+        L7_FLAG_STREAM_GAP
+    } else {
+        0
+    };
+    L7CaptureOutcome { len, flags }
+}
+
 /// A captured socket payload for L7 protocol parsing (the zero-code APM path,
 /// ADR-002 Level 3). `len` is the captured prefix length and never exceeds
 /// `L7_CHUNK_LEN`. `direction` tags request vs response bytes so userspace can
@@ -147,6 +180,7 @@ pub struct L7Chunk {
     pub fd: u32,
     pub len: u32,
     pub direction: u8,
+    pub flags: u8,
     /// Kernel capture timestamp — see `LogChunk::observed_ktime_ns`.
     pub observed_ktime_ns: u64,
     /// The capturing thread id — see `LogChunk::tid`.
@@ -173,6 +207,7 @@ pub struct TlsChunk {
     pub pid: u32,
     pub len: u32,
     pub direction: u8,
+    pub flags: u8,
     /// Kernel capture timestamp — see `LogChunk::observed_ktime_ns`.
     pub observed_ktime_ns: u64,
     /// The capturing thread id — see `LogChunk::tid`.
@@ -191,5 +226,38 @@ mod tests {
         assert_eq!(bounded_capture_len(CHUNK_LEN as u64, CHUNK_LEN), 128);
         assert_eq!(bounded_capture_len(CHUNK_LEN as u64 + 1, CHUNK_LEN), 128);
         assert_eq!(bounded_capture_len(u64::MAX, L7_CHUNK_LEN), 1024);
+    }
+
+    #[test]
+    fn l7_capture_outcome_uses_successful_bytes_and_marks_only_missing_stream_data() {
+        assert_eq!(
+            l7_capture_outcome(37, 100, L7_CHUNK_LEN),
+            L7CaptureOutcome { len: 37, flags: 0 }
+        );
+        assert_eq!(
+            l7_capture_outcome(2_048, 2_048, L7_CHUNK_LEN),
+            L7CaptureOutcome {
+                len: 1_024,
+                flags: L7_FLAG_STREAM_GAP,
+            }
+        );
+        assert_eq!(
+            l7_capture_outcome(24, 8, L7_CHUNK_LEN),
+            L7CaptureOutcome {
+                len: 8,
+                flags: L7_FLAG_STREAM_GAP,
+            }
+        );
+        assert_eq!(
+            l7_capture_outcome(8, 0, L7_CHUNK_LEN),
+            L7CaptureOutcome {
+                len: 0,
+                flags: L7_FLAG_STREAM_GAP,
+            }
+        );
+        assert_eq!(
+            l7_capture_outcome(8, 24, L7_CHUNK_LEN),
+            L7CaptureOutcome { len: 8, flags: 0 }
+        );
     }
 }

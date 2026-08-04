@@ -50,6 +50,9 @@ pub struct CapturedSegment {
     /// When the segment was observed in userspace (unix nanos) — the timing source
     /// for span start + duration until the kernel stamps ktime (a refinement).
     pub timestamp_nano: i64,
+    /// Successfully transferred bytes are missing after this captured prefix.
+    /// This carries evidence only; tracker invalidation and resync are separate.
+    pub stream_gap: bool,
     pub bytes: Vec<u8>,
 }
 
@@ -532,6 +535,7 @@ mod tests {
             fd,
             direction,
             timestamp_nano: 0,
+            stream_gap: false,
             bytes: bytes.to_vec(),
         }
     }
@@ -554,6 +558,7 @@ mod tests {
             fd,
             direction,
             timestamp_nano: 0,
+            stream_gap: false,
             bytes: bytes.to_vec(),
         }
     }

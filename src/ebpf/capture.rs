@@ -23,8 +23,9 @@ use tracing::warn;
 
 use edgepacer_ebpf_common::{
     CGROUP_MAX_LEVEL_SHIFT, CGROUP_MIN_LEVEL_SHIFT, CGROUP_SELECTOR_GENERATION_MASK,
-    CGROUP_SELECTOR_SLOT_SHIFT, CHUNK_LEN, ConnectEvent, L7_CHUNK_LEN, L7_DIR_INBOUND, L7Chunk,
-    ListenerEvent, LogChunk, MAX_ALLOWED_CGROUPS, MAX_CGROUP_ANCESTOR_LEVEL, TlsChunk,
+    CGROUP_SELECTOR_SLOT_SHIFT, CHUNK_LEN, ConnectEvent, L7_CHUNK_LEN, L7_DIR_INBOUND,
+    L7_FLAG_STREAM_GAP, L7Chunk, ListenerEvent, LogChunk, MAX_ALLOWED_CGROUPS,
+    MAX_CGROUP_ANCESTOR_LEVEL, TlsChunk,
 };
 
 use super::cgroup_resolver::{CgroupAnchor, CgroupRouting};
@@ -55,16 +56,26 @@ const CAPTURE_LISTEN_EXIT: (&str, &str, &str) =
 /// L7 capture programs (the zero-code APM path). Each attaches to two syscall
 /// tracepoints whose arg offsets match, so one program covers both:
 /// (program name, &[(category, event), …]).
-const L7_WRITE: (&str, &[(&str, &str)]) = (
-    "l7_io_write",
+const L7_WRITE_ENTER: (&str, &[(&str, &str)]) = (
+    "l7_io_write_enter",
     &[
         ("syscalls", "sys_enter_write"),
         ("syscalls", "sys_enter_sendto"),
     ],
 );
+const L7_WRITE_EXIT: (&str, &[(&str, &str)]) = (
+    "l7_io_write_exit",
+    &[
+        ("syscalls", "sys_exit_write"),
+        ("syscalls", "sys_exit_sendto"),
+    ],
+);
 // hyper-class runtimes send framed HTTP responses via writev — without this
 // hook the response half of every pair is invisible and no record completes.
-const L7_WRITEV: (&str, &[(&str, &str)]) = ("l7_io_writev", &[("syscalls", "sys_enter_writev")]);
+const L7_WRITEV_ENTER: (&str, &[(&str, &str)]) =
+    ("l7_io_writev_enter", &[("syscalls", "sys_enter_writev")]);
+const L7_WRITEV_EXIT: (&str, &[(&str, &str)]) =
+    ("l7_io_writev_exit", &[("syscalls", "sys_exit_writev")]);
 const L7_READ_ENTER: (&str, &[(&str, &str)]) = (
     "l7_io_read_enter",
     &[
@@ -351,10 +362,14 @@ impl CaptureProgram for AyaCaptureProgram {
 
         // L7 socket capture (APM): tap both directions of targeted PIDs' socket
         // I/O. Always-on for now; gating on per-target `protocols` is a refinement.
-        attach_tracepoint_multi(&mut ebpf, L7_WRITE.0, L7_WRITE.1)?;
-        attach_tracepoint_multi(&mut ebpf, L7_WRITEV.0, L7_WRITEV.1)?;
-        attach_tracepoint_multi(&mut ebpf, L7_READ_ENTER.0, L7_READ_ENTER.1)?;
+        // Attach exits first so an entry can never stage state without a
+        // consumer during start-up.
+        attach_tracepoint_multi(&mut ebpf, L7_WRITE_EXIT.0, L7_WRITE_EXIT.1)?;
+        attach_tracepoint_multi(&mut ebpf, L7_WRITE_ENTER.0, L7_WRITE_ENTER.1)?;
+        attach_tracepoint_multi(&mut ebpf, L7_WRITEV_EXIT.0, L7_WRITEV_EXIT.1)?;
+        attach_tracepoint_multi(&mut ebpf, L7_WRITEV_ENTER.0, L7_WRITEV_ENTER.1)?;
         attach_tracepoint_multi(&mut ebpf, L7_READ_EXIT.0, L7_READ_EXIT.1)?;
+        attach_tracepoint_multi(&mut ebpf, L7_READ_ENTER.0, L7_READ_ENTER.1)?;
         let l7_events = ebpf
             .take_map("L7_EVENTS")
             .ok_or("BPF map L7_EVENTS not found")?;
@@ -1167,6 +1182,7 @@ fn spawn_l7_drain(
                     fd: chunk.fd,
                     direction,
                     timestamp_nano,
+                    stream_gap: chunk.flags & L7_FLAG_STREAM_GAP != 0,
                     bytes: chunk.data[..n].to_vec(),
                 };
                 if tx.send(seg).await.is_err() {
@@ -1233,6 +1249,7 @@ fn spawn_tls_drain(
                     fd: (chunk.ssl >> 4) as u32,
                     direction,
                     timestamp_nano,
+                    stream_gap: chunk.flags & L7_FLAG_STREAM_GAP != 0,
                     bytes: chunk.data[..n].to_vec(),
                 };
                 if tx.send(seg).await.is_err() {
@@ -1297,34 +1314,57 @@ const LIBSSL_TARGETS: [&str; 4] = [
 /// and the OpenSSL 3.0 (`_ex`) APIs are hooked — a runtime links one or the other
 /// (Python 3.12 uses the `_ex` variants). Best-effort per symbol: a missing or
 /// unused symbol simply never fires. Errors only if nothing attached at all.
-/// The TLS uprobe programs + their OpenSSL symbols (classic + OpenSSL-3.0 `_ex`).
-const TLS_PROBES: [(&str, &str); 6] = [
-    ("ssl_write", "SSL_write"),
-    ("ssl_write_ex", "SSL_write_ex"),
-    ("ssl_read_enter", "SSL_read"),
-    ("ssl_read_exit", "SSL_read"),
-    ("ssl_read_ex_enter", "SSL_read_ex"),
-    ("ssl_read_ex_exit", "SSL_read_ex"),
+/// The TLS uprobe exit/entry pairs and their OpenSSL symbols. Exit attaches
+/// first so an entry probe can never stage state without a consumer.
+const TLS_PROBE_PAIRS: [((&str, &str), (&str, &str)); 4] = [
+    (
+        ("ssl_write_exit", "SSL_write"),
+        ("ssl_write_enter", "SSL_write"),
+    ),
+    (
+        ("ssl_write_ex_exit", "SSL_write_ex"),
+        ("ssl_write_ex_enter", "SSL_write_ex"),
+    ),
+    (
+        ("ssl_read_exit", "SSL_read"),
+        ("ssl_read_enter", "SSL_read"),
+    ),
+    (
+        ("ssl_read_ex_exit", "SSL_read_ex"),
+        ("ssl_read_ex_enter", "SSL_read_ex"),
+    ),
 ];
 
 fn attach_tls_uprobes(ebpf: &mut Ebpf) -> Result<(), String> {
-    let mut attached = 0;
+    let mut attached_pairs = 0;
     let mut last_err = String::new();
-    for (name, symbol) in TLS_PROBES {
-        match attach_uprobe(ebpf, name, symbol) {
-            Ok(()) => attached += 1,
-            Err(e) => last_err = e,
+    for (exit, enter) in TLS_PROBE_PAIRS {
+        if let Err(error) = load_uprobe(ebpf, exit.0) {
+            last_err = error;
+            continue;
+        }
+        if let Err(error) = load_uprobe(ebpf, enter.0) {
+            last_err = error;
+            continue;
+        }
+        if let Err(error) = attach_system_uprobe(ebpf, exit.0, exit.1) {
+            last_err = error;
+            continue;
+        }
+        match attach_system_uprobe(ebpf, enter.0, enter.1) {
+            Ok(()) => attached_pairs += 1,
+            Err(error) => last_err = error,
         }
     }
-    if attached == 0 {
+    if attached_pairs == 0 {
         return Err(format!(
-            "no TLS uprobes attached (no OpenSSL libssl?): {last_err}"
+            "no complete TLS uprobe pairs attached (no OpenSSL libssl?): {last_err}"
         ));
     }
     Ok(())
 }
 
-fn attach_uprobe(ebpf: &mut Ebpf, name: &str, symbol: &str) -> Result<(), String> {
+fn load_uprobe(ebpf: &mut Ebpf, name: &str) -> Result<(), String> {
     let program: &mut UProbe = ebpf
         .program_mut(name)
         .ok_or_else(|| format!("BPF program {name} not found"))?
@@ -1332,15 +1372,36 @@ fn attach_uprobe(ebpf: &mut Ebpf, name: &str, symbol: &str) -> Result<(), String
         .map_err(|e| format!("{name} is not a uprobe: {e}"))?;
     program
         .load()
-        .map_err(|e| format!("{name} verifier load: {e}"))?;
+        .map_err(|e| format!("{name} verifier load: {e}"))
+}
+
+fn attach_system_uprobe(ebpf: &mut Ebpf, name: &str, symbol: &str) -> Result<(), String> {
     let mut last_err = String::new();
     for target in LIBSSL_TARGETS {
-        match program.attach(Some(symbol), 0, target, None) {
+        match attach_loaded_uprobe(ebpf, name, symbol, target, None) {
             Ok(_) => return Ok(()),
             Err(e) => last_err = format!("{target}: {e}"),
         }
     }
     Err(format!("attach {name} -> {symbol} (no libssl): {last_err}"))
+}
+
+fn attach_loaded_uprobe(
+    ebpf: &mut Ebpf,
+    name: &str,
+    symbol: &str,
+    target: &str,
+    pid: Option<i32>,
+) -> Result<(), String> {
+    let program: &mut UProbe = ebpf
+        .program_mut(name)
+        .ok_or_else(|| format!("BPF program {name} not found"))?
+        .try_into()
+        .map_err(|e| format!("{name} is not a uprobe: {e}"))?;
+    program
+        .attach(Some(symbol), 0, target, pid)
+        .map(|_| ())
+        .map_err(|e| format!("attach {name} -> {symbol}: {e}"))
 }
 
 /// Attach the (already-loaded) TLS uprobes to one library for one pid — for the
@@ -1349,15 +1410,11 @@ fn attach_uprobe(ebpf: &mut Ebpf, name: &str, symbol: &str) -> Result<(), String
 /// misses. Best-effort; feeds the same TLS drain. The programs are already loaded
 /// by `attach_tls_uprobes` in `start()`, so this only attaches.
 fn attach_tls_to_lib(ebpf: &mut Ebpf, lib: &str, pid: i32) {
-    for (name, symbol) in TLS_PROBES {
-        let Some(program) = ebpf.program_mut(name) else {
+    for (exit, enter) in TLS_PROBE_PAIRS {
+        if attach_loaded_uprobe(ebpf, exit.0, exit.1, lib, Some(pid)).is_err() {
             continue;
-        };
-        let uprobe: &mut UProbe = match program.try_into() {
-            Ok(uprobe) => uprobe,
-            Err(_) => continue,
-        };
-        let _ = uprobe.attach(Some(symbol), 0, lib, Some(pid));
+        }
+        let _ = attach_loaded_uprobe(ebpf, enter.0, enter.1, lib, Some(pid));
     }
 }
 
