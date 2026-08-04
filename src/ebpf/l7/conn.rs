@@ -566,6 +566,55 @@ mod tests {
     const REQ: &[u8] = b"GET /api/users HTTP/1.1\r\nHost: api.internal\r\n\r\n";
     const RESP: &[u8] = b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n";
 
+    /// Why symmetric detection alone was not enough in live capture: the L7
+    /// hooks fire for every `read`/`write` an authorized process makes, files
+    /// included, so unparseable bytes routinely kill the tracker for an fd
+    /// number. fds are then recycled as sockets — and resurrection only ever
+    /// accepted an INBOUND request, so a server connection landing on a
+    /// recycled fd recovers while a CLIENT connection on one stays invisible
+    /// forever. That asymmetry is exactly what live capture showed: HTTP
+    /// server spans flowing, client spans never appearing, with the unit
+    /// tests green because a fresh tracker is never dead.
+    #[test]
+    #[ignore = "acceptance — resurrect on an outbound opener, then remove this ignore"]
+    fn recycled_fd_resurrects_for_a_client_connection() {
+        let mut reg = ConnRegistry::new();
+        // A file read on this fd: unparseable, so the tracker is killed.
+        reg.on_segment(&seg(20, 9, Direction::Inbound, &[0xff; 16]));
+        // The fd is recycled as a client socket — our request goes out first.
+        assert!(
+            reg.on_segment(&seg(20, 9, Direction::Outbound, REQ))
+                .is_empty(),
+            "the request alone completes nothing"
+        );
+        let records = reg.on_segment(&seg(20, 9, Direction::Inbound, RESP));
+        assert_eq!(
+            records.len(),
+            1,
+            "a recycled fd must not stay dead for client connections"
+        );
+        assert_eq!(records[0].operation, "GET /api/users");
+        assert_eq!(
+            reg.byte_role(&seg(20, 9, Direction::Outbound, REQ)),
+            Some(PeerRole::Client)
+        );
+    }
+
+    /// The server half of the same rule, green today — a guard so the
+    /// outbound resurrection cannot regress it.
+    #[test]
+    fn recycled_fd_still_resurrects_for_a_server_connection() {
+        let mut reg = ConnRegistry::new();
+        reg.on_segment(&seg(21, 9, Direction::Inbound, &[0xff; 16]));
+        assert!(
+            reg.on_segment(&seg(21, 9, Direction::Inbound, REQ))
+                .is_empty()
+        );
+        let records = reg.on_segment(&seg(21, 9, Direction::Outbound, RESP));
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].operation, "GET /api/users");
+    }
+
     /// The gap this slice closes: the monitored process wrote the request, so
     /// the exchange must still reconstruct — with the record's request/response
     /// sense taken from the bytes, not from an absent port hint.
