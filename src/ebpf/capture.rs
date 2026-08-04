@@ -1316,7 +1316,9 @@ const LIBSSL_TARGETS: [&str; 4] = [
 /// unused symbol simply never fires. Errors only if nothing attached at all.
 /// The TLS uprobe exit/entry pairs and their OpenSSL symbols. Exit attaches
 /// first so an entry probe can never stage state without a consumer.
-const TLS_PROBE_PAIRS: [((&str, &str), (&str, &str)); 4] = [
+type TlsProbe = (&'static str, &'static str);
+
+const TLS_PROBE_PAIRS: [(TlsProbe, TlsProbe); 4] = [
     (
         ("ssl_write_exit", "SSL_write"),
         ("ssl_write_enter", "SSL_write"),
