@@ -5,6 +5,7 @@ set -euo pipefail
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cargo_home="${CARGO_HOME:-${HOME}/.cargo}"
 rustup_home="${RUSTUP_HOME:-${HOME}/.rustup}"
+cross_config="${CROSS_CONFIG:-${repo_root}/Cross.toml}"
 preflight_image="${EDGEPACER_CROSS_PREFLIGHT_IMAGE:-alpine:3.20}"
 
 die() {
@@ -21,6 +22,12 @@ require_path() {
   local path="$2"
 
   [[ -e "${path}" ]] || die "${label} does not exist: ${path}"
+}
+
+check_container_rustc_wrapper() {
+  if ! grep -Eq '^[[:space:]]*passthrough[[:space:]]*=.*"RUSTC_WRAPPER="' "${cross_config}"; then
+    die "${cross_config} must clear RUSTC_WRAPPER so host-only Cargo wrappers do not leak into cross images"
+  fi
 }
 
 check_container_in_container_driver() {
@@ -72,7 +79,9 @@ main() {
   require_path "workspace" "${repo_root}"
   require_path "CARGO_HOME" "${cargo_home}"
   require_path "RUSTUP_HOME" "${rustup_home}"
+  require_path "cross config" "${cross_config}"
 
+  check_container_rustc_wrapper
   check_container_in_container_driver
   check_docker_path_visibility
 
