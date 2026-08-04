@@ -8,6 +8,8 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Stdio};
 use std::time::Duration;
 
+mod d1;
+
 fn enabled_section(network_flows_enabled: bool) -> EbpfSectionConfig {
     EbpfSectionConfig {
         enabled: true,
@@ -49,17 +51,40 @@ fn program() -> (
     mpsc::Receiver<CapturedSegment>,
     mpsc::Receiver<CapturedListener>,
 ) {
+    let (program, rx, flow_rx, l7_rx, listener_rx, _counters) = program_with_counters();
+    (program, rx, flow_rx, l7_rx, listener_rx)
+}
+
+type ProgramWithCounters = (
+    AyaCaptureProgram,
+    mpsc::Receiver<CapturedLine>,
+    mpsc::Receiver<CapturedFlow>,
+    mpsc::Receiver<CapturedSegment>,
+    mpsc::Receiver<CapturedListener>,
+    Arc<AgentCounters>,
+);
+
+fn program_with_counters() -> ProgramWithCounters {
     let (tx, rx) = mpsc::channel(256);
     let (flow_tx, flow_rx) = mpsc::channel(256);
     let (l7_tx, l7_rx) = mpsc::channel(256);
     let (listener_tx, listener_rx) = mpsc::channel(256);
     let (listener_health_tx, _listener_health_rx) = watch::channel(ListenerDrainHealth::stopped());
+    let counters = AgentCounters::new();
     (
-        AyaCaptureProgram::new(tx, flow_tx, l7_tx, listener_tx, listener_health_tx),
+        AyaCaptureProgram::new(
+            tx,
+            flow_tx,
+            l7_tx,
+            listener_tx,
+            listener_health_tx,
+            Arc::clone(&counters),
+        ),
         rx,
         flow_rx,
         l7_rx,
         listener_rx,
+        counters,
     )
 }
 

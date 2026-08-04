@@ -98,6 +98,7 @@ pub struct AgentCounters {
     pub spans_parented: AtomicU64,
     pub spans_cross_linked: AtomicU64,
     pub spans_kind_from_bytes: AtomicU64,
+    pub ebpf_capture_read_faults: AtomicU64,
     error_window: ErrorWindow,
 }
 
@@ -118,6 +119,7 @@ impl AgentCounters {
             spans_parented: AtomicU64::new(0),
             spans_cross_linked: AtomicU64::new(0),
             spans_kind_from_bytes: AtomicU64::new(0),
+            ebpf_capture_read_faults: AtomicU64::new(0),
             error_window: ErrorWindow::new(),
         })
     }
@@ -180,6 +182,11 @@ impl AgentCounters {
         self.spans_kind_from_bytes.fetch_add(n, Ordering::Relaxed);
     }
 
+    pub fn add_ebpf_capture_read_faults(&self, n: u64) {
+        self.ebpf_capture_read_faults
+            .fetch_add(n, Ordering::Relaxed);
+    }
+
     pub fn snapshot(&self) -> CountersSnapshot {
         CountersSnapshot {
             bytes_sent: self.bytes_sent.load(Ordering::Relaxed),
@@ -195,6 +202,7 @@ impl AgentCounters {
             spans_parented: self.spans_parented.load(Ordering::Relaxed),
             spans_cross_linked: self.spans_cross_linked.load(Ordering::Relaxed),
             spans_kind_from_bytes: self.spans_kind_from_bytes.load(Ordering::Relaxed),
+            ebpf_capture_read_faults: self.ebpf_capture_read_faults.load(Ordering::Relaxed),
         }
     }
 }
@@ -215,6 +223,7 @@ pub struct CountersSnapshot {
     pub spans_parented: u64,
     pub spans_cross_linked: u64,
     pub spans_kind_from_bytes: u64,
+    pub ebpf_capture_read_faults: u64,
 }
 
 #[cfg(test)]
@@ -296,6 +305,15 @@ mod tests {
         counters.add_spans_kind_from_bytes(2);
 
         assert_eq!(counters.snapshot().spans_kind_from_bytes, 6);
+    }
+
+    #[test]
+    fn ebpf_capture_read_faults_counter_increments_and_snapshots() {
+        let counters = AgentCounters::new();
+        counters.add_ebpf_capture_read_faults(2);
+        counters.add_ebpf_capture_read_faults(3);
+
+        assert_eq!(counters.snapshot().ebpf_capture_read_faults, 5);
     }
 
     #[test]

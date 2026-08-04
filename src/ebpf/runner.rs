@@ -198,6 +198,7 @@ pub async fn run_with_counters(
         l7_tx,
         listener_tx,
         listener_health_tx,
+        counters.clone(),
     ));
     // Routing seeded on the last reconcile, reused to route drained records.
     let mut pid_routing = PidRouting::default();
