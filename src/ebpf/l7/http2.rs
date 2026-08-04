@@ -181,9 +181,11 @@ type DecodedHeaders = Vec<(Vec<u8>, Vec<u8>)>;
 /// `buf.is_empty()`, and `decode_string` reads `buf[0]` for the Huffman flag
 /// with no emptiness check — so a HEADERS frame whose block ends mid-field
 /// (e.g. a literal with a name but no value-length octet) panics the decoder.
-/// Under the release profile's `panic = "abort"` that aborts the whole agent on
-/// a single hostile frame, so we must keep the panic *unreachable*, not merely
-/// catch it. This walker mirrors the decoder's per-octet field framing with
+/// A hostile frame must never reach that panic: it would unwind the eBPF
+/// runner task that drives every capture (and would abort the whole agent
+/// outright should the release profile ever set `panic = "abort"`), so we
+/// keep the panic *unreachable*, not merely caught. This walker mirrors the
+/// decoder's per-octet field framing with
 /// every read bounds-checked and returns `false` the moment the block would
 /// underflow, letting the caller mark the stream dead instead of decoding.
 ///
