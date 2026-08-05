@@ -54,6 +54,7 @@ fn demo(out: &mut String, name: &str, key: Option<&str>, req: &[u8], resp: &[u8]
         fd: 7,
         direction: Direction::Inbound,
         timestamp_nano: REQ_TS,
+        stream_gap: false,
         bytes: req.to_vec(),
     };
     let outbound = CapturedSegment {
@@ -66,6 +67,7 @@ fn demo(out: &mut String, name: &str, key: Option<&str>, req: &[u8], resp: &[u8]
         fd: 7,
         direction: Direction::Outbound,
         timestamp_nano: RESP_TS,
+        stream_gap: false,
         bytes: resp.to_vec(),
     };
     let mut recs = Vec::new();

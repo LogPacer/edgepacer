@@ -19,10 +19,10 @@ use aya_ebpf::{
     EbpfContext,
 };
 use edgepacer_ebpf_common::{
-    bounded_capture_len, ConnectEvent, ExecEvent, L7Chunk, ListenerEvent, LogChunk, TlsChunk,
-    CGROUP_LEVEL_FIELD_MASK, CGROUP_LEVEL_MASK, CGROUP_MAX_LEVEL_SHIFT, CGROUP_MIN_LEVEL_SHIFT,
-    CGROUP_SELECTOR_GENERATION_MASK, CGROUP_SELECTOR_SLOT_SHIFT, L7_DIR_INBOUND, L7_DIR_OUTBOUND,
-    MAX_ALLOWED_CGROUPS, MAX_CGROUP_ANCESTOR_LEVEL,
+    bounded_capture_len, l7_capture_outcome, ConnectEvent, ExecEvent, L7Chunk, ListenerEvent,
+    LogChunk, TlsChunk, CGROUP_LEVEL_FIELD_MASK, CGROUP_LEVEL_MASK, CGROUP_MAX_LEVEL_SHIFT,
+    CGROUP_MIN_LEVEL_SHIFT, CGROUP_SELECTOR_GENERATION_MASK, CGROUP_SELECTOR_SLOT_SHIFT,
+    L7_CHUNK_LEN, L7_DIR_INBOUND, L7_DIR_OUTBOUND, MAX_ALLOWED_CGROUPS, MAX_CGROUP_ANCESTOR_LEVEL,
 };
 
 // 256 KiB ring buffer (power of two, page-aligned) shared with userspace.
@@ -247,11 +247,36 @@ static L7_EVENTS: RingBuf = RingBuf::with_byte_size(256 * 1024, 0);
 #[map]
 static L7_READ_ARGS: HashMap<u64, ReadArgs> = HashMap::with_max_entries(10240, 0);
 
+// Outbound syscall arguments must survive until sys_exit reports how many bytes
+// actually entered the stream.
+#[map]
+static L7_WRITE_ARGS: HashMap<u64, WriteArgs> = HashMap::with_max_entries(10240, 0);
+
+#[map]
+static L7_WRITEV_ARGS: HashMap<u64, WritevArgs> = HashMap::with_max_entries(10240, 0);
+
 /// In-flight read args carried from a syscall's enter tracepoint to its exit.
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct ReadArgs {
     buf: u64,
+    fd: u64,
+    scope: CaptureScope,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct WriteArgs {
+    buf: u64,
+    count: u64,
+    fd: u64,
+    scope: CaptureScope,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct WritevArgs {
+    vec: u64,
     fd: u64,
     scope: CaptureScope,
 }
@@ -266,6 +291,11 @@ static TLS_EVENTS: RingBuf = RingBuf::with_byte_size(256 * 1024, 0);
 #[map]
 static TLS_READ_ARGS: HashMap<u64, TlsReadArgs> = HashMap::with_max_entries(10240, 0);
 
+// SSL_write arguments are consumed by the corresponding uretprobe so failed
+// calls never inject plaintext that was not accepted by OpenSSL.
+#[map]
+static TLS_WRITE_ARGS: HashMap<u64, TlsWriteArgs> = HashMap::with_max_entries(10240, 0);
+
 /// In-flight `SSL_read`/`SSL_read_ex` args carried from the uprobe (entry) to the
 /// uretprobe. `readbytes` is the `*readbytes` out-pointer for the `_ex` variant
 /// (the byte count lands there, not in the return value); 0 for plain `SSL_read`.
@@ -275,6 +305,16 @@ struct TlsReadArgs {
     ssl: u64,
     buf: u64,
     readbytes: u64,
+    scope: CaptureScope,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct TlsWriteArgs {
+    ssl: u64,
+    buf: u64,
+    count: u64,
+    written: u64,
     scope: CaptureScope,
 }
 
@@ -608,10 +648,10 @@ unsafe fn read_user_prefix<const N: usize>(
 //
 // Both directions of an authorized workload's socket I/O are tapped and emitted as
 // `L7Chunk`s; userspace reassembles + parses them. Arg offsets line up so one
-// program covers two syscalls each: write+sendto (outbound, count known at
-// enter) and read+recvfrom (inbound, count only known at the exit return value,
-// so the buffer pointer is stashed on enter). Socket-vs-file fd filtering is a
-// refinement — the userspace parser drops non-HTTP connections via detection.
+// program covers two syscalls each: write+sendto and read+recvfrom. Both stage
+// their buffer pointer on entry and emit only after sys_exit reports the
+// successful byte count. Socket-vs-file fd filtering is a refinement — the
+// userspace parser drops non-HTTP connections via detection.
 
 /// Reserve an `L7Chunk` and fill it from a user buffer. Mirrors `try_capture`'s
 /// verifier-safe shape: write through the ring pointer (the payload is too big
@@ -622,8 +662,10 @@ fn emit_l7(
     fd: u32,
     direction: u8,
     buf: *const u8,
-    count: u64,
+    stream_len: u64,
+    contiguous_len: u64,
 ) -> Result<(), i64> {
+    let outcome = l7_capture_outcome(stream_len, contiguous_len, L7_CHUNK_LEN);
     let Some(mut entry) = L7_EVENTS.reserve::<L7Chunk>(0) else {
         return Err(0);
     };
@@ -635,9 +677,10 @@ fn emit_l7(
         (*record).pid = pid;
         (*record).fd = fd;
         (*record).direction = direction;
+        (*record).flags = outcome.flags;
         (*record).observed_ktime_ns = bpf_ktime_get_ns();
         (*record).tid = bpf_get_current_pid_tgid() as u32;
-        match read_user_prefix(buf, &mut (*record).data, count) {
+        match read_user_prefix(buf, &mut (*record).data, outcome.len as u64) {
             Ok(len) => (*record).len = len,
             Err(_) => {
                 record_capture_read_fault();
@@ -650,46 +693,92 @@ fn emit_l7(
     Ok(())
 }
 
-/// Outbound: authorized `write(2)` / `sendto(2)`. Both share the arg
-/// layout fd@16, buf@24, count@32, and the byte count is known at enter.
+/// Outbound entry: stage authorized `write(2)` / `sendto(2)` arguments. Both
+/// share the layout fd@16, buf@24, count@32.
 #[tracepoint]
-pub fn l7_io_write(ctx: TracePointContext) -> u32 {
-    match try_l7_write(&ctx) {
+pub fn l7_io_write_enter(ctx: TracePointContext) -> u32 {
+    match try_l7_write_enter(&ctx) {
         Ok(()) => 0,
         Err(_) => 1,
     }
 }
 
-fn try_l7_write(ctx: &TracePointContext) -> Result<(), i64> {
+fn try_l7_write_enter(ctx: &TracePointContext) -> Result<(), i64> {
     let pid = ctx.tgid();
     let Some(scope) = capture_scope(pid) else {
         return Ok(());
     };
     let fd: u64 = unsafe { ctx.read_at(16).map_err(|_| 1_i64)? };
-    let buf: *const u8 = unsafe { ctx.read_at(24).map_err(|_| 1_i64)? };
+    let buf: u64 = unsafe { ctx.read_at(24).map_err(|_| 1_i64)? };
     let count: u64 = unsafe { ctx.read_at(32).map_err(|_| 1_i64)? };
-    emit_l7(scope, pid, fd as u32, L7_DIR_OUTBOUND, buf, count)
+    let key = bpf_get_current_pid_tgid();
+    let _ = L7_WRITE_ARGS.insert(
+        &key,
+        &WriteArgs {
+            buf,
+            count,
+            fd,
+            scope,
+        },
+        0,
+    );
+    Ok(())
 }
 
-/// Outbound: authorized `writev(2)`. hyper-class runtimes emit framed HTTP
-/// responses through vectored writes, which the `write`/`sendto` hook never
-/// sees — without this the response half of every pair is invisible and no
-/// L7 record ever completes (#99). Captures the first iovec segment (status
-/// line + headers); multi-iovec reassembly is the known refinement.
+/// Outbound exit: emit only the bytes `write(2)` / `sendto(2)` accepted.
 #[tracepoint]
-pub fn l7_io_writev(ctx: TracePointContext) -> u32 {
-    match try_l7_writev(&ctx) {
+pub fn l7_io_write_exit(ctx: TracePointContext) -> u32 {
+    match try_l7_write_exit(&ctx) {
         Ok(()) => 0,
         Err(_) => 1,
     }
 }
 
-fn try_l7_writev(ctx: &TracePointContext) -> Result<(), i64> {
+fn try_l7_write_exit(ctx: &TracePointContext) -> Result<(), i64> {
+    let key = bpf_get_current_pid_tgid();
+    let args = match unsafe { L7_WRITE_ARGS.get(&key) } {
+        Some(args) => *args,
+        None => return Ok(()),
+    };
+    let _ = L7_WRITE_ARGS.remove(&key);
+    let ret: i64 = unsafe { ctx.read_at(16).map_err(|_| 1_i64)? };
+    if ret <= 0 {
+        return Ok(());
+    }
+    let pid = (key >> 32) as u32;
+    let Some(scope) = capture_scope(pid) else {
+        return Ok(());
+    };
+    if !capture_scopes_match(scope, args.scope) {
+        return Ok(());
+    }
+    emit_l7(
+        scope,
+        pid,
+        args.fd as u32,
+        L7_DIR_OUTBOUND,
+        args.buf as *const u8,
+        ret as u64,
+        args.count,
+    )
+}
+
+/// Outbound entry: stage authorized `writev(2)` arguments. The exit side emits
+/// the successful prefix from the first iovec and flags any accepted tail that
+/// capture omits.
+#[tracepoint]
+pub fn l7_io_writev_enter(ctx: TracePointContext) -> u32 {
+    match try_l7_writev_enter(&ctx) {
+        Ok(()) => 0,
+        Err(_) => 1,
+    }
+}
+
+fn try_l7_writev_enter(ctx: &TracePointContext) -> Result<(), i64> {
     let pid = ctx.tgid();
     let Some(scope) = capture_scope(pid) else {
         return Ok(());
     };
-    // sys_enter_writev args: fd @ 16, const struct iovec *vec @ 24, unsigned long vlen @ 32.
     let fd: u64 = unsafe { ctx.read_at(16).map_err(|_| 1_i64)? };
     let vec: u64 = unsafe { ctx.read_at(24).map_err(|_| 1_i64)? };
     let vlen: u64 = unsafe { ctx.read_at(32).map_err(|_| 1_i64)? };
@@ -697,9 +786,51 @@ fn try_l7_writev(ctx: &TracePointContext) -> Result<(), i64> {
         return Ok(());
     }
 
+    let key = bpf_get_current_pid_tgid();
+    let _ = L7_WRITEV_ARGS.insert(
+        &key,
+        &WritevArgs {
+            vec,
+            fd,
+            scope,
+        },
+        0,
+    );
+    Ok(())
+}
+
+/// Outbound exit: consume the successful `writev(2)` byte count. Only the
+/// first iovec is copied; the event flag makes an accepted later tail explicit.
+#[tracepoint]
+pub fn l7_io_writev_exit(ctx: TracePointContext) -> u32 {
+    match try_l7_writev_exit(&ctx) {
+        Ok(()) => 0,
+        Err(_) => 1,
+    }
+}
+
+fn try_l7_writev_exit(ctx: &TracePointContext) -> Result<(), i64> {
+    let key = bpf_get_current_pid_tgid();
+    let args = match unsafe { L7_WRITEV_ARGS.get(&key) } {
+        Some(args) => *args,
+        None => return Ok(()),
+    };
+    let _ = L7_WRITEV_ARGS.remove(&key);
+    let ret: i64 = unsafe { ctx.read_at(16).map_err(|_| 1_i64)? };
+    if ret <= 0 {
+        return Ok(());
+    }
+    let pid = (key >> 32) as u32;
+    let Some(scope) = capture_scope(pid) else {
+        return Ok(());
+    };
+    if !capture_scopes_match(scope, args.scope) {
+        return Ok(());
+    }
+
     // Read the first iovec { void *iov_base; size_t iov_len } (16 bytes on 64-bit).
     let mut iov = [0u8; 16];
-    if unsafe { bpf_probe_read_user_buf(vec as *const u8, &mut iov) }.is_err() {
+    if unsafe { bpf_probe_read_user_buf(args.vec as *const u8, &mut iov) }.is_err() {
         record_capture_read_fault();
         return Ok(());
     }
@@ -712,9 +843,10 @@ fn try_l7_writev(ctx: &TracePointContext) -> Result<(), i64> {
     emit_l7(
         scope,
         pid,
-        fd as u32,
+        args.fd as u32,
         L7_DIR_OUTBOUND,
         iov_base as *const u8,
+        ret as u64,
         iov_len,
     )
 }
@@ -776,6 +908,7 @@ fn try_l7_read_exit(ctx: &TracePointContext) -> Result<(), i64> {
         L7_DIR_INBOUND,
         args.buf as *const u8,
         ret as u64,
+        ret as u64,
     )
 }
 
@@ -794,8 +927,10 @@ fn emit_tls(
     ssl: u64,
     direction: u8,
     buf: *const u8,
-    count: u64,
+    stream_len: u64,
+    contiguous_len: u64,
 ) -> Result<(), i64> {
+    let outcome = l7_capture_outcome(stream_len, contiguous_len, L7_CHUNK_LEN);
     let Some(mut entry) = TLS_EVENTS.reserve::<TlsChunk>(0) else {
         return Err(0);
     };
@@ -807,9 +942,10 @@ fn emit_tls(
         (*record).ssl = ssl;
         (*record).pid = pid;
         (*record).direction = direction;
+        (*record).flags = outcome.flags;
         (*record).observed_ktime_ns = bpf_ktime_get_ns();
         (*record).tid = bpf_get_current_pid_tgid() as u32;
-        match read_user_prefix(buf, &mut (*record).data, count) {
+        match read_user_prefix(buf, &mut (*record).data, outcome.len as u64) {
             Ok(len) => (*record).len = len,
             Err(_) => {
                 record_capture_read_fault();
@@ -822,17 +958,17 @@ fn emit_tls(
     Ok(())
 }
 
-/// `SSL_write(SSL *ssl, const void *buf, int num)` — the plaintext is in `buf` on
-/// entry (before encryption). Outbound from the monitored process.
+/// `SSL_write(SSL *ssl, const void *buf, int num)` entry — stage the plaintext
+/// buffer until the return value reports how many bytes OpenSSL accepted.
 #[uprobe]
-pub fn ssl_write(ctx: ProbeContext) -> u32 {
-    match try_ssl_write(&ctx) {
+pub fn ssl_write_enter(ctx: ProbeContext) -> u32 {
+    match try_ssl_write_enter(&ctx) {
         Ok(()) => 0,
         Err(_) => 1,
     }
 }
 
-fn try_ssl_write(ctx: &ProbeContext) -> Result<(), i64> {
+fn try_ssl_write_enter(ctx: &ProbeContext) -> Result<(), i64> {
     let pid = ctx.tgid();
     let Some(scope) = capture_scope(pid) else {
         return Ok(());
@@ -843,13 +979,56 @@ fn try_ssl_write(ctx: &ProbeContext) -> Result<(), i64> {
     if num <= 0 {
         return Ok(());
     }
+    let key = bpf_get_current_pid_tgid();
+    let _ = TLS_WRITE_ARGS.insert(
+        &key,
+        &TlsWriteArgs {
+            ssl,
+            buf,
+            count: num as u64,
+            written: 0,
+            scope,
+        },
+        0,
+    );
+    Ok(())
+}
+
+/// `SSL_write` return — emit only the successfully accepted plaintext prefix.
+#[uretprobe]
+pub fn ssl_write_exit(ctx: RetProbeContext) -> u32 {
+    match try_ssl_write_exit(&ctx) {
+        Ok(()) => 0,
+        Err(_) => 1,
+    }
+}
+
+fn try_ssl_write_exit(ctx: &RetProbeContext) -> Result<(), i64> {
+    let key = bpf_get_current_pid_tgid();
+    let args = match unsafe { TLS_WRITE_ARGS.get(&key) } {
+        Some(args) => *args,
+        None => return Ok(()),
+    };
+    let _ = TLS_WRITE_ARGS.remove(&key);
+    let ret: i32 = ctx.ret().ok_or(1_i64)?;
+    if ret <= 0 {
+        return Ok(());
+    }
+    let pid = (key >> 32) as u32;
+    let Some(scope) = capture_scope(pid) else {
+        return Ok(());
+    };
+    if !capture_scopes_match(scope, args.scope) {
+        return Ok(());
+    }
     emit_tls(
         scope,
         pid,
-        ssl,
+        args.ssl,
         L7_DIR_OUTBOUND,
-        buf as *const u8,
-        num as u64,
+        args.buf as *const u8,
+        ret as u64,
+        args.count,
     )
 }
 
@@ -918,21 +1097,21 @@ fn try_ssl_read_exit(ctx: &RetProbeContext) -> Result<(), i64> {
         L7_DIR_INBOUND,
         args.buf as *const u8,
         ret as u64,
+        ret as u64,
     )
 }
 
-/// `SSL_write_ex(SSL *ssl, const void *buf, size_t num, size_t *written)` — the
-/// OpenSSL 3.0 API that modern runtimes link (e.g. Python 3.12). Plaintext is in
-/// `buf` on entry; `num` (arg2) is the size_t length.
+/// `SSL_write_ex(SSL *ssl, const void *buf, size_t num, size_t *written)` entry.
+/// The successful byte count is written through arg3 at return.
 #[uprobe]
-pub fn ssl_write_ex(ctx: ProbeContext) -> u32 {
-    match try_ssl_write_ex(&ctx) {
+pub fn ssl_write_ex_enter(ctx: ProbeContext) -> u32 {
+    match try_ssl_write_ex_enter(&ctx) {
         Ok(()) => 0,
         Err(_) => 1,
     }
 }
 
-fn try_ssl_write_ex(ctx: &ProbeContext) -> Result<(), i64> {
+fn try_ssl_write_ex_enter(ctx: &ProbeContext) -> Result<(), i64> {
     let pid = ctx.tgid();
     let Some(scope) = capture_scope(pid) else {
         return Ok(());
@@ -940,10 +1119,72 @@ fn try_ssl_write_ex(ctx: &ProbeContext) -> Result<(), i64> {
     let ssl: u64 = ctx.arg(0).ok_or(1_i64)?;
     let buf: u64 = ctx.arg(1).ok_or(1_i64)?;
     let num: u64 = ctx.arg(2).ok_or(1_i64)?;
+    let written: u64 = ctx.arg(3).ok_or(1_i64)?;
     if num == 0 {
         return Ok(());
     }
-    emit_tls(scope, pid, ssl, L7_DIR_OUTBOUND, buf as *const u8, num)
+    let key = bpf_get_current_pid_tgid();
+    let _ = TLS_WRITE_ARGS.insert(
+        &key,
+        &TlsWriteArgs {
+            ssl,
+            buf,
+            count: num,
+            written,
+            scope,
+        },
+        0,
+    );
+    Ok(())
+}
+
+/// `SSL_write_ex` return — success is `1`; the accepted byte count is
+/// published through the staged `*written` pointer.
+#[uretprobe]
+pub fn ssl_write_ex_exit(ctx: RetProbeContext) -> u32 {
+    match try_ssl_write_ex_exit(&ctx) {
+        Ok(()) => 0,
+        Err(_) => 1,
+    }
+}
+
+fn try_ssl_write_ex_exit(ctx: &RetProbeContext) -> Result<(), i64> {
+    let key = bpf_get_current_pid_tgid();
+    let args = match unsafe { TLS_WRITE_ARGS.get(&key) } {
+        Some(args) => *args,
+        None => return Ok(()),
+    };
+    let _ = TLS_WRITE_ARGS.remove(&key);
+    let ret: i32 = ctx.ret().ok_or(1_i64)?;
+    if ret != 1 {
+        return Ok(());
+    }
+    let bytes: u64 = match unsafe { bpf_probe_read_user(args.written as *const u64) } {
+        Ok(bytes) => bytes,
+        Err(_) => {
+            record_capture_read_fault();
+            return Ok(());
+        }
+    };
+    if bytes == 0 {
+        return Ok(());
+    }
+    let pid = (key >> 32) as u32;
+    let Some(scope) = capture_scope(pid) else {
+        return Ok(());
+    };
+    if !capture_scopes_match(scope, args.scope) {
+        return Ok(());
+    }
+    emit_tls(
+        scope,
+        pid,
+        args.ssl,
+        L7_DIR_OUTBOUND,
+        args.buf as *const u8,
+        bytes,
+        args.count,
+    )
 }
 
 /// `SSL_read_ex(SSL *ssl, void *buf, size_t num, size_t *readbytes)` entry — the
@@ -1018,6 +1259,7 @@ fn try_ssl_read_ex_exit(ctx: &RetProbeContext) -> Result<(), i64> {
         args.ssl,
         L7_DIR_INBOUND,
         args.buf as *const u8,
+        bytes,
         bytes,
     )
 }
