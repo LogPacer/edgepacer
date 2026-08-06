@@ -98,7 +98,8 @@ enum ManagerCommand {
     Update,
     /// Install the OS supervisor (systemd / launchd / Scheduled Task) + start the manager.
     Install,
-    /// Stop + remove the supervisor and local state (reports the uninstall first).
+    /// Stop + remove the supervisor, local state, and installed binaries
+    /// (reports the uninstall first).
     Uninstall,
     /// Install, remove, and control the Windows Service wrapper
     Service(ServiceArgs),
@@ -403,10 +404,12 @@ async fn handle_install(run: &RunArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Report the uninstall to the control plane, then remove the supervisor + state.
+/// Report the uninstall to the control plane, then remove the supervisor,
+/// state, and installed binaries.
 async fn handle_uninstall(run: &RunArgs) -> anyhow::Result<()> {
     let rails = run.rails.as_deref().unwrap_or_default();
-    let msg = edgepacer::manager::supervisor::uninstall(rails).await?;
+    let agent_path = resolve_edgepacer_path(run.edgepacer.clone());
+    let msg = edgepacer::manager::supervisor::uninstall(rails, &agent_path).await?;
     info!("[manager] {msg}");
     Ok(())
 }
