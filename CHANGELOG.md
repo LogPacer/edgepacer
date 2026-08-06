@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.2.13 - 2026-08-06
+
 - `edgepacer-manager uninstall` now removes the installed binaries too: the
   agent binary plus its update leftovers (`.backup`, `.new`) and, on Linux and
   macOS, the manager binary itself (Windows cannot delete a running exe, so it
