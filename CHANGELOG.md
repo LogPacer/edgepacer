@@ -2,6 +2,20 @@
 
 ## Unreleased
 
+## 0.2.12 - 2026-08-06
+
+- Ship eBPF-captured L7 requests as OTLP spans through the same Traces-arm
+  wire contract as SDK spans, dual-shipped alongside the existing
+  `RequestSignal` arm behind `ebpf.spans_otlp` (default on).
+- Stop losing eBPF capture events on short buffers near mapped-page
+  boundaries: probe reads are bounded and truncation is reported as a fault
+  instead of silently dropping the event.
+- Capture outbound writes at exit rather than entry, so failed writes no
+  longer fabricate phantom protocol data, partial writes report only the
+  bytes that reached the stream, and successful writes are captured.
+- Resurrect dead L7 trackers when a recycled file descriptor opens a request
+  in either direction, keeping long-lived connection reuse visible.
+
 ## 0.2.11 - 2026-07-29
 
 - Prevent Docker API streams from re-shipping final container logs after
