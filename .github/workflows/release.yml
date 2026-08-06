@@ -125,7 +125,7 @@ jobs:
           key: release-${{ matrix.target }}
           cache-on-failure: true
 
-      - uses: taiki-e/install-action@v2
+      - uses: taiki-e/install-action@v2.85.5
         with:
           tool: cargo-audit,cargo-auditable@0.7.4
 
