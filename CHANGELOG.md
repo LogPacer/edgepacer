@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- `edgepacer-manager uninstall` now removes the installed binaries too: the
+  agent binary plus its update leftovers (`.backup`, `.new`) and, on Linux and
+  macOS, the manager binary itself (Windows cannot delete a running exe, so it
+  is left with a note). The uninstall report also works from an interactive
+  shell now — the control-plane URL is recovered from the installed
+  supervisor config instead of failing on an unset `EDGEPACER_RAILS_URL`.
+
 ## 0.2.12 - 2026-08-06
 
 - Ship eBPF-captured L7 requests as OTLP spans through the same Traces-arm

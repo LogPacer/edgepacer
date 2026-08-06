@@ -3,16 +3,14 @@
 //! `install` sets up the OS service that keeps `edgepacer-manager` running
 //! (systemd on Linux, launchd on macOS, a Scheduled Task on Windows) and starts
 //! it. `uninstall` reports to the control plane, then stops + removes the
-//! service and deletes local state. Moving this into the manager keeps the
+//! service and deletes local state and binaries. Moving this into the manager keeps the
 //! install scripts thin and makes uninstall remove exactly what install created.
 //!
 //! Not exercisable from a dev Mac for Linux/Windows — `cross check` validates
 //! that it compiles per-target; behaviour must be validated on each host.
 
 use anyhow::{Context, Result};
-#[cfg(any(target_os = "linux", target_os = "windows"))]
-use std::path::Path;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use tracing::{info, warn};
 
 /// OS service / task name (and launchd label suffix).
@@ -70,9 +68,22 @@ fn ensure_single_line(label: &str, value: &str) -> Result<()> {
 }
 
 /// Report the uninstall to the control plane (best-effort), then stop + remove
-/// the supervisor and delete local state (config + persisted tokens).
-pub async fn uninstall(rails_url: &str) -> Result<String> {
-    report_uninstall(rails_url).await;
+/// the supervisor and delete local state (config + persisted tokens) and the
+/// installed binaries (agent + update leftovers + the manager itself on Unix).
+pub async fn uninstall(rails_url: &str, agent_path: &Path) -> Result<String> {
+    // `uninstall` normally runs from an interactive shell where
+    // EDGEPACER_RAILS_URL is unset (it lives in the supervisor's env file /
+    // plist), so recover the URL install wrote before that config is deleted —
+    // reporting against an empty URL just fails with a reqwest builder error.
+    let rails_url = if rails_url.trim().is_empty() {
+        stored_rails_url()
+    } else {
+        Some(rails_url.to_string())
+    };
+    match &rails_url {
+        Some(url) => report_uninstall(url).await,
+        None => info!("[manager] no control-plane URL found; skipping uninstall report"),
+    }
 
     let mut log = String::new();
     #[cfg(target_os = "linux")]
@@ -95,7 +106,96 @@ pub async fn uninstall(rails_url: &str) -> Result<String> {
         let _ = std::fs::remove_dir_all(&state_dir);
         log.push_str(&format!("\nremoved state dir {}", state_dir.display()));
     }
+
+    remove_agent_binaries(agent_path, &mut log);
+    remove_manager_binary(&mut log);
     Ok(log)
+}
+
+/// Delete the agent binary the manager downloaded, plus update leftovers
+/// (`.backup` from a rollback point, `.new` from an interrupted download).
+fn remove_agent_binaries(agent_path: &Path, log: &mut String) {
+    for path in [
+        agent_path.to_path_buf(),
+        agent_path.with_extension("backup"),
+        agent_path.with_extension("new"),
+    ] {
+        if std::fs::remove_file(&path).is_ok() {
+            log.push_str(&format!("\nremoved {}", path.display()));
+        }
+    }
+}
+
+/// Delete the manager's own binary. On Unix a running executable can unlink
+/// itself (the mapped image stays valid until exit); Windows locks a running
+/// .exe, so there the binary is left for the operator to delete. Either way,
+/// clear a `.old` left behind by a prior self-update's rename-aside.
+fn remove_manager_binary(log: &mut String) {
+    let Ok(exe) = std::env::current_exe() else {
+        return;
+    };
+    let _ = std::fs::remove_file(exe.with_extension("old"));
+    #[cfg(not(target_os = "windows"))]
+    if std::fs::remove_file(&exe).is_ok() {
+        log.push_str(&format!("\nremoved {}", exe.display()));
+    }
+    #[cfg(target_os = "windows")]
+    log.push_str(&format!(
+        "\nmanager binary left at {} (a running exe cannot delete itself); delete it manually",
+        exe.display()
+    ));
+}
+
+/// Recover the control-plane URL that `install` persisted for the supervisor:
+/// the env file on Linux/Windows, the launchd plist on macOS.
+fn stored_rails_url() -> Option<String> {
+    #[cfg(target_os = "linux")]
+    {
+        let env = std::fs::read_to_string(Path::new(UNIX_CONFIG_DIR).join("edgepacer.env")).ok()?;
+        rails_url_from_env_file(&env)
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let plist = std::fs::read_to_string(LAUNCHD_PLIST_PATH).ok()?;
+        rails_url_from_plist(&plist)
+    }
+    #[cfg(target_os = "windows")]
+    {
+        let env_path = std::env::current_exe()
+            .ok()?
+            .parent()?
+            .join("edgepacer.env");
+        let env = std::fs::read_to_string(env_path).ok()?;
+        rails_url_from_env_file(&env)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+    {
+        None
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "windows", test))]
+fn rails_url_from_env_file(body: &str) -> Option<String> {
+    body.lines()
+        .find_map(|line| line.strip_prefix("EDGEPACER_RAILS_URL="))
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn rails_url_from_plist(plist: &str) -> Option<String> {
+    let after = plist
+        .split("<key>EDGEPACER_RAILS_URL</key><string>")
+        .nth(1)?;
+    let value = after.split("</string>").next()?;
+    // Reverse of `xml_escape` (applied when the plist was written); `&amp;`
+    // must be unescaped last so it can't create new entities.
+    let value = value
+        .replace("&quot;", "\"")
+        .replace("&gt;", ">")
+        .replace("&lt;", "<")
+        .replace("&amp;", "&");
+    (!value.is_empty()).then_some(value)
 }
 
 /// Best-effort POST /api/v1/edgepacer/uninstall so the control plane knows this
@@ -354,4 +454,72 @@ async fn run(program: &str, args: &[&str]) -> Result<()> {
         anyhow::bail!("{program} {args:?} failed: {}", stderr.trim());
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rails_url_from_env_file_extracts_value() {
+        let body = "EDGEPACER_ACCOUNT_TOKEN=tok\nEDGEPACER_RAILS_URL=https://app.logpacer.com\nEDGEPACER_UPDATE_PUBLIC_KEY=abc\n";
+        assert_eq!(
+            rails_url_from_env_file(body).as_deref(),
+            Some("https://app.logpacer.com")
+        );
+    }
+
+    #[test]
+    fn rails_url_from_env_file_handles_crlf_and_missing() {
+        let crlf =
+            "EDGEPACER_ACCOUNT_TOKEN=tok\r\nEDGEPACER_RAILS_URL=https://app.logpacer.com\r\n";
+        assert_eq!(
+            rails_url_from_env_file(crlf).as_deref(),
+            Some("https://app.logpacer.com")
+        );
+        assert_eq!(
+            rails_url_from_env_file("EDGEPACER_ACCOUNT_TOKEN=tok\n"),
+            None
+        );
+        assert_eq!(rails_url_from_env_file("EDGEPACER_RAILS_URL=\n"), None);
+    }
+
+    #[test]
+    fn rails_url_from_plist_extracts_and_unescapes() {
+        let plist = "<dict>\n\
+             <key>EDGEPACER_RAILS_URL</key><string>https://app.logpacer.com/?a=1&amp;b=2</string>\n\
+             </dict>";
+        assert_eq!(
+            rails_url_from_plist(plist).as_deref(),
+            Some("https://app.logpacer.com/?a=1&b=2")
+        );
+        assert_eq!(rails_url_from_plist("<dict></dict>"), None);
+    }
+
+    #[test]
+    fn remove_agent_binaries_deletes_agent_and_update_leftovers() {
+        let dir = tempfile::tempdir().unwrap();
+        let agent = dir.path().join("edgepacer");
+        let backup = dir.path().join("edgepacer.backup");
+        let new = dir.path().join("edgepacer.new");
+        for p in [&agent, &backup, &new] {
+            std::fs::write(p, b"bin").unwrap();
+        }
+
+        let mut log = String::new();
+        remove_agent_binaries(&agent, &mut log);
+
+        for p in [&agent, &backup, &new] {
+            assert!(!p.exists(), "{} should be removed", p.display());
+        }
+        assert!(log.contains("removed"));
+    }
+
+    #[test]
+    fn remove_agent_binaries_is_quiet_when_nothing_exists() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut log = String::new();
+        remove_agent_binaries(&dir.path().join("edgepacer"), &mut log);
+        assert!(log.is_empty());
+    }
 }
