@@ -289,7 +289,7 @@ async fn report_inventory(
     }
 
     // Files
-    if !report.new_files.is_empty() || !report.stopped_files.is_empty() {
+    if full_report || !report.new_files.is_empty() || !report.stopped_files.is_empty() {
         let payload = stamp_full_report(
             json!({
                 "files": report.new_files.iter().map(file_census_entry).collect::<Vec<_>>(),
@@ -628,6 +628,47 @@ mod tests {
             source_format: crate::config::FileSourceFormat::Plain,
             line_count: 100,
         }
+    }
+
+    #[tokio::test]
+    async fn empty_fresh_tracker_posts_one_full_file_report() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/v1/census/files"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "status": "accepted"
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let config = test_app_config(server.uri());
+        let client = Client::new_for_test(&config, "installation-1").unwrap();
+        client.set_bearer_token("access-1");
+        let mut tracker = ChangeTracker::new();
+        let census = discovery::Census::default();
+
+        let report = tracker.update_from_scan(&census);
+        report_inventory(&client, &mut tracker, &report, &[])
+            .await
+            .unwrap();
+
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 1, "empty fresh reports must be sent");
+        let body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+        assert_eq!(body["files"], serde_json::json!([]));
+        assert_eq!(body["stopped_files"], serde_json::json!([]));
+        assert_eq!(body["full_report"], true);
+
+        tracker.commit_scan();
+
+        let report = tracker.update_from_scan(&census);
+        report_inventory(&client, &mut tracker, &report, &[])
+            .await
+            .unwrap();
+
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 1, "empty deltas must remain unreported");
     }
 
     #[tokio::test]
@@ -1008,6 +1049,13 @@ mod tests {
             })))
             .mount(&server)
             .await;
+        Mock::given(method("POST"))
+            .and(path("/api/v1/census/files"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "status": "accepted"
+            })))
+            .mount(&server)
+            .await;
 
         let config = test_app_config(server.uri());
         let client = Client::new_for_test(&config, "installation-1").unwrap();
@@ -1189,6 +1237,13 @@ mod tests {
             })))
             .mount(&server)
             .await;
+        Mock::given(method("POST"))
+            .and(path("/api/v1/census/files"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "status": "accepted"
+            })))
+            .mount(&server)
+            .await;
 
         let config = test_app_config(server.uri());
         let client = Client::new_for_test(&config, "installation-1").unwrap();
@@ -1207,17 +1262,20 @@ mod tests {
             .await
             .unwrap();
 
-        let bodies: Vec<serde_json::Value> = server
-            .received_requests()
-            .await
-            .unwrap()
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 2, "containers plus the files full report");
+        assert!(
+            requests
+                .iter()
+                .all(|request| !request.url.path().ends_with("/census/services")),
+            "no explicit opt-in means no services-lane traffic"
+        );
+        let request = requests
             .iter()
-            .map(|r| serde_json::from_slice(&r.body).unwrap())
-            .collect();
-        // Only the containers (screener) lane posts — no explicit opt-in means
-        // no services-lane traffic.
-        assert_eq!(bodies.len(), 1);
-        let containers = bodies[0]["containers"].as_array().unwrap();
+            .find(|request| request.url.path().ends_with("/census/containers"))
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+        let containers = body["containers"].as_array().unwrap();
         assert_eq!(
             containers.len(),
             1,
@@ -1240,7 +1298,7 @@ mod tests {
     #[tokio::test]
     async fn explicit_k8s_container_still_reports_on_the_services_lane() {
         let server = MockServer::start().await;
-        for lane in ["containers", "services"] {
+        for lane in ["containers", "services", "files"] {
             Mock::given(method("POST"))
                 .and(path(format!("/api/v1/census/{lane}")))
                 .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
@@ -1265,14 +1323,23 @@ mod tests {
             .unwrap();
 
         let requests = server.received_requests().await.unwrap();
-        assert_eq!(requests.len(), 1);
-        assert!(requests[0].url.path().ends_with("/census/services"));
+        assert_eq!(requests.len(), 2, "services plus the files full report");
+        assert!(
+            requests
+                .iter()
+                .any(|request| request.url.path().ends_with("/census/services"))
+        );
+        assert!(
+            requests
+                .iter()
+                .all(|request| !request.url.path().ends_with("/census/containers"))
+        );
     }
 
     #[tokio::test]
     async fn census_lanes_stamp_full_report_only_on_full_re_emits() {
         let server = MockServer::start().await;
-        for lane in ["containers", "services"] {
+        for lane in ["containers", "services", "files"] {
             Mock::given(method("POST"))
                 .and(path(format!("/api/v1/census/{lane}")))
                 .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
@@ -1326,14 +1393,22 @@ mod tests {
             .iter()
             .map(|r| serde_json::from_slice(&r.body).unwrap())
             .collect();
-        assert_eq!(bodies.len(), 6, "two lanes over three cycles");
-        // Full re-emits (start + post-resync) are marked on both lanes...
-        for body in [&bodies[0], &bodies[1], &bodies[4], &bodies[5]] {
-            assert_eq!(body["full_report"], true);
-        }
-        // ...deltas carry no marker at all (absent, not false).
-        for body in [&bodies[2], &bodies[3]] {
-            assert!(body.get("full_report").is_none());
-        }
+        assert_eq!(bodies.len(), 8, "three full lanes and two delta lanes");
+        assert_eq!(
+            bodies
+                .iter()
+                .filter(|body| body.get("full_report") == Some(&json!(true)))
+                .count(),
+            6,
+            "start and post-resync mark every lane"
+        );
+        assert_eq!(
+            bodies
+                .iter()
+                .filter(|body| body.get("full_report").is_none())
+                .count(),
+            2,
+            "delta payloads omit the marker"
+        );
     }
 }
