@@ -6,6 +6,7 @@
 use super::LogFile;
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Read};
+use std::path::{Path, PathBuf};
 use tracing::debug;
 
 pub(crate) const FORMAT_NDJSON: &str = "ndjson";
@@ -37,38 +38,83 @@ pub async fn discover_log_files(
     scan_paths: &[&str],
     allowed_extensions: &[&str],
 ) -> anyhow::Result<Vec<LogFile>> {
+    discover_log_files_with_runtime_paths(scan_paths, allowed_extensions, &[], &[], false).await
+}
+
+/// Discover census files while omitting paths already owned by a working
+/// container runtime. Docker's default json-file tree is scanned separately
+/// only as a degraded fallback, with its storage wrapper accounted for during
+/// format detection.
+pub(crate) async fn discover_log_files_with_runtime_paths(
+    scan_paths: &[&str],
+    allowed_extensions: &[&str],
+    excluded_paths: &[PathBuf],
+    additional_scan_paths: &[PathBuf],
+    detect_docker_json_ownership: bool,
+) -> anyhow::Result<Vec<LogFile>> {
     let paths: Vec<String> = scan_paths.iter().map(|s| s.to_string()).collect();
     let allowed: Vec<String> = allowed_extensions.iter().map(|s| s.to_string()).collect();
+    let excluded = excluded_paths.to_vec();
+    let additional = additional_scan_paths.to_vec();
 
     // Run blocking I/O on a thread pool
-    tokio::task::spawn_blocking(move || discover_log_files_sync(&paths, &allowed))
-        .await
-        .map_err(|e| anyhow::anyhow!("file discovery task failed: {e}"))?
+    tokio::task::spawn_blocking(move || {
+        discover_log_files_sync(
+            &paths,
+            &allowed,
+            &excluded,
+            &additional,
+            detect_docker_json_ownership,
+        )
+    })
+    .await
+    .map_err(|e| anyhow::anyhow!("file discovery task failed: {e}"))?
 }
 
 fn discover_log_files_sync(
     scan_paths: &[String],
     allowed_extensions: &[String],
+    excluded_paths: &[PathBuf],
+    additional_scan_paths: &[PathBuf],
+    detect_docker_json_ownership: bool,
 ) -> anyhow::Result<Vec<LogFile>> {
     let mut files = Vec::new();
+    let excluded_paths = normalize_existing_paths(excluded_paths);
+    let mut paths: Vec<PathBuf> = scan_paths.iter().map(PathBuf::from).collect();
 
-    for base_path in scan_paths {
-        let base = std::path::Path::new(base_path);
+    for additional_path in additional_scan_paths {
+        if !paths.iter().any(|path| additional_path.starts_with(path)) {
+            paths.push(additional_path.clone());
+        }
+    }
+
+    for base in &paths {
         if !base.exists() {
-            debug!(path = %base_path, "scan path does not exist, skipping");
+            debug!(path = %base.display(), "scan path does not exist, skipping");
+            continue;
+        }
+        if path_belongs_to(base, &excluded_paths) {
             continue;
         }
 
-        walk_directory(base, &mut files, allowed_extensions)?;
+        walk_directory(
+            base,
+            &mut files,
+            allowed_extensions,
+            &excluded_paths,
+            detect_docker_json_ownership,
+        )?;
     }
 
     Ok(files)
 }
 
 fn walk_directory(
-    dir: &std::path::Path,
+    dir: &Path,
     files: &mut Vec<LogFile>,
     allowed_extensions: &[String],
+    excluded_paths: &[PathBuf],
+    detect_docker_json_ownership: bool,
 ) -> anyhow::Result<()> {
     let entries = match std::fs::read_dir(dir) {
         Ok(entries) => entries,
@@ -85,6 +131,9 @@ fn walk_directory(
         };
 
         let path = entry.path();
+        if path_belongs_to(&path, excluded_paths) {
+            continue;
+        }
         let metadata = match entry.metadata() {
             Ok(m) => m,
             Err(_) => continue,
@@ -92,7 +141,13 @@ fn walk_directory(
 
         if metadata.is_dir() {
             // Recurse but limit depth to avoid traversing huge trees
-            walk_directory(&path, files, allowed_extensions)?;
+            walk_directory(
+                &path,
+                files,
+                allowed_extensions,
+                excluded_paths,
+                detect_docker_json_ownership,
+            )?;
         } else if metadata.is_file() && is_log_file(&path, allowed_extensions) {
             let readable = is_readable(&path);
             let modified = metadata
@@ -106,7 +161,15 @@ fn walk_directory(
                 })
                 .unwrap_or_default();
 
-            let format = detect_format(&path);
+            let (format, source_format) =
+                if detect_docker_json_ownership && is_docker_json_log_path(&path) {
+                    (
+                        detect_docker_json_file_format(&path),
+                        crate::config::FileSourceFormat::DockerJson,
+                    )
+                } else {
+                    (detect_format(&path), crate::config::FileSourceFormat::Plain)
+                };
             let permissions = permissions_string(&metadata);
 
             let line_count = count_lines(&path);
@@ -118,12 +181,44 @@ fn walk_directory(
                 readable,
                 permissions,
                 format,
+                source_format,
                 line_count,
             });
         }
     }
 
     Ok(())
+}
+
+fn normalize_existing_paths(paths: &[PathBuf]) -> Vec<PathBuf> {
+    paths
+        .iter()
+        .map(|path| std::fs::canonicalize(path).unwrap_or_else(|_| path.clone()))
+        .collect()
+}
+
+fn path_belongs_to(path: &Path, roots: &[PathBuf]) -> bool {
+    roots.iter().any(|root| path.starts_with(root))
+        || std::fs::canonicalize(path)
+            .ok()
+            .is_some_and(|path| roots.iter().any(|root| path.starts_with(root)))
+}
+
+fn is_docker_json_log_path(path: &Path) -> bool {
+    let Some(container_id) = path
+        .parent()
+        .and_then(Path::file_name)
+        .and_then(|name| name.to_str())
+    else {
+        return false;
+    };
+    container_id.len() == 64
+        && container_id.bytes().all(|byte| byte.is_ascii_hexdigit())
+        && path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .and_then(|name| name.strip_suffix("-json.log"))
+            == Some(container_id)
 }
 
 /// Check if a file looks like a log file, given the allowed extension set
@@ -461,6 +556,62 @@ mod tests {
         let paths: Vec<&str> = files.iter().map(|f| f.path.as_str()).collect();
         assert!(paths.iter().any(|p| p.ends_with("app.log")));
         assert!(paths.iter().any(|p| p.ends_with("nested.log")));
+    }
+
+    #[tokio::test]
+    async fn excludes_runtime_owned_paths_from_census_scan() {
+        let dir = tempfile::tempdir().unwrap();
+        let runtime_root = dir.path().join("docker/containers");
+        std::fs::create_dir_all(&runtime_root).unwrap();
+        std::fs::write(runtime_root.join("container-json.log"), "runtime log\n").unwrap();
+        std::fs::write(dir.path().join("application.log"), "application log\n").unwrap();
+
+        let files = discover_log_files_with_runtime_paths(
+            &[dir.path().to_str().unwrap()],
+            DEFAULT_LOG_EXTENSIONS,
+            std::slice::from_ref(&runtime_root),
+            &[],
+            false,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(files.len(), 1);
+        assert!(files[0].path.ends_with("application.log"));
+    }
+
+    #[tokio::test]
+    async fn scans_docker_json_fallback_with_inner_payload_format() {
+        let dir = tempfile::tempdir().unwrap();
+        let runtime_root = dir.path().join("custom-runtime-root/containers");
+        let container_id = "a".repeat(64);
+        let container_dir = runtime_root.join(&container_id);
+        std::fs::create_dir_all(&container_dir).unwrap();
+        std::fs::write(
+            container_dir.join(format!("{container_id}-json.log")),
+            concat!(
+                r#"{"log":"INFO hello\n","stream":"stdout","time":"2026-08-12T08:00:00Z"}"#,
+                "\n"
+            ),
+        )
+        .unwrap();
+
+        let files = discover_log_files_with_runtime_paths(
+            &[runtime_root.to_str().unwrap()],
+            DEFAULT_LOG_EXTENSIONS,
+            &[],
+            &[],
+            true,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].format, FORMAT_PLAIN_TEXT);
+        assert_eq!(
+            files[0].source_format,
+            crate::config::FileSourceFormat::DockerJson
+        );
     }
 
     #[tokio::test]
