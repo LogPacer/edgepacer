@@ -648,8 +648,27 @@ mod tests {
         assert_eq!(extract_max_file_age_days(&config).await, 30);
     }
 
+    async fn wait_for_file_count(
+        cache: &SharedDiscoveryCache,
+        after_epoch: u64,
+        expected: usize,
+    ) -> u64 {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let cache = cache.read().await;
+                if cache.epoch() > after_epoch && cache.stats().files == expected {
+                    return cache.epoch();
+                }
+                drop(cache);
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("agent did not complete the expected discovery cycle")
+    }
+
     #[tokio::test]
-    async fn recurring_scan_applies_updated_max_file_age_config() {
+    async fn run_loop_applies_updated_max_file_age_config_on_next_poll() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("app.log");
         std::fs::write(&path, "line\n").unwrap();
@@ -672,9 +691,32 @@ mod tests {
             "wide".to_string(),
         ));
 
-        let first = discover_from_config(&config).await;
-        assert_eq!(first.log_files.len(), 1);
-        assert_eq!(first.log_files[0].path, path.to_string_lossy());
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "status": "accepted"
+            })))
+            .mount(&server)
+            .await;
+        let app_config = test_app_config(server.uri());
+        let client = Client::new_for_test(&app_config, "installation-1").unwrap();
+        client.set_bearer_token("access-1");
+        let cache = discovery::shared_discovery_cache();
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let run_config = config.clone();
+        let run_cache = cache.clone();
+        let handle = tokio::spawn(async move {
+            run(
+                &client,
+                run_config,
+                run_cache,
+                Duration::from_millis(50),
+                shutdown_rx,
+            )
+            .await;
+        });
+
+        let first_epoch = wait_for_file_count(&cache, 0, 1).await;
 
         *config.write().await = Some(crate::config::UnifiedConfig::new(
             serde_json::json!({
@@ -686,8 +728,12 @@ mod tests {
             "narrow".to_string(),
         ));
 
-        let recurring = discover_from_config(&config).await;
-        assert!(recurring.log_files.is_empty());
+        wait_for_file_count(&cache, first_epoch, 0).await;
+        shutdown_tx.send(true).unwrap();
+        tokio::time::timeout(Duration::from_secs(10), handle)
+            .await
+            .expect("agent did not shut down")
+            .unwrap();
     }
 
     #[tokio::test]
