@@ -40,12 +40,14 @@ pub async fn run(
         let scan_refs: Vec<&str> = scan_paths.iter().map(|s| s.as_str()).collect();
         let log_extensions = extract_log_extensions(&shared_config).await;
         let ext_refs: Vec<&str> = log_extensions.iter().map(|s| s.as_str()).collect();
+        let max_file_age_days = extract_max_file_age_days(&shared_config).await;
 
-        debug!(paths = ?scan_refs, extensions = ?ext_refs, "using scan paths");
+        debug!(paths = ?scan_refs, extensions = ?ext_refs, max_file_age_days, "using scan paths");
         let include_runtime_processes = runtime_process_discovery_enabled(&shared_config).await;
-        let census = discovery::discover_with_paths_and_runtime_processes(
+        let census = discovery::discover_with_file_settings_and_runtime_processes(
             &scan_refs,
             &ext_refs,
+            max_file_age_days,
             include_runtime_processes,
         )
         .await;
@@ -545,6 +547,16 @@ async fn extract_log_extensions(shared_config: &SharedConfig) -> Vec<String> {
     }
 }
 
+/// Extract the file-census age limit from unified config.
+async fn extract_max_file_age_days(shared_config: &SharedConfig) -> u64 {
+    let cfg = shared_config.read().await;
+    cfg.as_ref()
+        .and_then(|unified| unified.raw.get("discovery"))
+        .and_then(|discovery| discovery.get("max_file_age_days"))
+        .and_then(|value| value.as_u64())
+        .unwrap_or(discovery::files::DEFAULT_MAX_FILE_AGE_DAYS)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -614,6 +626,22 @@ mod tests {
             runtime_process_discovery_enabled(&config).await,
             cfg!(all(target_os = "linux", feature = "ebpf"))
         );
+    }
+
+    #[tokio::test]
+    async fn max_file_age_days_honors_unified_config() {
+        let config = crate::config::shared_config();
+        assert_eq!(
+            extract_max_file_age_days(&config).await,
+            discovery::files::DEFAULT_MAX_FILE_AGE_DAYS
+        );
+
+        *config.write().await = Some(crate::config::UnifiedConfig::new(
+            serde_json::json!({ "discovery": { "max_file_age_days": 30 } }),
+            "configured".to_string(),
+        ));
+
+        assert_eq!(extract_max_file_age_days(&config).await, 30);
     }
 
     #[tokio::test]
