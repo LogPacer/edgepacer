@@ -96,6 +96,13 @@ pub(crate) async fn discover_containers_with_runtime_log_paths(
             log_root_available: false,
         });
     };
+    discover_containers_with_connection(connection, include_runtime_processes).await
+}
+
+async fn discover_containers_with_connection(
+    connection: DockerConnection,
+    include_runtime_processes: bool,
+) -> anyhow::Result<DockerDiscovery> {
     let DockerConnection {
         client: docker,
         runtime_processes_are_local,
@@ -486,6 +493,8 @@ fn clean_name(name: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use wiremock::matchers::{method, path_regex};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
 
     #[cfg(unix)]
     const PLATFORM_DEFAULT_DOCKER_HOST: &str = DEFAULT_UNIX_DOCKER_HOST;
@@ -534,6 +543,38 @@ mod tests {
             Some(PathBuf::from("/mnt/docker-data/containers"))
         );
         assert_eq!(docker_json_log_root(None), None);
+    }
+
+    #[tokio::test]
+    async fn successful_container_listing_keeps_runtime_available_when_info_fails() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path_regex(r".*/info$"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path_regex(r".*/containers/json$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([])))
+            .mount(&server)
+            .await;
+        let connection = DockerConnection {
+            client: Docker::connect_with_http(
+                &server.uri(),
+                DOCKER_TIMEOUT_SECS,
+                API_DEFAULT_VERSION,
+            )
+            .unwrap(),
+            runtime_processes_are_local: false,
+        };
+
+        let discovery = discover_containers_with_connection(connection, false)
+            .await
+            .unwrap();
+
+        assert!(discovery.runtime_available);
+        assert!(!discovery.log_root_available);
+        assert!(discovery.runtime_log_paths.is_empty());
     }
 
     #[test]

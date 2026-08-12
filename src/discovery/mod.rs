@@ -1033,6 +1033,69 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn unavailable_docker_adds_default_json_root_to_the_scan() {
+        let dir = tempfile::tempdir().unwrap();
+        let docker_root = dir.path().join("containers");
+        let container_id = "c".repeat(64);
+        let container_dir = docker_root.join(&container_id);
+        std::fs::create_dir_all(&container_dir).unwrap();
+        std::fs::write(
+            container_dir.join(format!("{container_id}-json.log")),
+            concat!(
+                r#"{"log":"INFO hello\n","stream":"stdout","time":"2026-08-12T08:00:00Z"}"#,
+                "\n"
+            ),
+        )
+        .unwrap();
+        let docker_result = Err(anyhow::anyhow!("socket unreachable"));
+
+        let files = discover_files_after_runtime(
+            &[],
+            files::DEFAULT_LOG_EXTENSIONS,
+            &docker_result,
+            false,
+            &Ok(Vec::new()),
+            &unavailable_cri(),
+            &docker_root,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(files.len(), 1);
+        assert_eq!(
+            files[0].source_format,
+            crate::config::FileSourceFormat::DockerJson
+        );
+    }
+
+    #[tokio::test]
+    async fn degraded_docker_scan_keeps_non_runtime_files_plain() {
+        let dir = tempfile::tempdir().unwrap();
+        let ordinary_log = dir.path().join("application.log");
+        std::fs::write(&ordinary_log, "application\n").unwrap();
+        let docker_result = Err(anyhow::anyhow!("socket unreachable"));
+
+        let files = discover_files_after_runtime(
+            &[dir.path().to_str().unwrap()],
+            files::DEFAULT_LOG_EXTENSIONS,
+            &docker_result,
+            false,
+            &Ok(Vec::new()),
+            &unavailable_cri(),
+            &dir.path().join("missing-default-root"),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].path, ordinary_log.to_string_lossy());
+        assert_eq!(
+            files[0].source_format,
+            crate::config::FileSourceFormat::Plain
+        );
+    }
+
     #[test]
     fn runtime_process_identity_never_crosses_the_census_wire() {
         let mut container = make_container("my-nginx");
