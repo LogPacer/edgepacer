@@ -501,6 +501,8 @@ pub(crate) fn is_json_object_line(line: &[u8]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::discovery::Census;
+    use crate::tracker::ChangeTracker;
     use std::io::Write;
 
     fn ext(list: &[&str]) -> Vec<String> {
@@ -669,6 +671,47 @@ mod tests {
                 .is_empty()
         );
         assert_eq!(discovered_names(dir.path(), 30).await, vec!["app.log"]);
+    }
+
+    #[tokio::test]
+    async fn stale_file_stops_then_reenters_after_a_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("app.log");
+        std::fs::write(&path, "line\n").unwrap();
+        let scan = || async {
+            Census {
+                log_files: discover_log_files_with_max_age(
+                    &[dir.path().to_str().unwrap()],
+                    DEFAULT_LOG_EXTENSIONS,
+                    DEFAULT_MAX_FILE_AGE_DAYS,
+                )
+                .await
+                .unwrap(),
+                ..Default::default()
+            }
+        };
+        let mut tracker = ChangeTracker::new();
+
+        let fresh = tracker.update_from_scan(&scan().await);
+        assert_eq!(fresh.new_files.len(), 1);
+        tracker.commit_scan();
+
+        set_file_age(&path, 8);
+        let stale = tracker.update_from_scan(&scan().await);
+        assert_eq!(stale.stopped_files.len(), 1);
+        assert_eq!(stale.stopped_files[0].identifier, path.to_string_lossy());
+        tracker.commit_scan();
+
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(std::time::SystemTime::now())
+            .unwrap();
+        let moving_again = tracker.update_from_scan(&scan().await);
+        assert_eq!(moving_again.new_files.len(), 1);
+        assert_eq!(moving_again.new_files[0].path, path.to_string_lossy());
+        assert!(moving_again.stopped_files.is_empty());
     }
 
     #[test]

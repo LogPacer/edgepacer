@@ -34,23 +34,7 @@ pub async fn run(
 
     // Initial discovery immediately, then poll
     loop {
-        // Read scan_paths and the extension allowlist from config (dynamic —
-        // changes on hot-reload). Both fall back to OS-aware defaults when unset.
-        let scan_paths = extract_scan_paths(&shared_config).await;
-        let scan_refs: Vec<&str> = scan_paths.iter().map(|s| s.as_str()).collect();
-        let log_extensions = extract_log_extensions(&shared_config).await;
-        let ext_refs: Vec<&str> = log_extensions.iter().map(|s| s.as_str()).collect();
-        let max_file_age_days = extract_max_file_age_days(&shared_config).await;
-
-        debug!(paths = ?scan_refs, extensions = ?ext_refs, max_file_age_days, "using scan paths");
-        let include_runtime_processes = runtime_process_discovery_enabled(&shared_config).await;
-        let census = discovery::discover_with_file_settings_and_runtime_processes(
-            &scan_refs,
-            &ext_refs,
-            max_file_age_days,
-            include_runtime_processes,
-        )
-        .await;
+        let census = discover_from_config(&shared_config).await;
         let report = tracker.update_from_scan(&census);
         let package_report = if census.errors.contains_key("packages") {
             None
@@ -103,6 +87,26 @@ pub async fn run(
             }
         }
     }
+}
+
+async fn discover_from_config(shared_config: &SharedConfig) -> discovery::Census {
+    // Read file-discovery settings on every scan so hot-reloaded config applies
+    // without restarting the agent.
+    let scan_paths = extract_scan_paths(shared_config).await;
+    let scan_refs: Vec<&str> = scan_paths.iter().map(String::as_str).collect();
+    let log_extensions = extract_log_extensions(shared_config).await;
+    let ext_refs: Vec<&str> = log_extensions.iter().map(String::as_str).collect();
+    let max_file_age_days = extract_max_file_age_days(shared_config).await;
+
+    debug!(paths = ?scan_refs, extensions = ?ext_refs, max_file_age_days, "using scan paths");
+    let include_runtime_processes = runtime_process_discovery_enabled(shared_config).await;
+    discovery::discover_with_file_settings_and_runtime_processes(
+        &scan_refs,
+        &ext_refs,
+        max_file_age_days,
+        include_runtime_processes,
+    )
+    .await
 }
 
 async fn runtime_process_discovery_enabled(shared_config: &SharedConfig) -> bool {
@@ -642,6 +646,48 @@ mod tests {
         ));
 
         assert_eq!(extract_max_file_age_days(&config).await, 30);
+    }
+
+    #[tokio::test]
+    async fn recurring_scan_applies_updated_max_file_age_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("app.log");
+        std::fs::write(&path, "line\n").unwrap();
+        let old_mtime = std::time::SystemTime::now() - Duration::from_secs(8 * 24 * 60 * 60);
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(old_mtime)
+            .unwrap();
+
+        let config = crate::config::shared_config();
+        *config.write().await = Some(crate::config::UnifiedConfig::new(
+            serde_json::json!({
+                "discovery": {
+                    "scan_paths": [dir.path().to_str().unwrap()],
+                    "max_file_age_days": 30
+                }
+            }),
+            "wide".to_string(),
+        ));
+
+        let first = discover_from_config(&config).await;
+        assert_eq!(first.log_files.len(), 1);
+        assert_eq!(first.log_files[0].path, path.to_string_lossy());
+
+        *config.write().await = Some(crate::config::UnifiedConfig::new(
+            serde_json::json!({
+                "discovery": {
+                    "scan_paths": [dir.path().to_str().unwrap()],
+                    "max_file_age_days": 7
+                }
+            }),
+            "narrow".to_string(),
+        ));
+
+        let recurring = discover_from_config(&config).await;
+        assert!(recurring.log_files.is_empty());
     }
 
     #[tokio::test]
