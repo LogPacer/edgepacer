@@ -34,21 +34,7 @@ pub async fn run(
 
     // Initial discovery immediately, then poll
     loop {
-        // Read scan_paths and the extension allowlist from config (dynamic —
-        // changes on hot-reload). Both fall back to OS-aware defaults when unset.
-        let scan_paths = extract_scan_paths(&shared_config).await;
-        let scan_refs: Vec<&str> = scan_paths.iter().map(|s| s.as_str()).collect();
-        let log_extensions = extract_log_extensions(&shared_config).await;
-        let ext_refs: Vec<&str> = log_extensions.iter().map(|s| s.as_str()).collect();
-
-        debug!(paths = ?scan_refs, extensions = ?ext_refs, "using scan paths");
-        let include_runtime_processes = runtime_process_discovery_enabled(&shared_config).await;
-        let census = discovery::discover_with_paths_and_runtime_processes(
-            &scan_refs,
-            &ext_refs,
-            include_runtime_processes,
-        )
-        .await;
+        let census = discover_from_config(&shared_config).await;
         let report = tracker.update_from_scan(&census);
         let package_report = if census.errors.contains_key("packages") {
             None
@@ -101,6 +87,26 @@ pub async fn run(
             }
         }
     }
+}
+
+async fn discover_from_config(shared_config: &SharedConfig) -> discovery::Census {
+    // Read file-discovery settings on every scan so hot-reloaded config applies
+    // without restarting the agent.
+    let scan_paths = extract_scan_paths(shared_config).await;
+    let scan_refs: Vec<&str> = scan_paths.iter().map(String::as_str).collect();
+    let log_extensions = extract_log_extensions(shared_config).await;
+    let ext_refs: Vec<&str> = log_extensions.iter().map(String::as_str).collect();
+    let max_file_age_days = extract_max_file_age_days(shared_config).await;
+
+    debug!(paths = ?scan_refs, extensions = ?ext_refs, max_file_age_days, "using scan paths");
+    let include_runtime_processes = runtime_process_discovery_enabled(shared_config).await;
+    discovery::discover_with_file_settings_and_runtime_processes(
+        &scan_refs,
+        &ext_refs,
+        max_file_age_days,
+        include_runtime_processes,
+    )
+    .await
 }
 
 async fn runtime_process_discovery_enabled(shared_config: &SharedConfig) -> bool {
@@ -545,6 +551,16 @@ async fn extract_log_extensions(shared_config: &SharedConfig) -> Vec<String> {
     }
 }
 
+/// Extract the file-census age limit from unified config.
+async fn extract_max_file_age_days(shared_config: &SharedConfig) -> u64 {
+    let cfg = shared_config.read().await;
+    cfg.as_ref()
+        .and_then(|unified| unified.raw.get("discovery"))
+        .and_then(|discovery| discovery.get("max_file_age_days"))
+        .and_then(|value| value.as_u64())
+        .unwrap_or(discovery::files::DEFAULT_MAX_FILE_AGE_DAYS)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -614,6 +630,110 @@ mod tests {
             runtime_process_discovery_enabled(&config).await,
             cfg!(all(target_os = "linux", feature = "ebpf"))
         );
+    }
+
+    #[tokio::test]
+    async fn max_file_age_days_honors_unified_config() {
+        let config = crate::config::shared_config();
+        assert_eq!(
+            extract_max_file_age_days(&config).await,
+            discovery::files::DEFAULT_MAX_FILE_AGE_DAYS
+        );
+
+        *config.write().await = Some(crate::config::UnifiedConfig::new(
+            serde_json::json!({ "discovery": { "max_file_age_days": 30 } }),
+            "configured".to_string(),
+        ));
+
+        assert_eq!(extract_max_file_age_days(&config).await, 30);
+    }
+
+    async fn wait_for_file_count(
+        cache: &SharedDiscoveryCache,
+        after_epoch: u64,
+        expected: usize,
+    ) -> u64 {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let cache = cache.read().await;
+                if cache.epoch() > after_epoch && cache.stats().files == expected {
+                    return cache.epoch();
+                }
+                drop(cache);
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("agent did not complete the expected discovery cycle")
+    }
+
+    #[tokio::test]
+    async fn run_loop_applies_updated_max_file_age_config_on_next_poll() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("app.log");
+        std::fs::write(&path, "line\n").unwrap();
+        let old_mtime = std::time::SystemTime::now() - Duration::from_secs(8 * 24 * 60 * 60);
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(old_mtime)
+            .unwrap();
+
+        let config = crate::config::shared_config();
+        *config.write().await = Some(crate::config::UnifiedConfig::new(
+            serde_json::json!({
+                "discovery": {
+                    "scan_paths": [dir.path().to_str().unwrap()],
+                    "max_file_age_days": 30
+                }
+            }),
+            "wide".to_string(),
+        ));
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "status": "accepted"
+            })))
+            .mount(&server)
+            .await;
+        let app_config = test_app_config(server.uri());
+        let client = Client::new_for_test(&app_config, "installation-1").unwrap();
+        client.set_bearer_token("access-1");
+        let cache = discovery::shared_discovery_cache();
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let run_config = config.clone();
+        let run_cache = cache.clone();
+        let handle = tokio::spawn(async move {
+            run(
+                &client,
+                run_config,
+                run_cache,
+                Duration::from_millis(50),
+                shutdown_rx,
+            )
+            .await;
+        });
+
+        let first_epoch = wait_for_file_count(&cache, 0, 1).await;
+
+        *config.write().await = Some(crate::config::UnifiedConfig::new(
+            serde_json::json!({
+                "discovery": {
+                    "scan_paths": [dir.path().to_str().unwrap()],
+                    "max_file_age_days": 7
+                }
+            }),
+            "narrow".to_string(),
+        ));
+
+        wait_for_file_count(&cache, first_epoch, 0).await;
+        shutdown_tx.send(true).unwrap();
+        tokio::time::timeout(Duration::from_secs(10), handle)
+            .await
+            .expect("agent did not shut down")
+            .unwrap();
     }
 
     #[tokio::test]

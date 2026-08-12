@@ -550,9 +550,16 @@ pub async fn discover() -> Census {
     discover_with_runtime_processes(false).await
 }
 
+struct FileDiscoverySettings<'a> {
+    scan_paths: &'a [&'a str],
+    log_extensions: &'a [&'a str],
+    max_file_age_days: u64,
+}
+
 async fn discover_runtime_and_files(
     scan_paths: &[&str],
     log_extensions: &[&str],
+    max_file_age_days: u64,
     include_runtime_processes: bool,
 ) -> (
     anyhow::Result<Vec<Container>>,
@@ -568,8 +575,11 @@ async fn discover_runtime_and_files(
     );
 
     let files_result = discover_files_after_runtime(
-        scan_paths,
-        log_extensions,
+        FileDiscoverySettings {
+            scan_paths,
+            log_extensions,
+            max_file_age_days,
+        },
         &docker_result,
         kubernetes_runtime_present,
         &k8s_result,
@@ -587,8 +597,7 @@ async fn discover_runtime_and_files(
 }
 
 async fn discover_files_after_runtime(
-    scan_paths: &[&str],
-    log_extensions: &[&str],
+    settings: FileDiscoverySettings<'_>,
     docker_result: &anyhow::Result<docker::DockerDiscovery>,
     kubernetes_runtime_present: bool,
     k8s_result: &Result<Vec<Container>, String>,
@@ -620,11 +629,12 @@ async fn discover_files_after_runtime(
     }
 
     files::discover_log_files_with_runtime_paths(
-        scan_paths,
-        log_extensions,
+        settings.scan_paths,
+        settings.log_extensions,
         &excluded_paths,
         &additional_scan_paths,
         detect_docker_json_ownership,
+        settings.max_file_age_days,
     )
     .await
 }
@@ -653,6 +663,7 @@ pub(crate) async fn discover_with_runtime_processes(include_runtime_processes: b
         discover_runtime_and_files(
             scan_paths,
             files::DEFAULT_LOG_EXTENSIONS,
+            files::DEFAULT_MAX_FILE_AGE_DAYS,
             include_runtime_processes,
         ),
         systemd::discover_services(),
@@ -788,6 +799,21 @@ pub async fn discover_with_paths_and_runtime_processes(
     log_extensions: &[&str],
     include_runtime_processes: bool,
 ) -> Census {
+    discover_with_file_settings_and_runtime_processes(
+        scan_paths,
+        log_extensions,
+        files::DEFAULT_MAX_FILE_AGE_DAYS,
+        include_runtime_processes,
+    )
+    .await
+}
+
+pub(crate) async fn discover_with_file_settings_and_runtime_processes(
+    scan_paths: &[&str],
+    log_extensions: &[&str],
+    max_file_age_days: u64,
+    include_runtime_processes: bool,
+) -> Census {
     let mut census = Census {
         os: std::env::consts::OS.to_string(),
         architecture: std::env::consts::ARCH.to_string(),
@@ -803,7 +829,12 @@ pub async fn discover_with_paths_and_runtime_processes(
         packages_result,
         event_log_result,
     ) = tokio::join!(
-        discover_runtime_and_files(scan_paths, log_extensions, include_runtime_processes),
+        discover_runtime_and_files(
+            scan_paths,
+            log_extensions,
+            max_file_age_days,
+            include_runtime_processes,
+        ),
         systemd::discover_services(),
         processes::discover_processes(),
         ports::discover_ports(),
@@ -981,8 +1012,11 @@ mod tests {
         });
 
         let files = discover_files_after_runtime(
-            &[dir.path().to_str().unwrap()],
-            files::DEFAULT_LOG_EXTENSIONS,
+            FileDiscoverySettings {
+                scan_paths: &[dir.path().to_str().unwrap()],
+                log_extensions: files::DEFAULT_LOG_EXTENSIONS,
+                max_file_age_days: files::DEFAULT_MAX_FILE_AGE_DAYS,
+            },
             &docker_result,
             false,
             &Ok(Vec::new()),
@@ -1014,8 +1048,11 @@ mod tests {
         let docker_result = Err(anyhow::anyhow!("socket unreachable"));
 
         let files = discover_files_after_runtime(
-            &[configured_root.to_str().unwrap()],
-            files::DEFAULT_LOG_EXTENSIONS,
+            FileDiscoverySettings {
+                scan_paths: &[configured_root.to_str().unwrap()],
+                log_extensions: files::DEFAULT_LOG_EXTENSIONS,
+                max_file_age_days: files::DEFAULT_MAX_FILE_AGE_DAYS,
+            },
             &docker_result,
             false,
             &Ok(Vec::new()),
@@ -1051,8 +1088,11 @@ mod tests {
         let docker_result = Err(anyhow::anyhow!("socket unreachable"));
 
         let files = discover_files_after_runtime(
-            &[],
-            files::DEFAULT_LOG_EXTENSIONS,
+            FileDiscoverySettings {
+                scan_paths: &[],
+                log_extensions: files::DEFAULT_LOG_EXTENSIONS,
+                max_file_age_days: files::DEFAULT_MAX_FILE_AGE_DAYS,
+            },
             &docker_result,
             false,
             &Ok(Vec::new()),
@@ -1077,8 +1117,11 @@ mod tests {
         let docker_result = Err(anyhow::anyhow!("socket unreachable"));
 
         let files = discover_files_after_runtime(
-            &[dir.path().to_str().unwrap()],
-            files::DEFAULT_LOG_EXTENSIONS,
+            FileDiscoverySettings {
+                scan_paths: &[dir.path().to_str().unwrap()],
+                log_extensions: files::DEFAULT_LOG_EXTENSIONS,
+                max_file_age_days: files::DEFAULT_MAX_FILE_AGE_DAYS,
+            },
             &docker_result,
             false,
             &Ok(Vec::new()),
