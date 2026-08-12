@@ -59,17 +59,7 @@ pub async fn run(
             }
         }
 
-        if !report.is_empty() {
-            match report_inventory(client, &mut tracker, &report, &census.containers).await {
-                Ok(()) => tracker.commit_scan(),
-                Err(e) => {
-                    error!(error = %e, "failed to report inventory");
-                    tracker.rollback_scan();
-                }
-            }
-        } else {
-            tracker.commit_scan();
-        }
+        report_inventory_cycle(client, &mut tracker, &report, &census.containers).await;
 
         // Report volatile snapshot data separately from compacted inventory lanes.
         report_snapshot_data(client, &mut tracker, &census).await;
@@ -107,6 +97,25 @@ async fn discover_from_config(shared_config: &SharedConfig) -> discovery::Census
         include_runtime_processes,
     )
     .await
+}
+
+async fn report_inventory_cycle(
+    client: &Client,
+    tracker: &mut ChangeTracker,
+    report: &InventoryReport,
+    discovered_containers: &[Container],
+) {
+    if tracker.full_report() || !report.is_empty() {
+        match report_inventory(client, tracker, report, discovered_containers).await {
+            Ok(()) => tracker.commit_scan(),
+            Err(e) => {
+                error!(error = %e, "failed to report inventory");
+                tracker.rollback_scan();
+            }
+        }
+    } else {
+        tracker.commit_scan();
+    }
 }
 
 async fn runtime_process_discovery_enabled(shared_config: &SharedConfig) -> bool {
@@ -649,9 +658,7 @@ mod tests {
         let census = discovery::Census::default();
 
         let report = tracker.update_from_scan(&census);
-        report_inventory(&client, &mut tracker, &report, &[])
-            .await
-            .unwrap();
+        report_inventory_cycle(&client, &mut tracker, &report, &[]).await;
 
         let requests = server.received_requests().await.unwrap();
         assert_eq!(requests.len(), 1, "empty fresh reports must be sent");
@@ -660,12 +667,8 @@ mod tests {
         assert_eq!(body["stopped_files"], serde_json::json!([]));
         assert_eq!(body["full_report"], true);
 
-        tracker.commit_scan();
-
         let report = tracker.update_from_scan(&census);
-        report_inventory(&client, &mut tracker, &report, &[])
-            .await
-            .unwrap();
+        report_inventory_cycle(&client, &mut tracker, &report, &[]).await;
 
         let requests = server.received_requests().await.unwrap();
         assert_eq!(requests.len(), 1, "empty deltas must remain unreported");
