@@ -34,21 +34,7 @@ pub async fn run(
 
     // Initial discovery immediately, then poll
     loop {
-        // Read scan_paths and the extension allowlist from config (dynamic —
-        // changes on hot-reload). Both fall back to OS-aware defaults when unset.
-        let scan_paths = extract_scan_paths(&shared_config).await;
-        let scan_refs: Vec<&str> = scan_paths.iter().map(|s| s.as_str()).collect();
-        let log_extensions = extract_log_extensions(&shared_config).await;
-        let ext_refs: Vec<&str> = log_extensions.iter().map(|s| s.as_str()).collect();
-
-        debug!(paths = ?scan_refs, extensions = ?ext_refs, "using scan paths");
-        let include_runtime_processes = runtime_process_discovery_enabled(&shared_config).await;
-        let census = discovery::discover_with_paths_and_runtime_processes(
-            &scan_refs,
-            &ext_refs,
-            include_runtime_processes,
-        )
-        .await;
+        let census = discover_from_config(&shared_config).await;
         let report = tracker.update_from_scan(&census);
         let package_report = if census.errors.contains_key("packages") {
             None
@@ -73,17 +59,7 @@ pub async fn run(
             }
         }
 
-        if !report.is_empty() {
-            match report_inventory(client, &mut tracker, &report, &census.containers).await {
-                Ok(()) => tracker.commit_scan(),
-                Err(e) => {
-                    error!(error = %e, "failed to report inventory");
-                    tracker.rollback_scan();
-                }
-            }
-        } else {
-            tracker.commit_scan();
-        }
+        report_inventory_cycle(client, &mut tracker, &report, &census.containers).await;
 
         // Report volatile snapshot data separately from compacted inventory lanes.
         report_snapshot_data(client, &mut tracker, &census).await;
@@ -100,6 +76,45 @@ pub async fn run(
                 return;
             }
         }
+    }
+}
+
+async fn discover_from_config(shared_config: &SharedConfig) -> discovery::Census {
+    // Read file-discovery settings on every scan so hot-reloaded config applies
+    // without restarting the agent.
+    let scan_paths = extract_scan_paths(shared_config).await;
+    let scan_refs: Vec<&str> = scan_paths.iter().map(String::as_str).collect();
+    let log_extensions = extract_log_extensions(shared_config).await;
+    let ext_refs: Vec<&str> = log_extensions.iter().map(String::as_str).collect();
+    let max_file_age_days = extract_max_file_age_days(shared_config).await;
+
+    debug!(paths = ?scan_refs, extensions = ?ext_refs, max_file_age_days, "using scan paths");
+    let include_runtime_processes = runtime_process_discovery_enabled(shared_config).await;
+    discovery::discover_with_file_settings_and_runtime_processes(
+        &scan_refs,
+        &ext_refs,
+        max_file_age_days,
+        include_runtime_processes,
+    )
+    .await
+}
+
+async fn report_inventory_cycle(
+    client: &Client,
+    tracker: &mut ChangeTracker,
+    report: &InventoryReport,
+    discovered_containers: &[Container],
+) {
+    if tracker.full_report() || !report.is_empty() {
+        match report_inventory(client, tracker, report, discovered_containers).await {
+            Ok(()) => tracker.commit_scan(),
+            Err(e) => {
+                error!(error = %e, "failed to report inventory");
+                tracker.rollback_scan();
+            }
+        }
+    } else {
+        tracker.commit_scan();
     }
 }
 
@@ -283,20 +298,16 @@ async fn report_inventory(
     }
 
     // Files
-    if !report.new_files.is_empty() {
-        let payload = json!({
-                        "files": report.new_files.iter().map(|f| json!({
-                "identifier": f.identifier(),
-                "name": f.path.rsplit('/').next().unwrap_or(&f.path),
-                "path": f.path,
-                "size": f.size,
-                "format": f.format,
-                "permissions": f.permissions,
-                "modified": f.modified,
-                "line_count": f.line_count,
-                "state": "active",
-            })).collect::<Vec<_>>(),
-        });
+    if full_report || !report.new_files.is_empty() || !report.stopped_files.is_empty() {
+        let payload = stamp_full_report(
+            json!({
+                "files": report.new_files.iter().map(file_census_entry).collect::<Vec<_>>(),
+                "stopped_files": report.stopped_files.iter()
+                    .map(|s| json!({ "identifier": s.identifier }))
+                    .collect::<Vec<_>>(),
+            }),
+            full_report,
+        );
 
         match client.report_file_inventory(&payload).await {
             Ok(resp) => {
@@ -350,6 +361,21 @@ async fn report_inventory(
     }
 
     Ok(())
+}
+
+fn file_census_entry(file: &discovery::LogFile) -> serde_json::Value {
+    json!({
+        "identifier": file.identifier(),
+        "name": file.path.rsplit('/').next().unwrap_or(&file.path),
+        "path": file.path,
+        "size": file.size,
+        "format": file.format,
+        "metadata": { "source_format": file.source_format.hash_part() },
+        "permissions": file.permissions,
+        "modified": file.modified,
+        "line_count": file.line_count,
+        "state": "active",
+    })
 }
 
 /// Report volatile snapshot inventory (processes, ports) — full replacement, no delta tracking.
@@ -540,6 +566,16 @@ async fn extract_log_extensions(shared_config: &SharedConfig) -> Vec<String> {
     }
 }
 
+/// Extract the file-census age limit from unified config.
+async fn extract_max_file_age_days(shared_config: &SharedConfig) -> u64 {
+    let cfg = shared_config.read().await;
+    cfg.as_ref()
+        .and_then(|unified| unified.raw.get("discovery"))
+        .and_then(|discovery| discovery.get("max_file_age_days"))
+        .and_then(|value| value.as_u64())
+        .unwrap_or(discovery::files::DEFAULT_MAX_FILE_AGE_DAYS)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -571,6 +607,227 @@ mod tests {
         }
     }
 
+    #[test]
+    fn docker_fallback_census_entry_reports_runtime_ownership() {
+        let file = discovery::LogFile {
+            path: "/custom/docker/containers/id/id-json.log".into(),
+            size: 128,
+            modified: "2026-08-12T08:00:00Z".into(),
+            readable: true,
+            permissions: "644".into(),
+            format: "plain_text".into(),
+            source_format: crate::config::FileSourceFormat::DockerJson,
+            line_count: 1,
+        };
+
+        let entry = file_census_entry(&file);
+
+        assert_eq!(entry["format"], "plain_text");
+        assert_eq!(entry["metadata"]["source_format"], "docker-json");
+    }
+
+    fn log_file(path: &str) -> crate::discovery::LogFile {
+        crate::discovery::LogFile {
+            path: path.into(),
+            size: 1024,
+            modified: "2026-08-12T00:00:00Z".into(),
+            readable: true,
+            permissions: "644".into(),
+            format: "plain_text".into(),
+            source_format: crate::config::FileSourceFormat::Plain,
+            line_count: 100,
+        }
+    }
+
+    async fn wait_for_empty_file_discovery(cache: &SharedDiscoveryCache, after_epoch: u64) -> u64 {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let cache = cache.read().await;
+                if cache.epoch() > after_epoch && cache.stats().files == 0 {
+                    return cache.epoch();
+                }
+                drop(cache);
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("agent did not complete an empty-file discovery cycle")
+    }
+
+    #[tokio::test]
+    async fn run_loop_posts_one_empty_full_file_report() {
+        const CHILD_MARKER: &str = "EDGEPACER_EMPTY_DISCOVERY_CHILD";
+        const TEST_NAME: &str = "agent::tests::run_loop_posts_one_empty_full_file_report";
+
+        if std::env::var_os(CHILD_MARKER).is_none() {
+            let isolation = tempfile::tempdir().unwrap();
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([TEST_NAME, "--exact", "--nocapture"])
+                .env(CHILD_MARKER, "1")
+                .env(
+                    "DOCKER_HOST",
+                    format!("unix://{}", isolation.path().join("missing.sock").display()),
+                )
+                .env("PATH", isolation.path())
+                .env_remove("CONTAINER_HOST")
+                .env_remove("NODE_NAME")
+                .output()
+                .expect("failed to start isolated agent run-loop test");
+            assert!(
+                output.status.success(),
+                "isolated agent run-loop test failed\nstdout:\n{}\nstderr:\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "status": "accepted"
+            })))
+            .mount(&server)
+            .await;
+
+        let config = test_app_config(server.uri());
+        let client = Client::new_for_test(&config, "installation-1").unwrap();
+        client.set_bearer_token("access-1");
+        let shared_config = crate::config::shared_config();
+        *shared_config.write().await = Some(crate::config::UnifiedConfig::new(
+            serde_json::json!({
+                "discovery": {
+                    "scan_paths": [dir.path().to_string_lossy().to_string()]
+                }
+            }),
+            "empty-files".to_string(),
+        ));
+        let cache = discovery::shared_discovery_cache();
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let run_cache = cache.clone();
+        let handle = tokio::spawn(async move {
+            run(
+                &client,
+                shared_config,
+                run_cache,
+                Duration::from_millis(50),
+                shutdown_rx,
+            )
+            .await;
+        });
+
+        let first_epoch = wait_for_empty_file_discovery(&cache, 0).await;
+        wait_for_empty_file_discovery(&cache, first_epoch).await;
+        shutdown_tx.send(true).unwrap();
+        tokio::time::timeout(Duration::from_secs(10), handle)
+            .await
+            .expect("agent did not shut down")
+            .unwrap();
+
+        let requests: Vec<_> = server
+            .received_requests()
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|request| request.url.path() == "/api/v1/census/files")
+            .collect();
+        assert_eq!(requests.len(), 1, "empty fresh reports must be sent");
+        let body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+        assert_eq!(body["files"], serde_json::json!([]));
+        assert_eq!(body["stopped_files"], serde_json::json!([]));
+        assert_eq!(body["full_report"], true);
+    }
+
+    #[tokio::test]
+    async fn fresh_tracker_file_payload_is_a_full_report() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/v1/census/files"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "status": "accepted"
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let config = test_app_config(server.uri());
+        let client = Client::new_for_test(&config, "installation-1").unwrap();
+        client.set_bearer_token("access-1");
+        let mut tracker = ChangeTracker::new();
+        let census = discovery::Census {
+            log_files: vec![log_file("/var/log/app.log")],
+            ..Default::default()
+        };
+
+        let report = tracker.update_from_scan(&census);
+        report_inventory(&client, &mut tracker, &report, &[])
+            .await
+            .unwrap();
+
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 1);
+        let body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+        assert_eq!(body["full_report"], true);
+    }
+
+    #[tokio::test]
+    async fn stale_file_posts_an_identifier_only_stop() {
+        let dir = tempfile::tempdir().unwrap();
+        let file_path = dir.path().join("app.log");
+        std::fs::write(&file_path, "line\n").unwrap();
+        let scan = || async {
+            discovery::Census {
+                log_files: discovery::files::discover_log_files_with_max_age(
+                    &[dir.path().to_str().unwrap()],
+                    discovery::files::DEFAULT_LOG_EXTENSIONS,
+                    discovery::files::DEFAULT_MAX_FILE_AGE_DAYS,
+                )
+                .await
+                .unwrap(),
+                ..Default::default()
+            }
+        };
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/v1/census/files"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "status": "accepted"
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let config = test_app_config(server.uri());
+        let client = Client::new_for_test(&config, "installation-1").unwrap();
+        client.set_bearer_token("access-1");
+        let mut tracker = ChangeTracker::new();
+        tracker.update_from_scan(&scan().await);
+        tracker.commit_scan();
+
+        let old_mtime = std::time::SystemTime::now() - Duration::from_secs(8 * 24 * 60 * 60);
+        std::fs::File::options()
+            .write(true)
+            .open(&file_path)
+            .unwrap()
+            .set_modified(old_mtime)
+            .unwrap();
+        let report = tracker.update_from_scan(&scan().await);
+        assert_eq!(report.stopped_files.len(), 1);
+        report_inventory(&client, &mut tracker, &report, &[])
+            .await
+            .unwrap();
+
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 1);
+        let body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+        assert_eq!(
+            body["stopped_files"],
+            serde_json::json!([{ "identifier": file_path.to_string_lossy() }])
+        );
+        assert_eq!(body["stopped_files"][0].as_object().unwrap().len(), 1);
+    }
+
     #[tokio::test]
     async fn runtime_process_discovery_requires_runtime_ebpf_enablement() {
         let config = crate::config::shared_config();
@@ -590,6 +847,110 @@ mod tests {
             runtime_process_discovery_enabled(&config).await,
             cfg!(all(target_os = "linux", feature = "ebpf"))
         );
+    }
+
+    #[tokio::test]
+    async fn max_file_age_days_honors_unified_config() {
+        let config = crate::config::shared_config();
+        assert_eq!(
+            extract_max_file_age_days(&config).await,
+            discovery::files::DEFAULT_MAX_FILE_AGE_DAYS
+        );
+
+        *config.write().await = Some(crate::config::UnifiedConfig::new(
+            serde_json::json!({ "discovery": { "max_file_age_days": 30 } }),
+            "configured".to_string(),
+        ));
+
+        assert_eq!(extract_max_file_age_days(&config).await, 30);
+    }
+
+    async fn wait_for_file_count(
+        cache: &SharedDiscoveryCache,
+        after_epoch: u64,
+        expected: usize,
+    ) -> u64 {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let cache = cache.read().await;
+                if cache.epoch() > after_epoch && cache.stats().files == expected {
+                    return cache.epoch();
+                }
+                drop(cache);
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("agent did not complete the expected discovery cycle")
+    }
+
+    #[tokio::test]
+    async fn run_loop_applies_updated_max_file_age_config_on_next_poll() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("app.log");
+        std::fs::write(&path, "line\n").unwrap();
+        let old_mtime = std::time::SystemTime::now() - Duration::from_secs(8 * 24 * 60 * 60);
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(old_mtime)
+            .unwrap();
+
+        let config = crate::config::shared_config();
+        *config.write().await = Some(crate::config::UnifiedConfig::new(
+            serde_json::json!({
+                "discovery": {
+                    "scan_paths": [dir.path().to_str().unwrap()],
+                    "max_file_age_days": 30
+                }
+            }),
+            "wide".to_string(),
+        ));
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "status": "accepted"
+            })))
+            .mount(&server)
+            .await;
+        let app_config = test_app_config(server.uri());
+        let client = Client::new_for_test(&app_config, "installation-1").unwrap();
+        client.set_bearer_token("access-1");
+        let cache = discovery::shared_discovery_cache();
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let run_config = config.clone();
+        let run_cache = cache.clone();
+        let handle = tokio::spawn(async move {
+            run(
+                &client,
+                run_config,
+                run_cache,
+                Duration::from_millis(50),
+                shutdown_rx,
+            )
+            .await;
+        });
+
+        let first_epoch = wait_for_file_count(&cache, 0, 1).await;
+
+        *config.write().await = Some(crate::config::UnifiedConfig::new(
+            serde_json::json!({
+                "discovery": {
+                    "scan_paths": [dir.path().to_str().unwrap()],
+                    "max_file_age_days": 7
+                }
+            }),
+            "narrow".to_string(),
+        ));
+
+        wait_for_file_count(&cache, first_epoch, 0).await;
+        shutdown_tx.send(true).unwrap();
+        tokio::time::timeout(Duration::from_secs(10), handle)
+            .await
+            .expect("agent did not shut down")
+            .unwrap();
     }
 
     #[tokio::test]
@@ -775,6 +1136,13 @@ mod tests {
             })))
             .mount(&server)
             .await;
+        Mock::given(method("POST"))
+            .and(path("/api/v1/census/files"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "status": "accepted"
+            })))
+            .mount(&server)
+            .await;
 
         let config = test_app_config(server.uri());
         let client = Client::new_for_test(&config, "installation-1").unwrap();
@@ -956,6 +1324,13 @@ mod tests {
             })))
             .mount(&server)
             .await;
+        Mock::given(method("POST"))
+            .and(path("/api/v1/census/files"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "status": "accepted"
+            })))
+            .mount(&server)
+            .await;
 
         let config = test_app_config(server.uri());
         let client = Client::new_for_test(&config, "installation-1").unwrap();
@@ -974,17 +1349,20 @@ mod tests {
             .await
             .unwrap();
 
-        let bodies: Vec<serde_json::Value> = server
-            .received_requests()
-            .await
-            .unwrap()
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 2, "containers plus the files full report");
+        assert!(
+            requests
+                .iter()
+                .all(|request| !request.url.path().ends_with("/census/services")),
+            "no explicit opt-in means no services-lane traffic"
+        );
+        let request = requests
             .iter()
-            .map(|r| serde_json::from_slice(&r.body).unwrap())
-            .collect();
-        // Only the containers (screener) lane posts — no explicit opt-in means
-        // no services-lane traffic.
-        assert_eq!(bodies.len(), 1);
-        let containers = bodies[0]["containers"].as_array().unwrap();
+            .find(|request| request.url.path().ends_with("/census/containers"))
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+        let containers = body["containers"].as_array().unwrap();
         assert_eq!(
             containers.len(),
             1,
@@ -1007,7 +1385,7 @@ mod tests {
     #[tokio::test]
     async fn explicit_k8s_container_still_reports_on_the_services_lane() {
         let server = MockServer::start().await;
-        for lane in ["containers", "services"] {
+        for lane in ["containers", "services", "files"] {
             Mock::given(method("POST"))
                 .and(path(format!("/api/v1/census/{lane}")))
                 .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
@@ -1032,14 +1410,23 @@ mod tests {
             .unwrap();
 
         let requests = server.received_requests().await.unwrap();
-        assert_eq!(requests.len(), 1);
-        assert!(requests[0].url.path().ends_with("/census/services"));
+        assert_eq!(requests.len(), 2, "services plus the files full report");
+        assert!(
+            requests
+                .iter()
+                .any(|request| request.url.path().ends_with("/census/services"))
+        );
+        assert!(
+            requests
+                .iter()
+                .all(|request| !request.url.path().ends_with("/census/containers"))
+        );
     }
 
     #[tokio::test]
     async fn census_lanes_stamp_full_report_only_on_full_re_emits() {
         let server = MockServer::start().await;
-        for lane in ["containers", "services"] {
+        for lane in ["containers", "services", "files"] {
             Mock::given(method("POST"))
                 .and(path(format!("/api/v1/census/{lane}")))
                 .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
@@ -1093,14 +1480,22 @@ mod tests {
             .iter()
             .map(|r| serde_json::from_slice(&r.body).unwrap())
             .collect();
-        assert_eq!(bodies.len(), 6, "two lanes over three cycles");
-        // Full re-emits (start + post-resync) are marked on both lanes...
-        for body in [&bodies[0], &bodies[1], &bodies[4], &bodies[5]] {
-            assert_eq!(body["full_report"], true);
-        }
-        // ...deltas carry no marker at all (absent, not false).
-        for body in [&bodies[2], &bodies[3]] {
-            assert!(body.get("full_report").is_none());
-        }
+        assert_eq!(bodies.len(), 8, "three full lanes and two delta lanes");
+        assert_eq!(
+            bodies
+                .iter()
+                .filter(|body| body.get("full_report") == Some(&json!(true)))
+                .count(),
+            6,
+            "start and post-resync mark every lane"
+        );
+        assert_eq!(
+            bodies
+                .iter()
+                .filter(|body| body.get("full_report").is_none())
+                .count(),
+            2,
+            "delta payloads omit the marker"
+        );
     }
 }

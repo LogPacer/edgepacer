@@ -496,6 +496,9 @@ pub struct LogFile {
     pub readable: bool,
     pub permissions: String,
     pub format: String, // "ndjson" or "plain_text"
+    /// File framing required before interpreting the application payload.
+    #[serde(skip)]
+    pub source_format: crate::config::FileSourceFormat,
     /// Approximate line count (for Rails decision-making on sampling priority).
     pub line_count: u64,
 }
@@ -547,6 +550,95 @@ pub async fn discover() -> Census {
     discover_with_runtime_processes(false).await
 }
 
+struct FileDiscoverySettings<'a> {
+    scan_paths: &'a [&'a str],
+    log_extensions: &'a [&'a str],
+    max_file_age_days: u64,
+}
+
+async fn discover_runtime_and_files(
+    scan_paths: &[&str],
+    log_extensions: &[&str],
+    max_file_age_days: u64,
+    include_runtime_processes: bool,
+) -> (
+    anyhow::Result<Vec<Container>>,
+    anyhow::Result<Vec<LogFile>>,
+    Result<Vec<Container>, String>,
+    Result<Vec<Container>, String>,
+) {
+    let kubernetes_runtime_present = kubernetes::is_running_in_kubernetes();
+    let (docker_result, k8s_result, cri_result) = tokio::join!(
+        docker::discover_containers_with_runtime_log_paths(include_runtime_processes),
+        kubernetes::discover_kubernetes_pods(),
+        cri::discover_cri_containers_with_runtime_status(include_runtime_processes),
+    );
+
+    let files_result = discover_files_after_runtime(
+        FileDiscoverySettings {
+            scan_paths,
+            log_extensions,
+            max_file_age_days,
+        },
+        &docker_result,
+        kubernetes_runtime_present,
+        &k8s_result,
+        &cri_result,
+        &docker::default_docker_json_log_root(),
+    )
+    .await;
+
+    (
+        docker_result.map(|discovery| discovery.containers),
+        files_result,
+        k8s_result,
+        cri_result.map(|discovery| discovery.containers),
+    )
+}
+
+async fn discover_files_after_runtime(
+    settings: FileDiscoverySettings<'_>,
+    docker_result: &anyhow::Result<docker::DockerDiscovery>,
+    kubernetes_runtime_present: bool,
+    k8s_result: &Result<Vec<Container>, String>,
+    cri_result: &Result<cri::CriDiscovery, String>,
+    default_docker_json_root: &std::path::Path,
+) -> anyhow::Result<Vec<LogFile>> {
+    let mut excluded_paths = Vec::new();
+    let mut additional_scan_paths = Vec::new();
+    let mut detect_docker_json_ownership = false;
+
+    match docker_result {
+        Ok(discovery) if discovery.runtime_available => {
+            excluded_paths.extend(discovery.runtime_log_paths.iter().cloned());
+            if !discovery.log_root_available {
+                excluded_paths.push(default_docker_json_root.to_path_buf());
+            }
+        }
+        Ok(_) | Err(_) => {
+            additional_scan_paths.push(default_docker_json_root.to_path_buf());
+            detect_docker_json_ownership = true;
+        }
+    }
+
+    let cri_runtime_available = cri_result
+        .as_ref()
+        .is_ok_and(|discovery| discovery.runtime_available);
+    if (kubernetes_runtime_present && k8s_result.is_ok()) || cri_runtime_available {
+        excluded_paths.push(kubernetes::resolve_pod_logs_dir().into());
+    }
+
+    files::discover_log_files_with_runtime_paths(
+        settings.scan_paths,
+        settings.log_extensions,
+        &excluded_paths,
+        &additional_scan_paths,
+        detect_docker_json_ownership,
+        settings.max_file_age_days,
+    )
+    .await
+}
+
 pub(crate) async fn discover_with_runtime_processes(include_runtime_processes: bool) -> Census {
     let mut census = Census {
         os: std::env::consts::OS.to_string(),
@@ -561,21 +653,20 @@ pub(crate) async fn discover_with_runtime_processes(include_runtime_processes: b
 
     // Run discovery backends in parallel
     let (
-        docker_result,
-        files_result,
+        (docker_result, files_result, k8s_result, cri_result),
         systemd_result,
-        k8s_result,
-        cri_result,
         processes_result,
         ports_result,
         packages_result,
         event_log_result,
     ) = tokio::join!(
-        docker::discover_containers_with_runtime_processes(include_runtime_processes),
-        files::discover_log_files(scan_paths, files::DEFAULT_LOG_EXTENSIONS),
+        discover_runtime_and_files(
+            scan_paths,
+            files::DEFAULT_LOG_EXTENSIONS,
+            files::DEFAULT_MAX_FILE_AGE_DAYS,
+            include_runtime_processes,
+        ),
         systemd::discover_services(),
-        kubernetes::discover_kubernetes_pods(),
-        cri::discover_cri_containers_with_runtime_processes(include_runtime_processes),
         processes::discover_processes(),
         ports::discover_ports(),
         packages::discover_packages(),
@@ -708,6 +799,21 @@ pub async fn discover_with_paths_and_runtime_processes(
     log_extensions: &[&str],
     include_runtime_processes: bool,
 ) -> Census {
+    discover_with_file_settings_and_runtime_processes(
+        scan_paths,
+        log_extensions,
+        files::DEFAULT_MAX_FILE_AGE_DAYS,
+        include_runtime_processes,
+    )
+    .await
+}
+
+pub(crate) async fn discover_with_file_settings_and_runtime_processes(
+    scan_paths: &[&str],
+    log_extensions: &[&str],
+    max_file_age_days: u64,
+    include_runtime_processes: bool,
+) -> Census {
     let mut census = Census {
         os: std::env::consts::OS.to_string(),
         architecture: std::env::consts::ARCH.to_string(),
@@ -716,21 +822,20 @@ pub async fn discover_with_paths_and_runtime_processes(
     };
 
     let (
-        docker_result,
-        files_result,
+        (docker_result, files_result, k8s_result, cri_result),
         systemd_result,
-        k8s_result,
-        cri_result,
         processes_result,
         ports_result,
         packages_result,
         event_log_result,
     ) = tokio::join!(
-        docker::discover_containers_with_runtime_processes(include_runtime_processes),
-        files::discover_log_files(scan_paths, log_extensions),
+        discover_runtime_and_files(
+            scan_paths,
+            log_extensions,
+            max_file_age_days,
+            include_runtime_processes,
+        ),
         systemd::discover_services(),
-        kubernetes::discover_kubernetes_pods(),
-        cri::discover_cri_containers_with_runtime_processes(include_runtime_processes),
         processes::discover_processes(),
         ports::discover_ports(),
         packages::discover_packages(),
@@ -880,6 +985,158 @@ mod tests {
             container_name: String::new(),
             runtime_process: None,
         }
+    }
+
+    fn unavailable_cri() -> Result<cri::CriDiscovery, String> {
+        Ok(cri::CriDiscovery {
+            containers: Vec::new(),
+            runtime_available: false,
+        })
+    }
+
+    #[tokio::test]
+    async fn successful_docker_listing_without_info_still_excludes_default_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let docker_root = dir.path().join("containers");
+        std::fs::create_dir_all(&docker_root).unwrap();
+        std::fs::write(docker_root.join("exited-container.log"), "runtime\n").unwrap();
+        let inspected_log_path = dir.path().join("custom/running-container.log");
+        std::fs::create_dir_all(inspected_log_path.parent().unwrap()).unwrap();
+        std::fs::write(&inspected_log_path, "runtime\n").unwrap();
+        std::fs::write(dir.path().join("application.log"), "application\n").unwrap();
+        let docker_result = Ok(docker::DockerDiscovery {
+            containers: Vec::new(),
+            runtime_log_paths: vec![inspected_log_path],
+            runtime_available: true,
+            log_root_available: false,
+        });
+
+        let files = discover_files_after_runtime(
+            FileDiscoverySettings {
+                scan_paths: &[dir.path().to_str().unwrap()],
+                log_extensions: files::DEFAULT_LOG_EXTENSIONS,
+                max_file_age_days: files::DEFAULT_MAX_FILE_AGE_DAYS,
+            },
+            &docker_result,
+            false,
+            &Ok(Vec::new()),
+            &unavailable_cri(),
+            &docker_root,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(files.len(), 1);
+        assert!(files[0].path.ends_with("application.log"));
+    }
+
+    #[tokio::test]
+    async fn unavailable_docker_attributes_configured_non_default_json_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let configured_root = dir.path().join("custom-data/containers");
+        let container_id = "b".repeat(64);
+        let container_dir = configured_root.join(&container_id);
+        std::fs::create_dir_all(&container_dir).unwrap();
+        std::fs::write(
+            container_dir.join(format!("{container_id}-json.log")),
+            concat!(
+                r#"{"log":"INFO hello\n","stream":"stdout","time":"2026-08-12T08:00:00Z"}"#,
+                "\n"
+            ),
+        )
+        .unwrap();
+        let docker_result = Err(anyhow::anyhow!("socket unreachable"));
+
+        let files = discover_files_after_runtime(
+            FileDiscoverySettings {
+                scan_paths: &[configured_root.to_str().unwrap()],
+                log_extensions: files::DEFAULT_LOG_EXTENSIONS,
+                max_file_age_days: files::DEFAULT_MAX_FILE_AGE_DAYS,
+            },
+            &docker_result,
+            false,
+            &Ok(Vec::new()),
+            &unavailable_cri(),
+            &dir.path().join("missing-default-root"),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].format, files::FORMAT_PLAIN_TEXT);
+        assert_eq!(
+            files[0].source_format,
+            crate::config::FileSourceFormat::DockerJson
+        );
+    }
+
+    #[tokio::test]
+    async fn unavailable_docker_adds_default_json_root_to_the_scan() {
+        let dir = tempfile::tempdir().unwrap();
+        let docker_root = dir.path().join("containers");
+        let container_id = "c".repeat(64);
+        let container_dir = docker_root.join(&container_id);
+        std::fs::create_dir_all(&container_dir).unwrap();
+        std::fs::write(
+            container_dir.join(format!("{container_id}-json.log")),
+            concat!(
+                r#"{"log":"INFO hello\n","stream":"stdout","time":"2026-08-12T08:00:00Z"}"#,
+                "\n"
+            ),
+        )
+        .unwrap();
+        let docker_result = Err(anyhow::anyhow!("socket unreachable"));
+
+        let files = discover_files_after_runtime(
+            FileDiscoverySettings {
+                scan_paths: &[],
+                log_extensions: files::DEFAULT_LOG_EXTENSIONS,
+                max_file_age_days: files::DEFAULT_MAX_FILE_AGE_DAYS,
+            },
+            &docker_result,
+            false,
+            &Ok(Vec::new()),
+            &unavailable_cri(),
+            &docker_root,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(files.len(), 1);
+        assert_eq!(
+            files[0].source_format,
+            crate::config::FileSourceFormat::DockerJson
+        );
+    }
+
+    #[tokio::test]
+    async fn degraded_docker_scan_keeps_non_runtime_files_plain() {
+        let dir = tempfile::tempdir().unwrap();
+        let ordinary_log = dir.path().join("application.log");
+        std::fs::write(&ordinary_log, "application\n").unwrap();
+        let docker_result = Err(anyhow::anyhow!("socket unreachable"));
+
+        let files = discover_files_after_runtime(
+            FileDiscoverySettings {
+                scan_paths: &[dir.path().to_str().unwrap()],
+                log_extensions: files::DEFAULT_LOG_EXTENSIONS,
+                max_file_age_days: files::DEFAULT_MAX_FILE_AGE_DAYS,
+            },
+            &docker_result,
+            false,
+            &Ok(Vec::new()),
+            &unavailable_cri(),
+            &dir.path().join("missing-default-root"),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].path, ordinary_log.to_string_lossy());
+        assert_eq!(
+            files[0].source_format,
+            crate::config::FileSourceFormat::Plain
+        );
     }
 
     #[test]

@@ -839,6 +839,53 @@ mod tests {
         assert!(by_id("no-file").detail.contains("no file at"));
     }
 
+    #[tokio::test]
+    async fn stale_census_file_still_resolves_file_path_collection() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("stale.log");
+        std::fs::write(&path, "line\n").unwrap();
+        let old_mtime =
+            std::time::SystemTime::now() - std::time::Duration::from_secs(8 * 24 * 60 * 60);
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(old_mtime)
+            .unwrap();
+
+        let census = Census {
+            log_files: crate::discovery::files::discover_log_files_with_max_age(
+                &[dir.path().to_str().unwrap()],
+                crate::discovery::files::DEFAULT_LOG_EXTENSIONS,
+                crate::discovery::files::DEFAULT_MAX_FILE_AGE_DAYS,
+            )
+            .await
+            .unwrap(),
+            ..Default::default()
+        };
+        assert!(census.log_files.is_empty());
+
+        let unified = unified(json!({
+            "discovery": { "max_file_age_days": 7 },
+            "collect": {
+                "stale-file": {
+                    "locator": path.to_str().unwrap(),
+                    "matching_strategy": "file_path",
+                    "subbox_endpoint": "https://s/wire",
+                    "archive_id": "arc",
+                    "repo_id": "repo"
+                }
+            }
+        }));
+        let mut cache = DiscoveryCache::new();
+        cache.update_all(&census);
+
+        let resolved = resolved_collect_from_config(&unified, &cache);
+        assert_eq!(resolved.file_streams.len(), 1);
+        assert_eq!(resolved.file_streams[0].path, path.to_string_lossy());
+        assert_eq!(resolved.diagnostics[0].status, MatchStatus::Matched);
+    }
+
     #[test]
     fn resolve_refuses_ambiguous_weak_container_match() {
         // Two containers share a 12-char id prefix; a weak id match must surface

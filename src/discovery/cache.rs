@@ -827,6 +827,7 @@ mod tests {
             readable: true,
             permissions: "644".into(),
             format: "plain_text".into(),
+            source_format: crate::config::FileSourceFormat::Plain,
             line_count: 10,
         });
         cache.update_all(&census);
@@ -947,6 +948,7 @@ mod tests {
             readable: true,
             permissions: "644".into(),
             format: "plain_text".into(),
+            source_format: crate::config::FileSourceFormat::Plain,
             line_count: 10,
         });
         let mut cache = DiscoveryCache::new();

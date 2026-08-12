@@ -2,6 +2,25 @@
 
 ## Unreleased
 
+## 0.2.14 - 2026-08-12
+
+- Stop double-reporting container runtime log files: file discovery now
+  derives the runtime-owned log roots (Docker's data root, inspected
+  per-container log paths, the Kubernetes pod log directory) and excludes
+  them from file scanning while container discovery owns those logs. If the
+  Docker socket is unreachable but its json-file tree is readable, those
+  files are still discovered as a fallback — attributed as Docker json logs
+  instead of anonymous plain files.
+- Leave never-moving files out of the file census: a file whose mtime is
+  older than `discovery.max_file_age_days` (default 7, tunable from the
+  control plane) is not reported until it moves again, so dead log files
+  stop being recommended for collection. Explicitly configured file paths
+  are unaffected.
+- Report `stopped_files` in the files census and stamp `full_report` on
+  fresh-tracker cycles — including an empty full report when no files
+  remain — so the control plane can retire file sources that disappeared,
+  even while the agent was down.
+
 ## 0.2.13 - 2026-08-06
 
 - `edgepacer-manager uninstall` now removes the installed binaries too: the

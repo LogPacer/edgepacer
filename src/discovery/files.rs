@@ -6,6 +6,7 @@
 use super::LogFile;
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Read};
+use std::path::{Path, PathBuf};
 use tracing::debug;
 
 pub(crate) const FORMAT_NDJSON: &str = "ndjson";
@@ -16,6 +17,9 @@ const FORMAT_SAMPLE_MAX_BYTES: u64 = 64 * 1024;
 /// Default file extension allowlist — bare `.log` only. `.txt` is opt-in per
 /// host via the `discovery.log_extensions` config key.
 pub const DEFAULT_LOG_EXTENSIONS: &[&str] = &["log"];
+
+/// Default maximum age for files included in the census, in days.
+pub const DEFAULT_MAX_FILE_AGE_DAYS: u64 = 7;
 
 /// OS-aware default scan paths, used when no config scan_paths are set.
 /// Windows has no `/var/log`, so fall back to the common server log roots.
@@ -37,38 +41,114 @@ pub async fn discover_log_files(
     scan_paths: &[&str],
     allowed_extensions: &[&str],
 ) -> anyhow::Result<Vec<LogFile>> {
+    discover_log_files_with_runtime_paths(
+        scan_paths,
+        allowed_extensions,
+        &[],
+        &[],
+        false,
+        DEFAULT_MAX_FILE_AGE_DAYS,
+    )
+    .await
+}
+
+#[cfg(test)]
+pub(crate) async fn discover_log_files_with_max_age(
+    scan_paths: &[&str],
+    allowed_extensions: &[&str],
+    max_file_age_days: u64,
+) -> anyhow::Result<Vec<LogFile>> {
+    discover_log_files_with_runtime_paths(
+        scan_paths,
+        allowed_extensions,
+        &[],
+        &[],
+        false,
+        max_file_age_days,
+    )
+    .await
+}
+
+/// Discover census files while omitting paths already owned by a working
+/// container runtime. Docker's default json-file tree is scanned separately
+/// only as a degraded fallback, with its storage wrapper accounted for during
+/// format detection.
+pub(crate) async fn discover_log_files_with_runtime_paths(
+    scan_paths: &[&str],
+    allowed_extensions: &[&str],
+    excluded_paths: &[PathBuf],
+    additional_scan_paths: &[PathBuf],
+    detect_docker_json_ownership: bool,
+    max_file_age_days: u64,
+) -> anyhow::Result<Vec<LogFile>> {
     let paths: Vec<String> = scan_paths.iter().map(|s| s.to_string()).collect();
     let allowed: Vec<String> = allowed_extensions.iter().map(|s| s.to_string()).collect();
+    let excluded = excluded_paths.to_vec();
+    let additional = additional_scan_paths.to_vec();
 
     // Run blocking I/O on a thread pool
-    tokio::task::spawn_blocking(move || discover_log_files_sync(&paths, &allowed))
-        .await
-        .map_err(|e| anyhow::anyhow!("file discovery task failed: {e}"))?
+    tokio::task::spawn_blocking(move || {
+        discover_log_files_sync(
+            &paths,
+            &allowed,
+            &excluded,
+            &additional,
+            detect_docker_json_ownership,
+            max_file_age_days,
+        )
+    })
+    .await
+    .map_err(|e| anyhow::anyhow!("file discovery task failed: {e}"))?
 }
 
 fn discover_log_files_sync(
     scan_paths: &[String],
     allowed_extensions: &[String],
+    excluded_paths: &[PathBuf],
+    additional_scan_paths: &[PathBuf],
+    detect_docker_json_ownership: bool,
+    max_file_age_days: u64,
 ) -> anyhow::Result<Vec<LogFile>> {
     let mut files = Vec::new();
+    let excluded_paths = normalize_existing_paths(excluded_paths);
+    let mut paths: Vec<PathBuf> = scan_paths.iter().map(PathBuf::from).collect();
+    let stale_cutoff = stale_cutoff(max_file_age_days, std::time::SystemTime::now());
 
-    for base_path in scan_paths {
-        let base = std::path::Path::new(base_path);
+    for additional_path in additional_scan_paths {
+        if !paths.iter().any(|path| additional_path.starts_with(path)) {
+            paths.push(additional_path.clone());
+        }
+    }
+
+    for base in &paths {
         if !base.exists() {
-            debug!(path = %base_path, "scan path does not exist, skipping");
+            debug!(path = %base.display(), "scan path does not exist, skipping");
+            continue;
+        }
+        if path_belongs_to(base, &excluded_paths) {
             continue;
         }
 
-        walk_directory(base, &mut files, allowed_extensions)?;
+        walk_directory(
+            base,
+            &mut files,
+            allowed_extensions,
+            &excluded_paths,
+            detect_docker_json_ownership,
+            stale_cutoff,
+        )?;
     }
 
     Ok(files)
 }
 
 fn walk_directory(
-    dir: &std::path::Path,
+    dir: &Path,
     files: &mut Vec<LogFile>,
     allowed_extensions: &[String],
+    excluded_paths: &[PathBuf],
+    detect_docker_json_ownership: bool,
+    stale_cutoff: Option<std::time::SystemTime>,
 ) -> anyhow::Result<()> {
     let entries = match std::fs::read_dir(dir) {
         Ok(entries) => entries,
@@ -85,6 +165,9 @@ fn walk_directory(
         };
 
         let path = entry.path();
+        if path_belongs_to(&path, excluded_paths) {
+            continue;
+        }
         let metadata = match entry.metadata() {
             Ok(m) => m,
             Err(_) => continue,
@@ -92,12 +175,22 @@ fn walk_directory(
 
         if metadata.is_dir() {
             // Recurse but limit depth to avoid traversing huge trees
-            walk_directory(&path, files, allowed_extensions)?;
+            walk_directory(
+                &path,
+                files,
+                allowed_extensions,
+                excluded_paths,
+                detect_docker_json_ownership,
+                stale_cutoff,
+            )?;
         } else if metadata.is_file() && is_log_file(&path, allowed_extensions) {
+            let modified_at = metadata.modified().ok();
+            if is_stale(modified_at, stale_cutoff) {
+                continue;
+            }
+
             let readable = is_readable(&path);
-            let modified = metadata
-                .modified()
-                .ok()
+            let modified = modified_at
                 .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
                 .map(|d| {
                     chrono::DateTime::from_timestamp(d.as_secs() as i64, 0)
@@ -106,7 +199,15 @@ fn walk_directory(
                 })
                 .unwrap_or_default();
 
-            let format = detect_format(&path);
+            let (format, source_format) =
+                if detect_docker_json_ownership && is_docker_json_log_path(&path) {
+                    (
+                        detect_docker_json_file_format(&path),
+                        crate::config::FileSourceFormat::DockerJson,
+                    )
+                } else {
+                    (detect_format(&path), crate::config::FileSourceFormat::Plain)
+                };
             let permissions = permissions_string(&metadata);
 
             let line_count = count_lines(&path);
@@ -118,12 +219,44 @@ fn walk_directory(
                 readable,
                 permissions,
                 format,
+                source_format,
                 line_count,
             });
         }
     }
 
     Ok(())
+}
+
+fn normalize_existing_paths(paths: &[PathBuf]) -> Vec<PathBuf> {
+    paths
+        .iter()
+        .map(|path| std::fs::canonicalize(path).unwrap_or_else(|_| path.clone()))
+        .collect()
+}
+
+fn path_belongs_to(path: &Path, roots: &[PathBuf]) -> bool {
+    roots.iter().any(|root| path.starts_with(root))
+        || std::fs::canonicalize(path)
+            .ok()
+            .is_some_and(|path| roots.iter().any(|root| path.starts_with(root)))
+}
+
+fn is_docker_json_log_path(path: &Path) -> bool {
+    let Some(container_id) = path
+        .parent()
+        .and_then(Path::file_name)
+        .and_then(|name| name.to_str())
+    else {
+        return false;
+    };
+    container_id.len() == 64
+        && container_id.bytes().all(|byte| byte.is_ascii_hexdigit())
+        && path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .and_then(|name| name.strip_suffix("-json.log"))
+            == Some(container_id)
 }
 
 /// Check if a file looks like a log file, given the allowed extension set
@@ -157,6 +290,22 @@ fn is_rotation_suffix(ext: &str) -> bool {
 /// (`app.log.1`, `app.log.42`).
 fn is_numeric(s: &str) -> bool {
     !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit())
+}
+
+fn stale_cutoff(
+    max_file_age_days: u64,
+    now: std::time::SystemTime,
+) -> Option<std::time::SystemTime> {
+    max_file_age_days
+        .checked_mul(24 * 60 * 60)
+        .and_then(|seconds| now.checked_sub(std::time::Duration::from_secs(seconds)))
+}
+
+fn is_stale(
+    modified: Option<std::time::SystemTime>,
+    cutoff: Option<std::time::SystemTime>,
+) -> bool {
+    matches!((modified, cutoff), (Some(modified), Some(cutoff)) if modified < cutoff)
 }
 
 #[cfg(unix)]
@@ -352,6 +501,8 @@ pub(crate) fn is_json_object_line(line: &[u8]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::discovery::Census;
+    use crate::tracker::ChangeTracker;
     use std::io::Write;
 
     fn ext(list: &[&str]) -> Vec<String> {
@@ -461,6 +612,175 @@ mod tests {
         let paths: Vec<&str> = files.iter().map(|f| f.path.as_str()).collect();
         assert!(paths.iter().any(|p| p.ends_with("app.log")));
         assert!(paths.iter().any(|p| p.ends_with("nested.log")));
+    }
+
+    fn set_file_age(path: &std::path::Path, days: u64) {
+        let modified =
+            std::time::SystemTime::now() - std::time::Duration::from_secs(days * 24 * 60 * 60);
+        std::fs::File::options()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_modified(modified)
+            .unwrap();
+    }
+
+    async fn discovered_names(dir: &std::path::Path, max_file_age_days: u64) -> Vec<String> {
+        discover_log_files_with_max_age(
+            &[dir.to_str().unwrap()],
+            DEFAULT_LOG_EXTENSIONS,
+            max_file_age_days,
+        )
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|file| {
+            std::path::Path::new(&file.path)
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .into_owned()
+        })
+        .collect()
+    }
+
+    #[tokio::test]
+    async fn excludes_files_older_than_max_age() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("fresh.log"), "line\n").unwrap();
+        let stale = dir.path().join("stale.log");
+        std::fs::write(&stale, "line\n").unwrap();
+        set_file_age(&stale, 8);
+
+        assert_eq!(
+            discovered_names(dir.path(), DEFAULT_MAX_FILE_AGE_DAYS).await,
+            vec!["fresh.log"]
+        );
+    }
+
+    #[tokio::test]
+    async fn max_file_age_is_tunable() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("app.log");
+        std::fs::write(&path, "line\n").unwrap();
+        set_file_age(&path, 8);
+
+        assert!(
+            discovered_names(dir.path(), DEFAULT_MAX_FILE_AGE_DAYS)
+                .await
+                .is_empty()
+        );
+        assert_eq!(discovered_names(dir.path(), 30).await, vec!["app.log"]);
+    }
+
+    #[tokio::test]
+    async fn stale_file_stops_then_reenters_after_a_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("app.log");
+        std::fs::write(&path, "line\n").unwrap();
+        let scan = || async {
+            Census {
+                log_files: discover_log_files_with_max_age(
+                    &[dir.path().to_str().unwrap()],
+                    DEFAULT_LOG_EXTENSIONS,
+                    DEFAULT_MAX_FILE_AGE_DAYS,
+                )
+                .await
+                .unwrap(),
+                ..Default::default()
+            }
+        };
+        let mut tracker = ChangeTracker::new();
+
+        let fresh = tracker.update_from_scan(&scan().await);
+        assert_eq!(fresh.new_files.len(), 1);
+        tracker.commit_scan();
+
+        set_file_age(&path, 8);
+        let stale = tracker.update_from_scan(&scan().await);
+        assert_eq!(stale.stopped_files.len(), 1);
+        assert_eq!(stale.stopped_files[0].identifier, path.to_string_lossy());
+        tracker.commit_scan();
+
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(std::time::SystemTime::now())
+            .unwrap();
+        let moving_again = tracker.update_from_scan(&scan().await);
+        assert_eq!(moving_again.new_files.len(), 1);
+        assert_eq!(moving_again.new_files[0].path, path.to_string_lossy());
+        assert!(moving_again.stopped_files.is_empty());
+    }
+
+    #[test]
+    fn staleness_boundary_is_exclusive() {
+        let cutoff = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000);
+
+        assert!(!is_stale(Some(cutoff), Some(cutoff)));
+        assert!(is_stale(
+            Some(cutoff - std::time::Duration::from_secs(1)),
+            Some(cutoff)
+        ));
+    }
+
+    #[tokio::test]
+    async fn excludes_runtime_owned_paths_from_census_scan() {
+        let dir = tempfile::tempdir().unwrap();
+        let runtime_root = dir.path().join("docker/containers");
+        std::fs::create_dir_all(&runtime_root).unwrap();
+        std::fs::write(runtime_root.join("container-json.log"), "runtime log\n").unwrap();
+        std::fs::write(dir.path().join("application.log"), "application log\n").unwrap();
+
+        let files = discover_log_files_with_runtime_paths(
+            &[dir.path().to_str().unwrap()],
+            DEFAULT_LOG_EXTENSIONS,
+            std::slice::from_ref(&runtime_root),
+            &[],
+            false,
+            DEFAULT_MAX_FILE_AGE_DAYS,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(files.len(), 1);
+        assert!(files[0].path.ends_with("application.log"));
+    }
+
+    #[tokio::test]
+    async fn scans_docker_json_fallback_with_inner_payload_format() {
+        let dir = tempfile::tempdir().unwrap();
+        let runtime_root = dir.path().join("custom-runtime-root/containers");
+        let container_id = "a".repeat(64);
+        let container_dir = runtime_root.join(&container_id);
+        std::fs::create_dir_all(&container_dir).unwrap();
+        std::fs::write(
+            container_dir.join(format!("{container_id}-json.log")),
+            concat!(
+                r#"{"log":"INFO hello\n","stream":"stdout","time":"2026-08-12T08:00:00Z"}"#,
+                "\n"
+            ),
+        )
+        .unwrap();
+
+        let files = discover_log_files_with_runtime_paths(
+            &[runtime_root.to_str().unwrap()],
+            DEFAULT_LOG_EXTENSIONS,
+            &[],
+            &[],
+            true,
+            DEFAULT_MAX_FILE_AGE_DAYS,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].format, FORMAT_PLAIN_TEXT);
+        assert_eq!(
+            files[0].source_format,
+            crate::config::FileSourceFormat::DockerJson
+        );
     }
 
     #[tokio::test]
