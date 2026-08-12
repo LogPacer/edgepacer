@@ -289,10 +289,16 @@ async fn report_inventory(
     }
 
     // Files
-    if !report.new_files.is_empty() {
-        let payload = json!({
-            "files": report.new_files.iter().map(file_census_entry).collect::<Vec<_>>(),
-        });
+    if !report.new_files.is_empty() || !report.stopped_files.is_empty() {
+        let payload = stamp_full_report(
+            json!({
+                "files": report.new_files.iter().map(file_census_entry).collect::<Vec<_>>(),
+                "stopped_files": report.stopped_files.iter()
+                    .map(|s| json!({ "identifier": s.identifier }))
+                    .collect::<Vec<_>>(),
+            }),
+            full_report,
+        );
 
         match client.report_file_inventory(&payload).await {
             Ok(resp) => {
@@ -609,6 +615,89 @@ mod tests {
 
         assert_eq!(entry["format"], "plain_text");
         assert_eq!(entry["metadata"]["source_format"], "docker-json");
+    }
+
+    fn log_file(path: &str) -> crate::discovery::LogFile {
+        crate::discovery::LogFile {
+            path: path.into(),
+            size: 1024,
+            modified: "2026-08-12T00:00:00Z".into(),
+            readable: true,
+            permissions: "644".into(),
+            format: "plain_text".into(),
+            source_format: crate::config::FileSourceFormat::Plain,
+            line_count: 100,
+        }
+    }
+
+    #[tokio::test]
+    async fn fresh_tracker_file_payload_is_a_full_report() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/v1/census/files"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "status": "accepted"
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let config = test_app_config(server.uri());
+        let client = Client::new_for_test(&config, "installation-1").unwrap();
+        client.set_bearer_token("access-1");
+        let mut tracker = ChangeTracker::new();
+        let census = discovery::Census {
+            log_files: vec![log_file("/var/log/app.log")],
+            ..Default::default()
+        };
+
+        let report = tracker.update_from_scan(&census);
+        report_inventory(&client, &mut tracker, &report, &[])
+            .await
+            .unwrap();
+
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 1);
+        let body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+        assert_eq!(body["full_report"], true);
+    }
+
+    #[tokio::test]
+    async fn removed_file_posts_an_identifier_only_stop() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/v1/census/files"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "status": "accepted"
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let config = test_app_config(server.uri());
+        let client = Client::new_for_test(&config, "installation-1").unwrap();
+        client.set_bearer_token("access-1");
+        let mut tracker = ChangeTracker::new();
+        let census = discovery::Census {
+            log_files: vec![log_file("/var/log/app.log")],
+            ..Default::default()
+        };
+        tracker.update_from_scan(&census);
+        tracker.commit_scan();
+
+        let report = tracker.update_from_scan(&discovery::Census::default());
+        report_inventory(&client, &mut tracker, &report, &[])
+            .await
+            .unwrap();
+
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 1);
+        let body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+        assert_eq!(
+            body["stopped_files"],
+            serde_json::json!([{ "identifier": "/var/log/app.log" }])
+        );
+        assert_eq!(body["stopped_files"][0].as_object().unwrap().len(), 1);
     }
 
     #[tokio::test]
