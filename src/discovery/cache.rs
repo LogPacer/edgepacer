@@ -474,11 +474,7 @@ impl DiscoveryCache {
     fn resolve_file(&self, identifier: &str) -> CollectMatch {
         match self.files.get(identifier) {
             Some(file) if file.readable => CollectMatch::Matched(ResolvedAccess {
-                access_method: match file.source_format {
-                    crate::config::FileSourceFormat::DockerJson => AccessMethod::DockerJsonFile,
-                    crate::config::FileSourceFormat::Plain
-                    | crate::config::FileSourceFormat::KubernetesCri => AccessMethod::File,
-                },
+                access_method: AccessMethod::File,
                 matched_via: MatchVia::FilePath,
                 stable_identity: file.path.clone(),
                 access_locator: file.path.clone(),
@@ -841,29 +837,6 @@ mod tests {
             .unwrap();
         assert_eq!(method, AccessMethod::File);
         assert_eq!(loc, "/var/log/app.log");
-    }
-
-    #[test]
-    fn resolves_docker_fallback_file_with_wrapper_aware_access() {
-        let mut cache = DiscoveryCache::new();
-        let path = "/var/lib/docker/containers/abc/abc-json.log";
-        cache.update_all(&Census {
-            log_files: vec![LogFile {
-                path: path.into(),
-                size: 100,
-                modified: String::new(),
-                readable: true,
-                permissions: "644".into(),
-                format: "plain_text".into(),
-                source_format: crate::config::FileSourceFormat::DockerJson,
-                line_count: 10,
-            }],
-            ..Default::default()
-        });
-
-        let (method, locator) = cache.resolve_access_method(path, "file").unwrap();
-        assert_eq!(method, AccessMethod::DockerJsonFile);
-        assert_eq!(locator, path);
     }
 
     #[test]

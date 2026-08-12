@@ -567,31 +567,14 @@ async fn discover_runtime_and_files(
         cri::discover_cri_containers_with_runtime_status(include_runtime_processes),
     );
 
-    let mut excluded_paths = Vec::new();
-    let mut docker_json_fallback_roots = Vec::new();
-
-    match &docker_result {
-        Ok(discovery) => {
-            excluded_paths.extend(discovery.runtime_log_paths.iter().cloned());
-            if !discovery.log_root_available {
-                docker_json_fallback_roots.push(docker::default_docker_json_log_root());
-            }
-        }
-        Err(_) => docker_json_fallback_roots.push(docker::default_docker_json_log_root()),
-    }
-
-    let cri_runtime_available = cri_result
-        .as_ref()
-        .is_ok_and(|discovery| discovery.runtime_available);
-    if (kubernetes_runtime_present && k8s_result.is_ok()) || cri_runtime_available {
-        excluded_paths.push(kubernetes::resolve_pod_logs_dir().into());
-    }
-
-    let files_result = files::discover_log_files_with_runtime_paths(
+    let files_result = discover_files_after_runtime(
         scan_paths,
         log_extensions,
-        &excluded_paths,
-        &docker_json_fallback_roots,
+        &docker_result,
+        kubernetes_runtime_present,
+        &k8s_result,
+        &cri_result,
+        &docker::default_docker_json_log_root(),
     )
     .await;
 
@@ -601,6 +584,49 @@ async fn discover_runtime_and_files(
         k8s_result,
         cri_result.map(|discovery| discovery.containers),
     )
+}
+
+async fn discover_files_after_runtime(
+    scan_paths: &[&str],
+    log_extensions: &[&str],
+    docker_result: &anyhow::Result<docker::DockerDiscovery>,
+    kubernetes_runtime_present: bool,
+    k8s_result: &Result<Vec<Container>, String>,
+    cri_result: &Result<cri::CriDiscovery, String>,
+    default_docker_json_root: &std::path::Path,
+) -> anyhow::Result<Vec<LogFile>> {
+    let mut excluded_paths = Vec::new();
+    let mut additional_scan_paths = Vec::new();
+    let mut detect_docker_json_ownership = false;
+
+    match docker_result {
+        Ok(discovery) if discovery.runtime_available => {
+            excluded_paths.extend(discovery.runtime_log_paths.iter().cloned());
+            if !discovery.log_root_available {
+                excluded_paths.push(default_docker_json_root.to_path_buf());
+            }
+        }
+        Ok(_) | Err(_) => {
+            additional_scan_paths.push(default_docker_json_root.to_path_buf());
+            detect_docker_json_ownership = true;
+        }
+    }
+
+    let cri_runtime_available = cri_result
+        .as_ref()
+        .is_ok_and(|discovery| discovery.runtime_available);
+    if (kubernetes_runtime_present && k8s_result.is_ok()) || cri_runtime_available {
+        excluded_paths.push(kubernetes::resolve_pod_logs_dir().into());
+    }
+
+    files::discover_log_files_with_runtime_paths(
+        scan_paths,
+        log_extensions,
+        &excluded_paths,
+        &additional_scan_paths,
+        detect_docker_json_ownership,
+    )
+    .await
 }
 
 pub(crate) async fn discover_with_runtime_processes(include_runtime_processes: bool) -> Census {
@@ -928,6 +954,83 @@ mod tests {
             container_name: String::new(),
             runtime_process: None,
         }
+    }
+
+    fn unavailable_cri() -> Result<cri::CriDiscovery, String> {
+        Ok(cri::CriDiscovery {
+            containers: Vec::new(),
+            runtime_available: false,
+        })
+    }
+
+    #[tokio::test]
+    async fn successful_docker_listing_without_info_still_excludes_default_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let docker_root = dir.path().join("containers");
+        std::fs::create_dir_all(&docker_root).unwrap();
+        std::fs::write(docker_root.join("exited-container.log"), "runtime\n").unwrap();
+        let inspected_log_path = dir.path().join("custom/running-container.log");
+        std::fs::create_dir_all(inspected_log_path.parent().unwrap()).unwrap();
+        std::fs::write(&inspected_log_path, "runtime\n").unwrap();
+        std::fs::write(dir.path().join("application.log"), "application\n").unwrap();
+        let docker_result = Ok(docker::DockerDiscovery {
+            containers: Vec::new(),
+            runtime_log_paths: vec![inspected_log_path],
+            runtime_available: true,
+            log_root_available: false,
+        });
+
+        let files = discover_files_after_runtime(
+            &[dir.path().to_str().unwrap()],
+            files::DEFAULT_LOG_EXTENSIONS,
+            &docker_result,
+            false,
+            &Ok(Vec::new()),
+            &unavailable_cri(),
+            &docker_root,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(files.len(), 1);
+        assert!(files[0].path.ends_with("application.log"));
+    }
+
+    #[tokio::test]
+    async fn unavailable_docker_attributes_configured_non_default_json_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let configured_root = dir.path().join("custom-data/containers");
+        let container_id = "b".repeat(64);
+        let container_dir = configured_root.join(&container_id);
+        std::fs::create_dir_all(&container_dir).unwrap();
+        std::fs::write(
+            container_dir.join(format!("{container_id}-json.log")),
+            concat!(
+                r#"{"log":"INFO hello\n","stream":"stdout","time":"2026-08-12T08:00:00Z"}"#,
+                "\n"
+            ),
+        )
+        .unwrap();
+        let docker_result = Err(anyhow::anyhow!("socket unreachable"));
+
+        let files = discover_files_after_runtime(
+            &[configured_root.to_str().unwrap()],
+            files::DEFAULT_LOG_EXTENSIONS,
+            &docker_result,
+            false,
+            &Ok(Vec::new()),
+            &unavailable_cri(),
+            &dir.path().join("missing-default-root"),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].format, files::FORMAT_PLAIN_TEXT);
+        assert_eq!(
+            files[0].source_format,
+            crate::config::FileSourceFormat::DockerJson
+        );
     }
 
     #[test]

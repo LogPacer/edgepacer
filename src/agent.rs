@@ -285,18 +285,7 @@ async fn report_inventory(
     // Files
     if !report.new_files.is_empty() {
         let payload = json!({
-                        "files": report.new_files.iter().map(|f| json!({
-                "identifier": f.identifier(),
-                "name": f.path.rsplit('/').next().unwrap_or(&f.path),
-                "path": f.path,
-                "size": f.size,
-                "format": f.format,
-                "metadata": { "source_format": f.source_format.hash_part() },
-                "permissions": f.permissions,
-                "modified": f.modified,
-                "line_count": f.line_count,
-                "state": "active",
-            })).collect::<Vec<_>>(),
+            "files": report.new_files.iter().map(file_census_entry).collect::<Vec<_>>(),
         });
 
         match client.report_file_inventory(&payload).await {
@@ -351,6 +340,21 @@ async fn report_inventory(
     }
 
     Ok(())
+}
+
+fn file_census_entry(file: &discovery::LogFile) -> serde_json::Value {
+    json!({
+        "identifier": file.identifier(),
+        "name": file.path.rsplit('/').next().unwrap_or(&file.path),
+        "path": file.path,
+        "size": file.size,
+        "format": file.format,
+        "metadata": { "source_format": file.source_format.hash_part() },
+        "permissions": file.permissions,
+        "modified": file.modified,
+        "line_count": file.line_count,
+        "state": "active",
+    })
 }
 
 /// Report volatile snapshot inventory (processes, ports) — full replacement, no delta tracking.
@@ -570,6 +574,25 @@ mod tests {
             name: "nginx".into(),
             version: "1.18.0".into(),
         }
+    }
+
+    #[test]
+    fn docker_fallback_census_entry_reports_runtime_ownership() {
+        let file = discovery::LogFile {
+            path: "/custom/docker/containers/id/id-json.log".into(),
+            size: 128,
+            modified: "2026-08-12T08:00:00Z".into(),
+            readable: true,
+            permissions: "644".into(),
+            format: "plain_text".into(),
+            source_format: crate::config::FileSourceFormat::DockerJson,
+            line_count: 1,
+        };
+
+        let entry = file_census_entry(&file);
+
+        assert_eq!(entry["format"], "plain_text");
+        assert_eq!(entry["metadata"]["source_format"], "docker-json");
     }
 
     #[tokio::test]

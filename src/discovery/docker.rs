@@ -43,6 +43,9 @@ struct DockerConnection {
 pub(crate) struct DockerDiscovery {
     pub containers: Vec<Container>,
     pub runtime_log_paths: Vec<PathBuf>,
+    /// True once container listing succeeds, even if the independent info call fails.
+    pub runtime_available: bool,
+    /// True only when `docker info` supplied the authoritative data root.
     pub log_root_available: bool,
 }
 
@@ -89,6 +92,7 @@ pub(crate) async fn discover_containers_with_runtime_log_paths(
         return Ok(DockerDiscovery {
             containers: Vec::new(),
             runtime_log_paths: Vec::new(),
+            runtime_available: false,
             log_root_available: false,
         });
     };
@@ -229,6 +233,7 @@ pub(crate) async fn discover_containers_with_runtime_log_paths(
     Ok(DockerDiscovery {
         containers: result,
         runtime_log_paths,
+        runtime_available: true,
         log_root_available,
     })
 }

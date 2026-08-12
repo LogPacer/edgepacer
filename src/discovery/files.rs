@@ -38,7 +38,7 @@ pub async fn discover_log_files(
     scan_paths: &[&str],
     allowed_extensions: &[&str],
 ) -> anyhow::Result<Vec<LogFile>> {
-    discover_log_files_with_runtime_paths(scan_paths, allowed_extensions, &[], &[]).await
+    discover_log_files_with_runtime_paths(scan_paths, allowed_extensions, &[], &[], false).await
 }
 
 /// Discover census files while omitting paths already owned by a working
@@ -49,16 +49,23 @@ pub(crate) async fn discover_log_files_with_runtime_paths(
     scan_paths: &[&str],
     allowed_extensions: &[&str],
     excluded_paths: &[PathBuf],
-    docker_json_fallback_roots: &[PathBuf],
+    additional_scan_paths: &[PathBuf],
+    detect_docker_json_ownership: bool,
 ) -> anyhow::Result<Vec<LogFile>> {
     let paths: Vec<String> = scan_paths.iter().map(|s| s.to_string()).collect();
     let allowed: Vec<String> = allowed_extensions.iter().map(|s| s.to_string()).collect();
     let excluded = excluded_paths.to_vec();
-    let docker_json_roots = docker_json_fallback_roots.to_vec();
+    let additional = additional_scan_paths.to_vec();
 
     // Run blocking I/O on a thread pool
     tokio::task::spawn_blocking(move || {
-        discover_log_files_sync(&paths, &allowed, &excluded, &docker_json_roots)
+        discover_log_files_sync(
+            &paths,
+            &allowed,
+            &excluded,
+            &additional,
+            detect_docker_json_ownership,
+        )
     })
     .await
     .map_err(|e| anyhow::anyhow!("file discovery task failed: {e}"))?
@@ -68,16 +75,16 @@ fn discover_log_files_sync(
     scan_paths: &[String],
     allowed_extensions: &[String],
     excluded_paths: &[PathBuf],
-    docker_json_fallback_roots: &[PathBuf],
+    additional_scan_paths: &[PathBuf],
+    detect_docker_json_ownership: bool,
 ) -> anyhow::Result<Vec<LogFile>> {
     let mut files = Vec::new();
     let excluded_paths = normalize_existing_paths(excluded_paths);
-    let docker_json_roots = normalize_existing_paths(docker_json_fallback_roots);
     let mut paths: Vec<PathBuf> = scan_paths.iter().map(PathBuf::from).collect();
 
-    for fallback_root in docker_json_fallback_roots {
-        if !paths.iter().any(|path| fallback_root.starts_with(path)) {
-            paths.push(fallback_root.clone());
+    for additional_path in additional_scan_paths {
+        if !paths.iter().any(|path| additional_path.starts_with(path)) {
+            paths.push(additional_path.clone());
         }
     }
 
@@ -95,7 +102,7 @@ fn discover_log_files_sync(
             &mut files,
             allowed_extensions,
             &excluded_paths,
-            &docker_json_roots,
+            detect_docker_json_ownership,
         )?;
     }
 
@@ -107,7 +114,7 @@ fn walk_directory(
     files: &mut Vec<LogFile>,
     allowed_extensions: &[String],
     excluded_paths: &[PathBuf],
-    docker_json_roots: &[PathBuf],
+    detect_docker_json_ownership: bool,
 ) -> anyhow::Result<()> {
     let entries = match std::fs::read_dir(dir) {
         Ok(entries) => entries,
@@ -139,7 +146,7 @@ fn walk_directory(
                 files,
                 allowed_extensions,
                 excluded_paths,
-                docker_json_roots,
+                detect_docker_json_ownership,
             )?;
         } else if metadata.is_file() && is_log_file(&path, allowed_extensions) {
             let readable = is_readable(&path);
@@ -154,14 +161,15 @@ fn walk_directory(
                 })
                 .unwrap_or_default();
 
-            let (format, source_format) = if path_belongs_to(&path, docker_json_roots) {
-                (
-                    detect_docker_json_file_format(&path),
-                    crate::config::FileSourceFormat::DockerJson,
-                )
-            } else {
-                (detect_format(&path), crate::config::FileSourceFormat::Plain)
-            };
+            let (format, source_format) =
+                if detect_docker_json_ownership && is_docker_json_log_path(&path) {
+                    (
+                        detect_docker_json_file_format(&path),
+                        crate::config::FileSourceFormat::DockerJson,
+                    )
+                } else {
+                    (detect_format(&path), crate::config::FileSourceFormat::Plain)
+                };
             let permissions = permissions_string(&metadata);
 
             let line_count = count_lines(&path);
@@ -194,6 +202,23 @@ fn path_belongs_to(path: &Path, roots: &[PathBuf]) -> bool {
         || std::fs::canonicalize(path)
             .ok()
             .is_some_and(|path| roots.iter().any(|root| path.starts_with(root)))
+}
+
+fn is_docker_json_log_path(path: &Path) -> bool {
+    let Some(container_id) = path
+        .parent()
+        .and_then(Path::file_name)
+        .and_then(|name| name.to_str())
+    else {
+        return false;
+    };
+    container_id.len() == 64
+        && container_id.bytes().all(|byte| byte.is_ascii_hexdigit())
+        && path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .and_then(|name| name.strip_suffix("-json.log"))
+            == Some(container_id)
 }
 
 /// Check if a file looks like a log file, given the allowed extension set
@@ -546,6 +571,7 @@ mod tests {
             DEFAULT_LOG_EXTENSIONS,
             std::slice::from_ref(&runtime_root),
             &[],
+            false,
         )
         .await
         .unwrap();
@@ -557,11 +583,12 @@ mod tests {
     #[tokio::test]
     async fn scans_docker_json_fallback_with_inner_payload_format() {
         let dir = tempfile::tempdir().unwrap();
-        let runtime_root = dir.path().join("containers");
-        let container_dir = runtime_root.join("abc123");
+        let runtime_root = dir.path().join("custom-runtime-root/containers");
+        let container_id = "a".repeat(64);
+        let container_dir = runtime_root.join(&container_id);
         std::fs::create_dir_all(&container_dir).unwrap();
         std::fs::write(
-            container_dir.join("abc123-json.log"),
+            container_dir.join(format!("{container_id}-json.log")),
             concat!(
                 r#"{"log":"INFO hello\n","stream":"stdout","time":"2026-08-12T08:00:00Z"}"#,
                 "\n"
@@ -570,10 +597,11 @@ mod tests {
         .unwrap();
 
         let files = discover_log_files_with_runtime_paths(
-            &[],
+            &[runtime_root.to_str().unwrap()],
             DEFAULT_LOG_EXTENSIONS,
             &[],
-            std::slice::from_ref(&runtime_root),
+            &[],
+            true,
         )
         .await
         .unwrap();
