@@ -13,7 +13,7 @@ use bollard::{API_DEFAULT_VERSION, Docker};
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use tracing::{debug, warn};
 
 const DOCKER_TIMEOUT_SECS: u64 = 120;
@@ -24,6 +24,11 @@ const DEFAULT_UNIX_DOCKER_SOCKET: &str = "/var/run/docker.sock";
 #[cfg(windows)]
 const DEFAULT_WINDOWS_DOCKER_HOST: &str = "npipe:////./pipe/docker_engine";
 
+#[cfg(unix)]
+const DEFAULT_DOCKER_JSON_LOG_ROOT: &str = "/var/lib/docker/containers";
+#[cfg(windows)]
+const DEFAULT_DOCKER_JSON_LOG_ROOT: &str = r"C:\ProgramData\docker\containers";
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum DockerConnectionTarget {
     Environment(&'static str),
@@ -33,6 +38,12 @@ enum DockerConnectionTarget {
 struct DockerConnection {
     client: Docker,
     runtime_processes_are_local: bool,
+}
+
+pub(crate) struct DockerDiscovery {
+    pub containers: Vec<Container>,
+    pub runtime_log_paths: Vec<PathBuf>,
+    pub log_root_available: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -63,22 +74,53 @@ pub async fn discover_containers() -> anyhow::Result<Vec<Container>> {
 pub(crate) async fn discover_containers_with_runtime_processes(
     include_runtime_processes: bool,
 ) -> anyhow::Result<Vec<Container>> {
+    Ok(
+        discover_containers_with_runtime_log_paths(include_runtime_processes)
+            .await?
+            .containers,
+    )
+}
+
+pub(crate) async fn discover_containers_with_runtime_log_paths(
+    include_runtime_processes: bool,
+) -> anyhow::Result<DockerDiscovery> {
     let Some(connection) = connect_docker_with_locality()? else {
         debug!("docker discovery skipped: no Docker-compatible endpoint configured");
-        return Ok(Vec::new());
+        return Ok(DockerDiscovery {
+            containers: Vec::new(),
+            runtime_log_paths: Vec::new(),
+            log_root_available: false,
+        });
     };
     let DockerConnection {
         client: docker,
         runtime_processes_are_local,
     } = connection;
 
-    // List all containers (running + stopped)
     let list_opts = ListContainersOptions {
         all: true,
         ..Default::default()
     };
-    docker_limiter().wait().await;
-    let raw_containers = docker.list_containers(Some(list_opts)).await?;
+    let info_request = async {
+        docker_limiter().wait().await;
+        docker.info().await
+    };
+    let list_request = async {
+        docker_limiter().wait().await;
+        docker.list_containers(Some(list_opts)).await
+    };
+    let (info_result, containers_result) = tokio::join!(info_request, list_request);
+
+    let docker_root = match info_result {
+        Ok(info) => docker_json_log_root(info.docker_root_dir),
+        Err(error) => {
+            warn!(%error, "failed to discover Docker data root");
+            None
+        }
+    };
+
+    // List all containers (running + stopped)
+    let raw_containers = containers_result?;
 
     let mut result = Vec::with_capacity(raw_containers.len());
 
@@ -174,7 +216,31 @@ pub(crate) async fn discover_containers_with_runtime_processes(
         });
     }
 
-    Ok(result)
+    let log_root_available = docker_root.is_some();
+    let mut runtime_log_paths = Vec::with_capacity(result.len() + usize::from(log_root_available));
+    runtime_log_paths.extend(docker_root);
+    runtime_log_paths.extend(
+        result
+            .iter()
+            .filter(|container| !container.log_path.is_empty())
+            .map(|container| PathBuf::from(&container.log_path)),
+    );
+
+    Ok(DockerDiscovery {
+        containers: result,
+        runtime_log_paths,
+        log_root_available,
+    })
+}
+
+pub(crate) fn default_docker_json_log_root() -> PathBuf {
+    PathBuf::from(DEFAULT_DOCKER_JSON_LOG_ROOT)
+}
+
+fn docker_json_log_root(root: Option<String>) -> Option<PathBuf> {
+    root.filter(|root| !root.is_empty())
+        .map(PathBuf::from)
+        .map(|root| root.join("containers"))
 }
 
 fn runtime_process_from_docker_state(
@@ -454,6 +520,15 @@ mod tests {
     fn clean_container_name() {
         assert_eq!(clean_name("/mycontainer"), "mycontainer");
         assert_eq!(clean_name("noprefix"), "noprefix");
+    }
+
+    #[test]
+    fn derives_json_log_root_from_docker_data_root() {
+        assert_eq!(
+            docker_json_log_root(Some("/mnt/docker-data".into())),
+            Some(PathBuf::from("/mnt/docker-data/containers"))
+        );
+        assert_eq!(docker_json_log_root(None), None);
     }
 
     #[test]

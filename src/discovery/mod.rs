@@ -496,6 +496,9 @@ pub struct LogFile {
     pub readable: bool,
     pub permissions: String,
     pub format: String, // "ndjson" or "plain_text"
+    /// File framing required before interpreting the application payload.
+    #[serde(skip)]
+    pub source_format: crate::config::FileSourceFormat,
     /// Approximate line count (for Rails decision-making on sampling priority).
     pub line_count: u64,
 }
@@ -547,6 +550,59 @@ pub async fn discover() -> Census {
     discover_with_runtime_processes(false).await
 }
 
+async fn discover_runtime_and_files(
+    scan_paths: &[&str],
+    log_extensions: &[&str],
+    include_runtime_processes: bool,
+) -> (
+    anyhow::Result<Vec<Container>>,
+    anyhow::Result<Vec<LogFile>>,
+    Result<Vec<Container>, String>,
+    Result<Vec<Container>, String>,
+) {
+    let kubernetes_runtime_present = kubernetes::is_running_in_kubernetes();
+    let (docker_result, k8s_result, cri_result) = tokio::join!(
+        docker::discover_containers_with_runtime_log_paths(include_runtime_processes),
+        kubernetes::discover_kubernetes_pods(),
+        cri::discover_cri_containers_with_runtime_status(include_runtime_processes),
+    );
+
+    let mut excluded_paths = Vec::new();
+    let mut docker_json_fallback_roots = Vec::new();
+
+    match &docker_result {
+        Ok(discovery) => {
+            excluded_paths.extend(discovery.runtime_log_paths.iter().cloned());
+            if !discovery.log_root_available {
+                docker_json_fallback_roots.push(docker::default_docker_json_log_root());
+            }
+        }
+        Err(_) => docker_json_fallback_roots.push(docker::default_docker_json_log_root()),
+    }
+
+    let cri_runtime_available = cri_result
+        .as_ref()
+        .is_ok_and(|discovery| discovery.runtime_available);
+    if (kubernetes_runtime_present && k8s_result.is_ok()) || cri_runtime_available {
+        excluded_paths.push(kubernetes::resolve_pod_logs_dir().into());
+    }
+
+    let files_result = files::discover_log_files_with_runtime_paths(
+        scan_paths,
+        log_extensions,
+        &excluded_paths,
+        &docker_json_fallback_roots,
+    )
+    .await;
+
+    (
+        docker_result.map(|discovery| discovery.containers),
+        files_result,
+        k8s_result,
+        cri_result.map(|discovery| discovery.containers),
+    )
+}
+
 pub(crate) async fn discover_with_runtime_processes(include_runtime_processes: bool) -> Census {
     let mut census = Census {
         os: std::env::consts::OS.to_string(),
@@ -561,21 +617,19 @@ pub(crate) async fn discover_with_runtime_processes(include_runtime_processes: b
 
     // Run discovery backends in parallel
     let (
-        docker_result,
-        files_result,
+        (docker_result, files_result, k8s_result, cri_result),
         systemd_result,
-        k8s_result,
-        cri_result,
         processes_result,
         ports_result,
         packages_result,
         event_log_result,
     ) = tokio::join!(
-        docker::discover_containers_with_runtime_processes(include_runtime_processes),
-        files::discover_log_files(scan_paths, files::DEFAULT_LOG_EXTENSIONS),
+        discover_runtime_and_files(
+            scan_paths,
+            files::DEFAULT_LOG_EXTENSIONS,
+            include_runtime_processes,
+        ),
         systemd::discover_services(),
-        kubernetes::discover_kubernetes_pods(),
-        cri::discover_cri_containers_with_runtime_processes(include_runtime_processes),
         processes::discover_processes(),
         ports::discover_ports(),
         packages::discover_packages(),
@@ -716,21 +770,15 @@ pub async fn discover_with_paths_and_runtime_processes(
     };
 
     let (
-        docker_result,
-        files_result,
+        (docker_result, files_result, k8s_result, cri_result),
         systemd_result,
-        k8s_result,
-        cri_result,
         processes_result,
         ports_result,
         packages_result,
         event_log_result,
     ) = tokio::join!(
-        docker::discover_containers_with_runtime_processes(include_runtime_processes),
-        files::discover_log_files(scan_paths, log_extensions),
+        discover_runtime_and_files(scan_paths, log_extensions, include_runtime_processes),
         systemd::discover_services(),
-        kubernetes::discover_kubernetes_pods(),
-        cri::discover_cri_containers_with_runtime_processes(include_runtime_processes),
         processes::discover_processes(),
         ports::discover_ports(),
         packages::discover_packages(),

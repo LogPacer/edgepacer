@@ -291,6 +291,7 @@ async fn report_inventory(
                 "path": f.path,
                 "size": f.size,
                 "format": f.format,
+                "metadata": { "source_format": f.source_format.hash_part() },
                 "permissions": f.permissions,
                 "modified": f.modified,
                 "line_count": f.line_count,

@@ -644,6 +644,7 @@ mod tests {
             readable: true,
             permissions: "644".into(),
             format: "plain_text".into(),
+            source_format: crate::config::FileSourceFormat::Plain,
             line_count: 100,
         }
     }

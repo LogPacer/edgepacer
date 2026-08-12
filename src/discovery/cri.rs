@@ -31,6 +31,11 @@ const CRI_INSPECT_TIMEOUT: Duration = Duration::from_secs(10);
 #[cfg(all(target_os = "linux", feature = "ebpf"))]
 const CRI_INSPECT_FALLBACK_CONCURRENCY: usize = 8;
 
+pub(crate) struct CriDiscovery {
+    pub containers: Vec<crate::discovery::Container>,
+    pub runtime_available: bool,
+}
+
 /// Check if a local Unix CRI runtime is available. Remote endpoints cannot
 /// safely supply host PIDs for `/proc`-backed identity, so every invocation is
 /// pinned to the exact socket selected here.
@@ -92,11 +97,24 @@ pub async fn discover_cri_containers() -> Result<Vec<crate::discovery::Container
 pub(crate) async fn discover_cri_containers_with_runtime_processes(
     include_runtime_processes: bool,
 ) -> Result<Vec<crate::discovery::Container>, String> {
+    Ok(
+        discover_cri_containers_with_runtime_status(include_runtime_processes)
+            .await?
+            .containers,
+    )
+}
+
+pub(crate) async fn discover_cri_containers_with_runtime_status(
+    include_runtime_processes: bool,
+) -> Result<CriDiscovery, String> {
     #[cfg(not(all(target_os = "linux", feature = "ebpf")))]
     let _ = include_runtime_processes;
 
     let Some(endpoint) = local_cri_endpoint() else {
-        return Ok(vec![]);
+        return Ok(CriDiscovery {
+            containers: Vec::new(),
+            runtime_available: false,
+        });
     };
 
     let output = match crictl_command(&endpoint)
@@ -110,7 +128,12 @@ pub(crate) async fn discover_cri_containers_with_runtime_processes(
         // runtime to speak to. That's CRI-absent (like the k8s lane), not a
         // failed backend — a "cri" census error fail-closes the eBPF ownership
         // gate for the whole host.
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(vec![]),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(CriDiscovery {
+                containers: Vec::new(),
+                runtime_available: false,
+            });
+        }
         Err(e) => return Err(format!("crictl not available: {e}")),
     };
 
@@ -213,7 +236,10 @@ pub(crate) async fn discover_cri_containers_with_runtime_processes(
         })
         .collect();
 
-    Ok(containers)
+    Ok(CriDiscovery {
+        containers,
+        runtime_available: true,
+    })
 }
 
 /// Fetch verbose status for all currently-running containers. Modern crictl
