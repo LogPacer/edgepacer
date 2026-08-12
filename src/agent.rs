@@ -772,7 +772,22 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn removed_file_posts_an_identifier_only_stop() {
+    async fn stale_file_posts_an_identifier_only_stop() {
+        let dir = tempfile::tempdir().unwrap();
+        let file_path = dir.path().join("app.log");
+        std::fs::write(&file_path, "line\n").unwrap();
+        let scan = || async {
+            discovery::Census {
+                log_files: discovery::files::discover_log_files_with_max_age(
+                    &[dir.path().to_str().unwrap()],
+                    discovery::files::DEFAULT_LOG_EXTENSIONS,
+                    discovery::files::DEFAULT_MAX_FILE_AGE_DAYS,
+                )
+                .await
+                .unwrap(),
+                ..Default::default()
+            }
+        };
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/api/v1/census/files"))
@@ -787,14 +802,18 @@ mod tests {
         let client = Client::new_for_test(&config, "installation-1").unwrap();
         client.set_bearer_token("access-1");
         let mut tracker = ChangeTracker::new();
-        let census = discovery::Census {
-            log_files: vec![log_file("/var/log/app.log")],
-            ..Default::default()
-        };
-        tracker.update_from_scan(&census);
+        tracker.update_from_scan(&scan().await);
         tracker.commit_scan();
 
-        let report = tracker.update_from_scan(&discovery::Census::default());
+        let old_mtime = std::time::SystemTime::now() - Duration::from_secs(8 * 24 * 60 * 60);
+        std::fs::File::options()
+            .write(true)
+            .open(&file_path)
+            .unwrap()
+            .set_modified(old_mtime)
+            .unwrap();
+        let report = tracker.update_from_scan(&scan().await);
+        assert_eq!(report.stopped_files.len(), 1);
         report_inventory(&client, &mut tracker, &report, &[])
             .await
             .unwrap();
@@ -804,7 +823,7 @@ mod tests {
         let body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
         assert_eq!(
             body["stopped_files"],
-            serde_json::json!([{ "identifier": "/var/log/app.log" }])
+            serde_json::json!([{ "identifier": file_path.to_string_lossy() }])
         );
         assert_eq!(body["stopped_files"][0].as_object().unwrap().len(), 1);
     }
