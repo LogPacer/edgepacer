@@ -639,39 +639,104 @@ mod tests {
         }
     }
 
+    async fn wait_for_empty_file_discovery(cache: &SharedDiscoveryCache, after_epoch: u64) -> u64 {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let cache = cache.read().await;
+                if cache.epoch() > after_epoch && cache.stats().files == 0 {
+                    return cache.epoch();
+                }
+                drop(cache);
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("agent did not complete an empty-file discovery cycle")
+    }
+
     #[tokio::test]
-    async fn empty_fresh_tracker_posts_one_full_file_report() {
+    async fn run_loop_posts_one_empty_full_file_report() {
+        const CHILD_MARKER: &str = "EDGEPACER_EMPTY_DISCOVERY_CHILD";
+        const TEST_NAME: &str = "agent::tests::run_loop_posts_one_empty_full_file_report";
+
+        if std::env::var_os(CHILD_MARKER).is_none() {
+            let isolation = tempfile::tempdir().unwrap();
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([TEST_NAME, "--exact", "--nocapture"])
+                .env(CHILD_MARKER, "1")
+                .env(
+                    "DOCKER_HOST",
+                    format!("unix://{}", isolation.path().join("missing.sock").display()),
+                )
+                .env("PATH", isolation.path())
+                .env_remove("CONTAINER_HOST")
+                .env_remove("NODE_NAME")
+                .output()
+                .expect("failed to start isolated agent run-loop test");
+            assert!(
+                output.status.success(),
+                "isolated agent run-loop test failed\nstdout:\n{}\nstderr:\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+
+        let dir = tempfile::tempdir().unwrap();
         let server = MockServer::start().await;
         Mock::given(method("POST"))
-            .and(path("/api/v1/census/files"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "status": "accepted"
             })))
-            .expect(1)
             .mount(&server)
             .await;
 
         let config = test_app_config(server.uri());
         let client = Client::new_for_test(&config, "installation-1").unwrap();
         client.set_bearer_token("access-1");
-        let mut tracker = ChangeTracker::new();
-        let census = discovery::Census::default();
+        let shared_config = crate::config::shared_config();
+        *shared_config.write().await = Some(crate::config::UnifiedConfig::new(
+            serde_json::json!({
+                "discovery": {
+                    "scan_paths": [dir.path().to_string_lossy().to_string()]
+                }
+            }),
+            "empty-files".to_string(),
+        ));
+        let cache = discovery::shared_discovery_cache();
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let run_cache = cache.clone();
+        let handle = tokio::spawn(async move {
+            run(
+                &client,
+                shared_config,
+                run_cache,
+                Duration::from_millis(50),
+                shutdown_rx,
+            )
+            .await;
+        });
 
-        let report = tracker.update_from_scan(&census);
-        report_inventory_cycle(&client, &mut tracker, &report, &[]).await;
+        let first_epoch = wait_for_empty_file_discovery(&cache, 0).await;
+        wait_for_empty_file_discovery(&cache, first_epoch).await;
+        shutdown_tx.send(true).unwrap();
+        tokio::time::timeout(Duration::from_secs(10), handle)
+            .await
+            .expect("agent did not shut down")
+            .unwrap();
 
-        let requests = server.received_requests().await.unwrap();
+        let requests: Vec<_> = server
+            .received_requests()
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|request| request.url.path() == "/api/v1/census/files")
+            .collect();
         assert_eq!(requests.len(), 1, "empty fresh reports must be sent");
         let body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
         assert_eq!(body["files"], serde_json::json!([]));
         assert_eq!(body["stopped_files"], serde_json::json!([]));
         assert_eq!(body["full_report"], true);
-
-        let report = tracker.update_from_scan(&census);
-        report_inventory_cycle(&client, &mut tracker, &report, &[]).await;
-
-        let requests = server.received_requests().await.unwrap();
-        assert_eq!(requests.len(), 1, "empty deltas must remain unreported");
     }
 
     #[tokio::test]
