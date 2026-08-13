@@ -229,6 +229,7 @@ pub async fn stream_container_logs(
                     Some(Ok(output)) => {
                         let raw = output.to_string();
                         let (timestamp, line) = parse_docker_log_line(&raw);
+                        let line = crate::ansi::strip_str(line);
 
                         if line.is_empty() {
                             continue;

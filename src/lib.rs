@@ -4,6 +4,7 @@
 //! integration test needs to cross the library boundary.
 
 pub mod agent;
+pub mod ansi;
 pub mod auth_session;
 pub mod batch_tracker;
 mod bootstrap;

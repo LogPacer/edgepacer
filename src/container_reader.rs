@@ -74,10 +74,10 @@ impl ContainerReader {
                         raw.pop();
                     }
 
-                    let Some(mut out) = cri::reassemble_partial(&raw, &mut self.partial_buffer)
-                    else {
+                    let Some(out) = cri::reassemble_partial(&raw, &mut self.partial_buffer) else {
                         continue;
                     };
+                    let mut out = crate::ansi::strip_owned(out);
 
                     if out.len() > DEFAULT_MAX_LINE_BYTES {
                         warn!(
@@ -245,7 +245,8 @@ pub fn sample_lines(container_dir: &Path) -> io::Result<Vec<Vec<u8>>> {
                     raw.pop();
                 }
 
-                if let Some(mut out) = cri::reassemble_partial(&raw, &mut partial_buffer) {
+                if let Some(out) = cri::reassemble_partial(&raw, &mut partial_buffer) {
+                    let mut out = crate::ansi::strip_owned(out);
                     if out.len() > DEFAULT_MAX_LINE_BYTES {
                         out.truncate(DEFAULT_MAX_LINE_BYTES);
                     }

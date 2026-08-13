@@ -494,10 +494,11 @@ async fn read_docker_lines(container_id: &str, max_lines: usize) -> Result<Vec<S
             .to_string();
 
         let (_, line) = crate::docker_stream::parse_docker_log_line(&raw);
+        let line = crate::ansi::strip_str(line);
         if line.is_empty() {
             continue;
         }
-        lines.push(line.to_string());
+        lines.push(line.into_owned());
     }
 
     let start = lines.len().saturating_sub(max_lines);
@@ -510,7 +511,7 @@ async fn read_docker_lines(container_id: &str, max_lines: usize) -> Result<Vec<S
 /// assembler and then takes the tail (`finalize_sample`), so an assembled entry
 /// is never split at the window edge.
 fn read_file_lines(path: &str) -> Result<Vec<String>, String> {
-    read_file_lines_with(path, |line| line.to_string())
+    read_file_lines_with(path, |line| crate::ansi::strip_str(line).into_owned())
 }
 
 fn read_docker_json_file_lines(path: &str) -> Result<Vec<String>, String> {
@@ -520,10 +521,12 @@ fn read_docker_json_file_lines(path: &str) -> Result<Vec<String>, String> {
     let raw_fallbacks = std::cell::Cell::new(0usize);
     let lines = read_file_lines_with(path, |line| {
         match crate::cri::parse_docker_json_line(line.as_bytes()) {
-            Some((payload, _)) => String::from_utf8_lossy(&payload).into_owned(),
+            Some((payload, _)) => {
+                String::from_utf8_lossy(&crate::ansi::strip_owned(payload)).into_owned()
+            }
             None => {
                 raw_fallbacks.set(raw_fallbacks.get() + 1);
-                line.to_string()
+                crate::ansi::strip_str(line).into_owned()
             }
         }
     })?;

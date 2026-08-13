@@ -106,7 +106,7 @@ impl LogTailer {
 fn line_with_payload_as_source(payload: Vec<u8>) -> TailedLine {
     TailedLine {
         source_len: payload.len() as u64 + 1,
-        payload,
+        payload: crate::ansi::strip_owned(payload),
     }
 }
 
@@ -116,7 +116,7 @@ fn docker_json_payload_line(raw: Vec<u8>) -> TailedLine {
         .map(|(payload, _)| payload)
         .unwrap_or(raw);
     TailedLine {
-        payload,
+        payload: crate::ansi::strip_owned(payload),
         source_len,
     }
 }
@@ -945,6 +945,33 @@ mod tests {
 
         assert_eq!(line.payload, b"http: TLS handshake error");
         assert_eq!(line.source_len, raw.len() as u64 + 1);
+    }
+
+    /// Kill-test: a colourised source must reach the assembler as plain text.
+    /// Before stripping, the leading SGR code sat in front of the timestamp, so
+    /// a pattern mined from the source's plain text matched nothing and the
+    /// whole stream folded into one event.
+    #[test]
+    fn coloured_lines_are_stripped_before_assembly_and_shipping() {
+        let anchor = regex::Regex::new(r"^\d{4}-").unwrap();
+
+        let coloured = "\x1b[2m2026-08-06T15:03:17Z\x1b[0m \x1b[32m INFO\x1b[0m msg";
+        let plain = line_with_payload_as_source(coloured.as_bytes().to_vec());
+        assert_eq!(plain.payload, b"2026-08-06T15:03:17Z  INFO msg");
+        assert!(anchor.is_match(&String::from_utf8_lossy(&plain.payload)));
+        assert_eq!(
+            plain.source_len,
+            coloured.len() as u64 + 1,
+            "offsets still span the raw bytes read from the file"
+        );
+
+        // Docker escapes the ESC byte as \u001b inside the json-file wrapper.
+        let raw = br#"{"log":"\u001b[36m2026-08-06T15:03:17Z\u001b[0m boot\n","stream":"stdout","time":"2026-08-06T15:03:17Z"}"#.to_vec();
+        let source_len = raw.len() as u64 + 1;
+        let wrapped = docker_json_payload_line(raw);
+        assert_eq!(wrapped.payload, b"2026-08-06T15:03:17Z boot");
+        assert!(anchor.is_match(&String::from_utf8_lossy(&wrapped.payload)));
+        assert_eq!(wrapped.source_len, source_len);
     }
 
     #[tokio::test]

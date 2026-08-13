@@ -153,7 +153,12 @@ pub async fn stream_event_log(
                     );
 
                     match assembler
-                        .process_line(handle, record.json, now_ns, Some(checkpoint))
+                        .process_line(
+                            handle,
+                            crate::ansi::strip_owned(record.json),
+                            now_ns,
+                            Some(checkpoint),
+                        )
                         .await
                     {
                         Ok(emit) => {
@@ -285,7 +290,7 @@ pub async fn sample_channel_lines(channel: &str, max_lines: usize) -> Result<Vec
     let lines: Vec<String> = records
         .iter()
         .take(max_lines)
-        .map(|record| String::from_utf8_lossy(&record.json).into_owned())
+        .map(|record| crate::ansi::strip_str(&String::from_utf8_lossy(&record.json)).into_owned())
         .collect();
     Ok(lines)
 }
