@@ -217,6 +217,15 @@ impl EntryAssembler {
         self.buffer.is_empty()
     }
 
+    /// Start offset of the oldest buffered line, or `None` when idle.
+    ///
+    /// The owning pipeline holds its checkpoint at or below this offset: these
+    /// bytes have been read but the event containing them has not been emitted,
+    /// let alone delivered.
+    pub fn buffered_start_offset(&self) -> Option<u64> {
+        self.contexts.first().map(|ctx| ctx.start_offset)
+    }
+
     fn drain_current(&mut self) -> (Vec<u8>, EventMetadata) {
         let lines = std::mem::take(&mut self.buffer);
         let contexts = std::mem::take(&mut self.contexts);

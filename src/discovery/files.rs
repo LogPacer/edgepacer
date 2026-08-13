@@ -353,7 +353,7 @@ pub(crate) fn detect_format(path: &std::path::Path) -> String {
 /// field describes the source format LogPacer should use.
 pub(crate) fn detect_docker_json_file_format(path: &std::path::Path) -> String {
     if is_ndjson_log(path, |line| {
-        crate::cri::parse_docker_json_line(line).map(|(payload, _)| payload)
+        crate::cri::parse_docker_json_line(line).map(|record| record.payload)
     }) {
         FORMAT_NDJSON.to_string()
     } else {

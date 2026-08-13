@@ -521,8 +521,8 @@ fn read_docker_json_file_lines(path: &str) -> Result<Vec<String>, String> {
     let raw_fallbacks = std::cell::Cell::new(0usize);
     let lines = read_file_lines_with(path, |line| {
         match crate::cri::parse_docker_json_line(line.as_bytes()) {
-            Some((payload, _)) => {
-                String::from_utf8_lossy(&crate::ansi::strip_owned(payload)).into_owned()
+            Some(record) => {
+                String::from_utf8_lossy(&crate::ansi::strip_owned(record.payload)).into_owned()
             }
             None => {
                 raw_fallbacks.set(raw_fallbacks.get() + 1);
