@@ -9,3 +9,6 @@ dist/
 *.tgz
 tmp/
 docs/plans/
+
+# Local worktrees and their uncommitted lifecycle shims (worktree-setup)
+/scripts/worktrees/
