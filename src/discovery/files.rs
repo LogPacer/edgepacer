@@ -183,7 +183,10 @@ fn walk_directory(
                 detect_docker_json_ownership,
                 stale_cutoff,
             )?;
-        } else if metadata.is_file() && is_log_file(&path, allowed_extensions) {
+        } else if metadata.is_file()
+            && is_log_file(&path, allowed_extensions)
+            && !is_agent_own_log(&path)
+        {
             let modified_at = metadata.modified().ok();
             if is_stale(modified_at, stale_cutoff) {
                 continue;
@@ -278,6 +281,33 @@ fn is_log_file(path: &std::path::Path, allowed: &[String]) -> bool {
             .unwrap_or(false),
         _ => false,
     }
+}
+
+/// Log files this agent writes about itself. On macOS and Windows the
+/// supervisor points the agent's stdout and stderr at files that land inside a
+/// default scan path, so discovery would otherwise offer the agent as a source
+/// of its own output — a loop with no bottom, since shipping logs writes logs
+/// about shipping. Rotated copies are covered too.
+fn is_agent_own_log(path: &Path) -> bool {
+    const AGENT_LOG_STEMS: &[&str] = &["edgepacer", "edgepacer.err", "edgepacer-manager"];
+
+    let mut name = path.file_name().and_then(|name| name.to_str());
+    // Peel rotation/compression suffixes: `edgepacer.log.1`, `edgepacer.log.gz`.
+    while let Some(current) = name {
+        let Some((stem, suffix)) = current.rsplit_once('.') else {
+            break;
+        };
+        if suffix == "log" {
+            return AGENT_LOG_STEMS
+                .iter()
+                .any(|own| stem.eq_ignore_ascii_case(own));
+        }
+        if !is_rotation_suffix(suffix) {
+            break;
+        }
+        name = Some(stem);
+    }
+    false
 }
 
 /// A rotation/compression suffix that wraps an inner log file: a known
@@ -528,6 +558,36 @@ mod tests {
             std::path::Path::new("/var/log/data.csv"),
             &allowed
         ));
+    }
+
+    /// The agent's own log files never enter the census, rotated copies
+    /// included — collecting them would feed the agent its own output.
+    #[test]
+    fn agent_own_logs_are_excluded_from_discovery() {
+        for path in [
+            "/var/log/edgepacer.log",
+            "/var/log/edgepacer.err.log",
+            "/var/log/edgepacer.log.1",
+            "/var/log/edgepacer.log.gz",
+            "/ProgramData/EdgePacer/edgepacer-manager.log",
+        ] {
+            assert!(
+                is_agent_own_log(std::path::Path::new(path)),
+                "{path} is the agent's own output"
+            );
+        }
+
+        // Negative control: a source that merely shares the prefix stays.
+        for path in [
+            "/var/log/edgepacer-proxy.log",
+            "/var/log/app.log",
+            "/var/log/edgepacer/upstream.log",
+        ] {
+            assert!(
+                !is_agent_own_log(std::path::Path::new(path)),
+                "{path} belongs to a real source"
+            );
+        }
     }
 
     #[test]

@@ -31,7 +31,7 @@ use std::time::Duration;
 #[cfg(target_os = "linux")]
 use tokio::time::MissedTickBehavior;
 
-pub use unit::is_systemd_unit;
+pub use unit::{is_agent_unit, is_systemd_unit};
 
 /// Checkpoint every N emitted entries. One definition, shared by both backends.
 const CHECKPOINT_INTERVAL: u64 = 100;

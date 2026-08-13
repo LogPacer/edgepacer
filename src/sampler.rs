@@ -307,7 +307,7 @@ async fn read_sample_lines_for_identifier(
         Some((AccessMethod::File, locator)) => read_file_lines(&locator)?,
         Some((AccessMethod::Kubernetes, locator)) => read_kubernetes_lines(&locator)?,
         Some((AccessMethod::DockerJsonFile, locator)) => read_docker_json_file_lines(&locator)?,
-        Some((AccessMethod::Journald, unit)) => journal::sample_unit_lines(&unit, max_lines)?,
+        Some((AccessMethod::Journald, unit)) => sample_journald_unit(&unit, max_lines)?,
         Some((AccessMethod::DockerApi, container_id)) => {
             read_docker_lines(&container_id, max_lines).await?
         }
@@ -429,7 +429,7 @@ fn read_kubernetes_lines(dir: &str) -> Result<Vec<String>, String> {
 /// minority once journald is the default sink).
 fn read_sample_lines(path: &str, max_lines: usize) -> Result<Vec<String>, String> {
     if journal::is_systemd_unit(path) {
-        return journal::sample_unit_lines(path, max_lines);
+        return sample_journald_unit(path, max_lines);
     }
 
     // Raw fallback with no resolved source has no multiline config, so it owns
@@ -439,10 +439,31 @@ fn read_sample_lines(path: &str, max_lines: usize) -> Result<Vec<String>, String
     Ok(lines.split_off(start))
 }
 
+/// Prefix of the error returned when a sample is requested for the agent's own
+/// service log. Kept as a constant so the reason mapping cannot drift from the
+/// message.
+const AGENT_SELF_LOG_ERROR: &str = "agent self log excluded";
+
+/// Read a journald sample, refusing the agent's own units.
+///
+/// A sample teaches the control plane a source's line format. The agent's own
+/// output would teach it the agent's format instead — and collecting that
+/// output at all closes a loop, since shipping logs writes logs about
+/// shipping. Discovery already leaves these units out of the inventory; this
+/// is the second door.
+fn sample_journald_unit(unit: &str, max_lines: usize) -> Result<Vec<String>, String> {
+    if journal::is_agent_unit(unit) {
+        return Err(format!("{AGENT_SELF_LOG_ERROR}: {unit}"));
+    }
+    journal::sample_unit_lines(unit, max_lines)
+}
+
 fn sample_error_reason(error: &str) -> &'static str {
     let normalized = error.to_ascii_lowercase();
 
-    if normalized.starts_with("file not found:") {
+    if normalized.starts_with(AGENT_SELF_LOG_ERROR) {
+        "agent_self_log"
+    } else if normalized.starts_with("file not found:") {
         "file_not_found"
     } else if normalized.contains("permission denied") {
         "permission_denied"
@@ -762,6 +783,19 @@ mod tests {
     fn read_sample_missing_file() {
         let result = read_sample_lines("/nonexistent/path.log", 10);
         assert!(result.is_err());
+    }
+
+    /// The agent must never serve a sample of its own service log — the
+    /// control plane would learn the agent's format instead of a source's.
+    #[test]
+    fn sampling_refuses_the_agents_own_unit() {
+        let error = sample_journald_unit("edgepacer.service", 100)
+            .expect_err("the agent's own unit is refused");
+        assert_eq!(sample_error_reason(&error), "agent_self_log");
+
+        let error = sample_journald_unit("edgepacer", 100)
+            .expect_err("a bare agent unit name is refused too");
+        assert_eq!(sample_error_reason(&error), "agent_self_log");
     }
 
     #[test]

@@ -81,8 +81,12 @@ fn discover_services_sync() -> Result<Vec<SystemdService>, String> {
 /// diagnostics on the way down, which is exactly when someone wants logs.
 /// A unit that later goes inactive simply vanishes from the scan and the
 /// ChangeTracker emits the stopped delta.
+///
+/// The agent's own units never belong in the census: shipping its output
+/// produces more output to ship, and there is no bottom to that loop.
 fn is_reportable(service: &SystemdService) -> bool {
     !matches!(service.active_state.as_str(), "inactive" | "dead")
+        && !crate::journal::is_agent_unit(&service.name)
 }
 
 /// Parse a single line from `systemctl list-units --no-legend` output.
@@ -181,6 +185,33 @@ mod tests {
         );
         assert!(!is_reportable(&mk("inactive")));
         assert!(!is_reportable(&mk("dead")));
+    }
+
+    /// The agent's own units are filtered out of the inventory it reports, so
+    /// the control plane is never offered the agent as a log source.
+    #[test]
+    fn inventory_excludes_the_agents_own_units() {
+        let listing = "\
+  nginx.service                loaded active running  A high performance web server
+  edgepacer.service            loaded active running  EdgePacer Log Agent
+  edgepacer-manager.service    loaded active running  EdgePacer Manager
+  edgepacer-proxy.service      loaded active running  A source that merely shares the prefix
+";
+
+        let reported: Vec<String> = listing
+            .lines()
+            .filter_map(parse_systemctl_line)
+            .filter(is_reportable)
+            .map(|service| service.name)
+            .collect();
+
+        assert_eq!(
+            reported,
+            vec![
+                "nginx.service".to_string(),
+                "edgepacer-proxy.service".to_string()
+            ]
+        );
     }
 
     #[test]
