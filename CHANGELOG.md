@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.2.15 - 2026-08-13
+
 - Multiline aggregation accepts an ordered `start_patterns` set instead of a
   single anchor, so a source carrying several line formats at once anchors
   each of them rather than gluing the unmatched formats onto the wrong event.
