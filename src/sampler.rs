@@ -659,8 +659,7 @@ mod tests {
         use crate::entry_assembler::{DEFAULT_TIMEOUT, EntryAssembler, LineContext};
 
         let mut asm =
-            EntryAssembler::new(&cfg.start_pattern, cfg.max_lines as usize, DEFAULT_TIMEOUT)
-                .unwrap();
+            EntryAssembler::new(cfg.patterns(), cfg.max_lines as usize, DEFAULT_TIMEOUT).unwrap();
         let mut events = Vec::new();
         for (i, line) in lines.iter().enumerate() {
             let ctx = LineContext {
@@ -684,11 +683,7 @@ mod tests {
     /// sample shipped the raw split lines the analyzer chokes on.
     #[test]
     fn kt_multiline_source_samples_assembled_entries() {
-        let cfg = MultilineConfig {
-            start_pattern: r"^\d{4}-\d{2}-\d{2}".to_string(),
-            max_lines: 500,
-            timeout_secs: 5,
-        };
+        let cfg = MultilineConfig::from_patterns(vec![r"^\d{4}-\d{2}-\d{2}".to_string()], 500, 5);
         let lines = vec![
             "2026-07-13 INFO request received".to_string(),
             "    header: value".to_string(),
@@ -706,11 +701,7 @@ mod tests {
     /// last N raw lines that would split an event at the window edge.
     #[test]
     fn finalize_sample_tails_assembled_entries_not_raw_lines() {
-        let cfg = MultilineConfig {
-            start_pattern: r"^\d{4}-\d{2}-\d{2}".to_string(),
-            max_lines: 500,
-            timeout_secs: 5,
-        };
+        let cfg = MultilineConfig::from_patterns(vec![r"^\d{4}-\d{2}-\d{2}".to_string()], 500, 5);
         // Three events, each a header plus one continuation line.
         let lines = vec![
             "2026-07-13 one".to_string(),

@@ -389,7 +389,7 @@ impl DeliveryPipeline {
             Some(cfg) => {
                 let timeout = Duration::from_secs(cfg.timeout_secs.max(1) as u64);
                 Some(
-                    EntryAssembler::new(&cfg.start_pattern, cfg.max_lines as usize, timeout)
+                    EntryAssembler::new(cfg.patterns(), cfg.max_lines as usize, timeout)
                         .map_err(PipelineError::InvalidMultilinePattern)?,
                 )
             }

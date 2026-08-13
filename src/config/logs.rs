@@ -5,7 +5,7 @@ use sha2::{Digest, Sha256};
 use super::fields::{
     ArchiveId, FieldContext, LogSourceId, RepoId, WireEndpoint, bool_field_or,
     optional_string_field, required_config_key, required_config_string, required_string_field,
-    u32_field_or,
+    string_array_field, u32_field_or,
 };
 use super::services::{CheckpointAdoption, all_service_descriptions, resolve_service_descriptions};
 use super::{StreamAccessMethod, StreamingSourceConfig, UnifiedConfig};
@@ -56,15 +56,47 @@ impl FileSourceFormat {
 }
 
 /// Per-source multiline aggregation settings, mirroring Go's
-/// `config.MultilineConfig`. `start_pattern` matches the first line of an
+/// `config.MultilineConfig`. A line matching any start pattern begins an
 /// event; non-matching lines are continuations. `max_lines` caps the
 /// buffer; `timeout_secs` is the idle-flush interval (Vector-style -
 /// resets on every line).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MultilineConfig {
+    /// First pattern of the set, kept as its own field so config hashing and
+    /// single-pattern consumers keep the shape they have always had.
     pub start_pattern: String,
+    /// The ordered start-pattern set. One source can carry several line
+    /// formats at once — a request log and an application log written to the
+    /// same place — and a single anchor glues the formats it doesn't match
+    /// onto the wrong event. A line matching ANY pattern starts a new event.
+    pub start_patterns: Vec<String>,
     pub max_lines: u32,
     pub timeout_secs: u32,
+}
+
+impl MultilineConfig {
+    /// Build a config from an ordered start-pattern set. The singular
+    /// `start_pattern` mirrors the first entry.
+    pub fn from_patterns(start_patterns: Vec<String>, max_lines: u32, timeout_secs: u32) -> Self {
+        let start_pattern = start_patterns.first().cloned().unwrap_or_default();
+        Self {
+            start_pattern,
+            start_patterns,
+            max_lines,
+            timeout_secs,
+        }
+    }
+
+    /// The start-pattern set lines are matched against. Falls back to the
+    /// singular field when the set is empty, so a config carrying only the
+    /// original single pattern still anchors events.
+    pub fn patterns(&self) -> &[String] {
+        if self.start_patterns.is_empty() {
+            std::slice::from_ref(&self.start_pattern)
+        } else {
+            &self.start_patterns
+        }
+    }
 }
 
 /// A collect directive from unified config `collect` map (Rails collection intent).
@@ -466,20 +498,31 @@ fn log_stream_from_collect(
     }
 }
 
+/// Parse a `multiline` block. The ordered `start_patterns` array is the
+/// pattern set; when it is absent or empty the singular `start_pattern` is
+/// the one-element set and stays required, so a block naming neither is
+/// rejected with the usual field warning.
 pub(super) fn parse_multiline_config(
     value: Option<&serde_json::Value>,
     ctx: FieldContext<'_>,
 ) -> Option<MultilineConfig> {
     let multiline = value?;
-    let start_pattern = required_string_field(multiline, "start_pattern", ctx)?;
+    let configured_pattern = optional_string_field(multiline, "start_pattern");
+    let mut start_patterns = string_array_field(multiline, "start_patterns");
+    start_patterns.retain(|pattern| !pattern.is_empty());
+    if start_patterns.is_empty() {
+        start_patterns.push(required_string_field(multiline, "start_pattern", ctx)?);
+    }
     let max_lines = u32_field_or(multiline, "max_lines", 0, ctx);
     let timeout_secs = multiline
         .get("timeout_seconds")
         .and_then(|value| value.as_u64())
         .and_then(|value| u32::try_from(value).ok())
         .unwrap_or_else(|| u32_field_or(multiline, "timeout_secs", 0, ctx));
+    let start_pattern = configured_pattern.unwrap_or_else(|| start_patterns[0].clone());
     Some(MultilineConfig {
         start_pattern,
+        start_patterns,
         max_lines,
         timeout_secs,
     })
@@ -487,11 +530,16 @@ pub(super) fn parse_multiline_config(
 
 /// Serialize the multiline settings into a stable fragment for config-hash
 /// computation. `-` denotes "no multiline", so toggling it changes the hash.
+/// Every pattern in the set is covered, so adding or editing any one of them
+/// reconciles the source's pipeline. The unit separator keeps the joined set
+/// unambiguous without escaping regex metacharacters.
 fn multiline_hash_part(multiline: Option<&MultilineConfig>) -> String {
     match multiline {
         Some(multiline) => format!(
             "{}|{}|{}",
-            multiline.start_pattern, multiline.max_lines, multiline.timeout_secs
+            multiline.patterns().join("\u{1f}"),
+            multiline.max_lines,
+            multiline.timeout_secs
         ),
         None => String::from("-"),
     }
@@ -672,6 +720,91 @@ mod tests {
                 )
             }),
             Some((r"^\d{4}-\d{2}-\d{2}", 500, 5))
+        );
+    }
+
+    #[test]
+    fn multiline_start_patterns_array_becomes_the_pattern_set() {
+        let ctx = FieldContext::entry("collect", "src");
+        let config = parse_multiline_config(
+            Some(&json!({
+                "start_pattern": "^\\d{4}-",
+                "start_patterns": ["^\\d{4}-", "^\\S+ - - \\[", ""],
+                "max_lines": 500,
+                "timeout_seconds": 5
+            })),
+            ctx,
+        )
+        .expect("a multiline block with a pattern set parses");
+
+        assert_eq!(
+            config.patterns(),
+            [r"^\d{4}-".to_string(), r"^\S+ - - \[".to_string()],
+            "the array is the ordered set; empty entries are dropped"
+        );
+        assert_eq!(
+            config.start_pattern, r"^\d{4}-",
+            "the singular field stays populated for hashing and back-compat"
+        );
+    }
+
+    #[test]
+    fn multiline_falls_back_to_the_singular_start_pattern() {
+        let ctx = FieldContext::entry("collect", "src");
+
+        let singular_only =
+            parse_multiline_config(Some(&json!({ "start_pattern": "^\\d{4}-" })), ctx)
+                .expect("a singular-only block parses");
+        assert_eq!(singular_only.patterns(), [r"^\d{4}-".to_string()]);
+
+        let empty_array = parse_multiline_config(
+            Some(&json!({ "start_pattern": "^\\d{4}-", "start_patterns": [] })),
+            ctx,
+        )
+        .expect("an empty set falls back to the singular field");
+        assert_eq!(empty_array.patterns(), [r"^\d{4}-".to_string()]);
+
+        // A set without the singular field is complete on its own.
+        let plural_only =
+            parse_multiline_config(Some(&json!({ "start_patterns": ["^A", "^B"] })), ctx)
+                .expect("a set without the singular field parses");
+        assert_eq!(plural_only.start_pattern, "^A");
+        assert_eq!(plural_only.patterns(), ["^A".to_string(), "^B".to_string()]);
+
+        assert!(
+            parse_multiline_config(Some(&json!({ "max_lines": 10 })), ctx).is_none(),
+            "a block naming no pattern at all is rejected"
+        );
+    }
+
+    #[test]
+    fn every_pattern_in_the_set_reconciles_the_config_hash() {
+        let two = MultilineConfig::from_patterns(vec!["^A".to_string(), "^B".to_string()], 500, 5);
+        let edited_last =
+            MultilineConfig::from_patterns(vec!["^A".to_string(), "^C".to_string()], 500, 5);
+        let single = MultilineConfig::from_patterns(vec!["^A".to_string()], 500, 5);
+
+        let hash = |multiline: &MultilineConfig| {
+            LogStreamConfig::compute_hash(
+                "/var/log/app.log",
+                "https://s/wire",
+                "arc",
+                "repo",
+                Some(multiline),
+                FileSourceFormat::Plain,
+                false,
+            )
+        };
+
+        assert_ne!(
+            hash(&two),
+            hash(&edited_last),
+            "editing a later pattern must restart the pipeline"
+        );
+        assert_ne!(
+            hash(&two),
+            hash(&single),
+            "adding a pattern changes the hash"
         );
     }
 

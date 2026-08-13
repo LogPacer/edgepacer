@@ -29,7 +29,7 @@ impl StreamingEntryAssembler {
             Some(cfg) => {
                 let timeout = Duration::from_secs(cfg.timeout_secs.max(1) as u64);
                 Some(EntryAssembler::new(
-                    &cfg.start_pattern,
+                    cfg.patterns(),
                     cfg.max_lines as usize,
                     timeout,
                 )?)
@@ -226,11 +226,8 @@ mod tests {
         let pipeline = test_pipeline(&format!("{}/wire", server.uri()), dir.path(), fast_config());
         let (handle, actor) = spawn_streaming_actor(pipeline);
 
-        let multiline = MultilineConfig {
-            start_pattern: r"^\d{4}-\d{2}-\d{2}".to_string(),
-            max_lines: 500,
-            timeout_secs: 5,
-        };
+        let multiline =
+            MultilineConfig::from_patterns(vec![r"^\d{4}-\d{2}-\d{2}".to_string()], 500, 5);
         let mut assembler = StreamingEntryAssembler::new(Some(&multiline)).unwrap();
 
         let first_checkpoint = StreamingCheckpoint::docker(
