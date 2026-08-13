@@ -2,3 +2,7 @@
 !Dockerfile
 !.docker-stage/
 !.docker-stage/**
+
+# Local worktrees and their uncommitted lifecycle shims (worktree-setup)
+/.worktrees/
+/scripts/worktrees/
