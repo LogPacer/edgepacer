@@ -15,6 +15,16 @@ use crate::tailer::{DEFAULT_MAX_LINE_BYTES, ReadPosition};
 static LOG_FILE_PATTERN: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^(\d+)\.log$").expect("valid log file pattern"));
 
+/// One logical container log message: the payload, the stream that wrote it,
+/// and the raw file bytes consumed to produce it (every `P` fragment plus the
+/// terminating record, newlines included).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContainerLine {
+    pub message: Vec<u8>,
+    pub stream: crate::cri::LogStream,
+    pub source_len: u64,
+}
+
 /// Tails numbered CRI log files inside a K8s container log directory.
 pub struct ContainerReader {
     container_dir: PathBuf,
@@ -23,6 +33,10 @@ pub struct ContainerReader {
     offset: u64,
     inode: u64,
     partial_buffer: Vec<u8>,
+    /// Raw bytes already consumed by `P` fragments that have no terminating
+    /// record yet. `offset` counts them, but no message spans them, so the
+    /// pipeline holds its byte accounting back by this much.
+    partial_source_len: u64,
 }
 
 impl ContainerReader {
@@ -34,6 +48,7 @@ impl ContainerReader {
             offset: 0,
             inode: 0,
             partial_buffer: Vec::new(),
+            partial_source_len: 0,
         };
         reader.find_and_open_active_log()?;
         Ok(reader)
@@ -47,12 +62,13 @@ impl ContainerReader {
             offset: checkpoint.offset,
             inode: checkpoint.inode,
             partial_buffer: Vec::new(),
+            partial_source_len: 0,
         };
         reader.find_and_open_active_log()?;
         Ok(reader)
     }
 
-    pub fn read_lines(&mut self, max_lines: usize) -> io::Result<Vec<Vec<u8>>> {
+    pub fn read_lines(&mut self, max_lines: usize) -> io::Result<Vec<ContainerLine>> {
         self.check_rotation()?;
 
         let Some(reader) = self.reader.as_mut() else {
@@ -67,6 +83,7 @@ impl ContainerReader {
                 Ok(0) => break,
                 Ok(n) => {
                     self.offset += n as u64;
+                    self.partial_source_len += n as u64;
                     if raw.last() == Some(&b'\n') {
                         raw.pop();
                     }
@@ -74,10 +91,12 @@ impl ContainerReader {
                         raw.pop();
                     }
 
-                    let Some(mut out) = cri::reassemble_partial(&raw, &mut self.partial_buffer)
+                    let Some((out, stream)) =
+                        cri::reassemble_partial(&raw, &mut self.partial_buffer)
                     else {
                         continue;
                     };
+                    let mut out = crate::ansi::strip_owned(out);
 
                     if out.len() > DEFAULT_MAX_LINE_BYTES {
                         warn!(
@@ -88,7 +107,11 @@ impl ContainerReader {
                         out.truncate(DEFAULT_MAX_LINE_BYTES);
                     }
 
-                    lines.push(out);
+                    lines.push(ContainerLine {
+                        message: out,
+                        stream,
+                        source_len: std::mem::take(&mut self.partial_source_len),
+                    });
                 }
                 Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
                 Err(e) => return Err(e),
@@ -103,6 +126,13 @@ impl ContainerReader {
             offset: self.offset,
             inode: self.inode,
         }
+    }
+
+    /// Raw bytes consumed by `P` fragments still waiting for their terminating
+    /// record. No emitted message spans them yet, so the pipeline must not let
+    /// its byte accounting run past them.
+    pub fn pending_partial_bytes(&self) -> u64 {
+        self.partial_source_len
     }
 
     fn find_and_open_active_log(&mut self) -> io::Result<()> {
@@ -154,6 +184,11 @@ impl ContainerReader {
                 "K8s log rotation detected"
             );
             self.offset = 0;
+            // A fragment left dangling in the rotated file can never be
+            // completed by the new one; drop it with its byte accounting
+            // rather than splicing it onto the new file's first message.
+            self.partial_buffer.clear();
+            self.partial_source_len = 0;
             self.open_file(&self.container_dir.join(&highest))?;
             self.current_file = highest;
         } else if let Some(reader) = self.reader.as_ref()
@@ -245,7 +280,8 @@ pub fn sample_lines(container_dir: &Path) -> io::Result<Vec<Vec<u8>>> {
                     raw.pop();
                 }
 
-                if let Some(mut out) = cri::reassemble_partial(&raw, &mut partial_buffer) {
+                if let Some((out, _)) = cri::reassemble_partial(&raw, &mut partial_buffer) {
+                    let mut out = crate::ansi::strip_owned(out);
                     if out.len() > DEFAULT_MAX_LINE_BYTES {
                         out.truncate(DEFAULT_MAX_LINE_BYTES);
                     }
@@ -310,7 +346,12 @@ mod tests {
         .unwrap();
         f.flush().unwrap();
 
-        let wire_messages = wire_reader.read_lines(100).unwrap();
+        let wire_messages: Vec<Vec<u8>> = wire_reader
+            .read_lines(100)
+            .unwrap()
+            .into_iter()
+            .map(|line| line.message)
+            .collect();
         let sample_messages = sample_lines(dir.path()).unwrap();
 
         assert_eq!(
@@ -346,7 +387,7 @@ mod tests {
 
         let lines = reader.read_lines(10).unwrap();
         assert_eq!(lines.len(), 2);
-        assert_eq!(lines[0], b"line one");
-        assert_eq!(lines[1], b"line two");
+        assert_eq!(lines[0].message, b"line one");
+        assert_eq!(lines[1].message, b"line two");
     }
 }

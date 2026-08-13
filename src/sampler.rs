@@ -307,7 +307,7 @@ async fn read_sample_lines_for_identifier(
         Some((AccessMethod::File, locator)) => read_file_lines(&locator)?,
         Some((AccessMethod::Kubernetes, locator)) => read_kubernetes_lines(&locator)?,
         Some((AccessMethod::DockerJsonFile, locator)) => read_docker_json_file_lines(&locator)?,
-        Some((AccessMethod::Journald, unit)) => journal::sample_unit_lines(&unit, max_lines)?,
+        Some((AccessMethod::Journald, unit)) => sample_journald_unit(&unit, max_lines)?,
         Some((AccessMethod::DockerApi, container_id)) => {
             read_docker_lines(&container_id, max_lines).await?
         }
@@ -429,7 +429,7 @@ fn read_kubernetes_lines(dir: &str) -> Result<Vec<String>, String> {
 /// minority once journald is the default sink).
 fn read_sample_lines(path: &str, max_lines: usize) -> Result<Vec<String>, String> {
     if journal::is_systemd_unit(path) {
-        return journal::sample_unit_lines(path, max_lines);
+        return sample_journald_unit(path, max_lines);
     }
 
     // Raw fallback with no resolved source has no multiline config, so it owns
@@ -439,10 +439,31 @@ fn read_sample_lines(path: &str, max_lines: usize) -> Result<Vec<String>, String
     Ok(lines.split_off(start))
 }
 
+/// Prefix of the error returned when a sample is requested for the agent's own
+/// service log. Kept as a constant so the reason mapping cannot drift from the
+/// message.
+const AGENT_SELF_LOG_ERROR: &str = "agent self log excluded";
+
+/// Read a journald sample, refusing the agent's own units.
+///
+/// A sample teaches the control plane a source's line format. The agent's own
+/// output would teach it the agent's format instead — and collecting that
+/// output at all closes a loop, since shipping logs writes logs about
+/// shipping. Discovery already leaves these units out of the inventory; this
+/// is the second door.
+fn sample_journald_unit(unit: &str, max_lines: usize) -> Result<Vec<String>, String> {
+    if journal::is_agent_unit(unit) {
+        return Err(format!("{AGENT_SELF_LOG_ERROR}: {unit}"));
+    }
+    journal::sample_unit_lines(unit, max_lines)
+}
+
 fn sample_error_reason(error: &str) -> &'static str {
     let normalized = error.to_ascii_lowercase();
 
-    if normalized.starts_with("file not found:") {
+    if normalized.starts_with(AGENT_SELF_LOG_ERROR) {
+        "agent_self_log"
+    } else if normalized.starts_with("file not found:") {
         "file_not_found"
     } else if normalized.contains("permission denied") {
         "permission_denied"
@@ -494,10 +515,11 @@ async fn read_docker_lines(container_id: &str, max_lines: usize) -> Result<Vec<S
             .to_string();
 
         let (_, line) = crate::docker_stream::parse_docker_log_line(&raw);
+        let line = crate::ansi::strip_str(line);
         if line.is_empty() {
             continue;
         }
-        lines.push(line.to_string());
+        lines.push(line.into_owned());
     }
 
     let start = lines.len().saturating_sub(max_lines);
@@ -510,7 +532,7 @@ async fn read_docker_lines(container_id: &str, max_lines: usize) -> Result<Vec<S
 /// assembler and then takes the tail (`finalize_sample`), so an assembled entry
 /// is never split at the window edge.
 fn read_file_lines(path: &str) -> Result<Vec<String>, String> {
-    read_file_lines_with(path, |line| line.to_string())
+    read_file_lines_with(path, |line| crate::ansi::strip_str(line).into_owned())
 }
 
 fn read_docker_json_file_lines(path: &str) -> Result<Vec<String>, String> {
@@ -520,10 +542,12 @@ fn read_docker_json_file_lines(path: &str) -> Result<Vec<String>, String> {
     let raw_fallbacks = std::cell::Cell::new(0usize);
     let lines = read_file_lines_with(path, |line| {
         match crate::cri::parse_docker_json_line(line.as_bytes()) {
-            Some((payload, _)) => String::from_utf8_lossy(&payload).into_owned(),
+            Some(record) => {
+                String::from_utf8_lossy(&crate::ansi::strip_owned(record.payload)).into_owned()
+            }
             None => {
                 raw_fallbacks.set(raw_fallbacks.get() + 1);
-                line.to_string()
+                crate::ansi::strip_str(line).into_owned()
             }
         }
     })?;
@@ -659,8 +683,7 @@ mod tests {
         use crate::entry_assembler::{DEFAULT_TIMEOUT, EntryAssembler, LineContext};
 
         let mut asm =
-            EntryAssembler::new(&cfg.start_pattern, cfg.max_lines as usize, DEFAULT_TIMEOUT)
-                .unwrap();
+            EntryAssembler::new(cfg.patterns(), cfg.max_lines as usize, DEFAULT_TIMEOUT).unwrap();
         let mut events = Vec::new();
         for (i, line) in lines.iter().enumerate() {
             let ctx = LineContext {
@@ -684,11 +707,7 @@ mod tests {
     /// sample shipped the raw split lines the analyzer chokes on.
     #[test]
     fn kt_multiline_source_samples_assembled_entries() {
-        let cfg = MultilineConfig {
-            start_pattern: r"^\d{4}-\d{2}-\d{2}".to_string(),
-            max_lines: 500,
-            timeout_secs: 5,
-        };
+        let cfg = MultilineConfig::from_patterns(vec![r"^\d{4}-\d{2}-\d{2}".to_string()], 500, 5);
         let lines = vec![
             "2026-07-13 INFO request received".to_string(),
             "    header: value".to_string(),
@@ -706,11 +725,7 @@ mod tests {
     /// last N raw lines that would split an event at the window edge.
     #[test]
     fn finalize_sample_tails_assembled_entries_not_raw_lines() {
-        let cfg = MultilineConfig {
-            start_pattern: r"^\d{4}-\d{2}-\d{2}".to_string(),
-            max_lines: 500,
-            timeout_secs: 5,
-        };
+        let cfg = MultilineConfig::from_patterns(vec![r"^\d{4}-\d{2}-\d{2}".to_string()], 500, 5);
         // Three events, each a header plus one continuation line.
         let lines = vec![
             "2026-07-13 one".to_string(),
@@ -768,6 +783,19 @@ mod tests {
     fn read_sample_missing_file() {
         let result = read_sample_lines("/nonexistent/path.log", 10);
         assert!(result.is_err());
+    }
+
+    /// The agent must never serve a sample of its own service log — the
+    /// control plane would learn the agent's format instead of a source's.
+    #[test]
+    fn sampling_refuses_the_agents_own_unit() {
+        let error = sample_journald_unit("edgepacer.service", 100)
+            .expect_err("the agent's own unit is refused");
+        assert_eq!(sample_error_reason(&error), "agent_self_log");
+
+        let error = sample_journald_unit("edgepacer", 100)
+            .expect_err("a bare agent unit name is refused too");
+        assert_eq!(sample_error_reason(&error), "agent_self_log");
     }
 
     #[test]

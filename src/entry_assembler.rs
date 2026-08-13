@@ -1,13 +1,16 @@
 //! Multiline entry aggregator — stitches continuation lines into a single
-//! logical event based on a start-pattern regex.
+//! logical event based on an ordered set of start-pattern regexes.
 //!
 //! Mirrors legacy EdgePacer's `internal/exporter/entry_assembler.go`. Each
-//! configured source optionally owns an assembler. Lines that match the
-//! start pattern begin a new event; lines that don't match are continuations
-//! of the current in-progress event.
+//! configured source optionally owns an assembler. Lines that match any start
+//! pattern begin a new event; lines that match none are continuations of the
+//! current in-progress event. The set exists because one source routinely
+//! carries several line formats — an access log and an application log written
+//! to the same place — and a single anchor turns every line of the formats it
+//! does not match into a continuation of the wrong event.
 //!
 //! Flush triggers (any of the three emits the buffered event):
-//! 1. A new line matches `start_pattern` AND the buffer is non-empty.
+//! 1. A new line matches a start pattern AND the buffer is non-empty.
 //! 2. The buffered line count reaches `max_lines`.
 //! 3. More than `timeout` has passed since the last line was received.
 //!    This is Vector-style: the timeout resets on every line, so it
@@ -27,7 +30,7 @@
 
 use std::time::{Duration, Instant};
 
-use regex::Regex;
+use regex::RegexSet;
 
 use crate::config::MultilineConfig;
 
@@ -52,7 +55,7 @@ pub fn assemble_batch(
     };
 
     let timeout = Duration::from_secs(u64::from(cfg.timeout_secs.max(1)));
-    let mut assembler = EntryAssembler::new(&cfg.start_pattern, cfg.max_lines as usize, timeout)?;
+    let mut assembler = EntryAssembler::new(cfg.patterns(), cfg.max_lines as usize, timeout)?;
 
     let mut events = Vec::new();
     for (offset, line) in lines.into_iter().enumerate() {
@@ -106,7 +109,7 @@ pub struct EventMetadata {
 
 /// Aggregates consecutive log lines into multi-line events.
 pub struct EntryAssembler {
-    start_pattern: Regex,
+    start_patterns: RegexSet,
     max_lines: usize,
     timeout: Duration,
     buffer: Vec<Vec<u8>>,
@@ -115,11 +118,11 @@ pub struct EntryAssembler {
 }
 
 impl EntryAssembler {
-    /// Compile `start_pattern` and build an assembler with the given cap
-    /// and idle timeout. Zero values fall back to `DEFAULT_MAX_LINES` /
-    /// `DEFAULT_TIMEOUT`, matching Go's NewEntryAssembler behavior.
+    /// Compile the ordered `start_patterns` set and build an assembler with the
+    /// given cap and idle timeout. Zero values fall back to `DEFAULT_MAX_LINES`
+    /// / `DEFAULT_TIMEOUT`, matching Go's NewEntryAssembler behavior.
     pub fn new(
-        start_pattern: &str,
+        start_patterns: &[String],
         max_lines: usize,
         timeout: Duration,
     ) -> Result<Self, regex::Error> {
@@ -135,13 +138,22 @@ impl EntryAssembler {
         };
 
         Ok(Self {
-            start_pattern: Regex::new(start_pattern)?,
+            start_patterns: RegexSet::new(start_patterns)?,
             max_lines,
             timeout,
             buffer: Vec::new(),
             contexts: Vec::new(),
             last_line_at: None,
         })
+    }
+
+    /// Build an assembler anchored on a single start pattern.
+    pub fn with_pattern(
+        start_pattern: &str,
+        max_lines: usize,
+        timeout: Duration,
+    ) -> Result<Self, regex::Error> {
+        Self::new(&[start_pattern.to_string()], max_lines, timeout)
     }
 
     /// Process a single line with its byte-offset context.
@@ -154,7 +166,7 @@ impl EntryAssembler {
     /// emitting anything.
     pub fn process(&mut self, line: Vec<u8>, ctx: LineContext) -> Option<(Vec<u8>, EventMetadata)> {
         let now = Instant::now();
-        let is_start = self.start_pattern.is_match(&lossy(&line));
+        let is_start = self.start_patterns.is_match(&lossy(&line));
         let timed_out = self
             .last_line_at
             .is_some_and(|t| now.duration_since(t) > self.timeout)
@@ -203,6 +215,15 @@ impl EntryAssembler {
     /// True when no lines are currently buffered.
     pub fn is_empty(&self) -> bool {
         self.buffer.is_empty()
+    }
+
+    /// Start offset of the oldest buffered line, or `None` when idle.
+    ///
+    /// The owning pipeline holds its checkpoint at or below this offset: these
+    /// bytes have been read but the event containing them has not been emitted,
+    /// let alone delivered.
+    pub fn buffered_start_offset(&self) -> Option<u64> {
+        self.contexts.first().map(|ctx| ctx.start_offset)
     }
 
     fn drain_current(&mut self) -> (Vec<u8>, EventMetadata) {
@@ -271,7 +292,7 @@ mod tests {
 
     #[test]
     fn starts_new_event_flushes_previous() {
-        let mut asm = EntryAssembler::new(r"^\d{4}", 500, DEFAULT_TIMEOUT).unwrap();
+        let mut asm = EntryAssembler::with_pattern(r"^\d{4}", 500, DEFAULT_TIMEOUT).unwrap();
 
         // First line — starts an event, buffered.
         assert!(
@@ -296,7 +317,7 @@ mod tests {
 
     #[test]
     fn buffer_full_flushes() {
-        let mut asm = EntryAssembler::new(r"^\d{4}", 3, DEFAULT_TIMEOUT).unwrap();
+        let mut asm = EntryAssembler::with_pattern(r"^\d{4}", 3, DEFAULT_TIMEOUT).unwrap();
 
         // Start event.
         assert!(
@@ -316,7 +337,8 @@ mod tests {
 
     #[test]
     fn idle_timeout_flushes_via_check_timeout() {
-        let mut asm = EntryAssembler::new(r"^\d{4}", 500, Duration::from_millis(50)).unwrap();
+        let mut asm =
+            EntryAssembler::with_pattern(r"^\d{4}", 500, Duration::from_millis(50)).unwrap();
 
         assert!(
             asm.process(b"2026-04-21 alone".to_vec(), ctx(0, 17))
@@ -337,7 +359,8 @@ mod tests {
 
     #[test]
     fn timeout_resets_on_every_line_vector_style() {
-        let mut asm = EntryAssembler::new(r"^\d{4}", 500, Duration::from_millis(100)).unwrap();
+        let mut asm =
+            EntryAssembler::with_pattern(r"^\d{4}", 500, Duration::from_millis(100)).unwrap();
 
         assert!(
             asm.process(b"2026-04-21 start".to_vec(), ctx(0, 17))
@@ -366,7 +389,7 @@ mod tests {
 
     #[test]
     fn flush_emits_remaining_event_on_shutdown() {
-        let mut asm = EntryAssembler::new(r"^\d{4}", 500, DEFAULT_TIMEOUT).unwrap();
+        let mut asm = EntryAssembler::with_pattern(r"^\d{4}", 500, DEFAULT_TIMEOUT).unwrap();
 
         assert!(
             asm.process(b"2026-04-21 lone".to_vec(), ctx(0, 16))
@@ -385,7 +408,7 @@ mod tests {
 
     #[test]
     fn blank_lines_become_continuations() {
-        let mut asm = EntryAssembler::new(r"^\d{4}", 500, DEFAULT_TIMEOUT).unwrap();
+        let mut asm = EntryAssembler::with_pattern(r"^\d{4}", 500, DEFAULT_TIMEOUT).unwrap();
 
         assert!(
             asm.process(b"2026-04-21 header".to_vec(), ctx(0, 18))
@@ -401,7 +424,7 @@ mod tests {
 
     #[test]
     fn invalid_utf8_line_does_not_panic() {
-        let mut asm = EntryAssembler::new(r"^\d{4}", 500, DEFAULT_TIMEOUT).unwrap();
+        let mut asm = EntryAssembler::with_pattern(r"^\d{4}", 500, DEFAULT_TIMEOUT).unwrap();
 
         // Start line is valid UTF-8 and matches.
         assert!(
@@ -422,19 +445,75 @@ mod tests {
 
     #[test]
     fn zero_max_lines_uses_default() {
-        let asm = EntryAssembler::new(r"^x", 0, Duration::from_secs(1)).unwrap();
+        let asm = EntryAssembler::with_pattern(r"^x", 0, Duration::from_secs(1)).unwrap();
         assert_eq!(asm.max_lines, DEFAULT_MAX_LINES);
     }
 
     #[test]
     fn zero_timeout_uses_default() {
-        let asm = EntryAssembler::new(r"^x", 10, Duration::ZERO).unwrap();
+        let asm = EntryAssembler::with_pattern(r"^x", 10, Duration::ZERO).unwrap();
         assert_eq!(asm.timeout, DEFAULT_TIMEOUT);
     }
 
     #[test]
     fn invalid_regex_is_rejected() {
-        assert!(EntryAssembler::new("[unclosed", 500, DEFAULT_TIMEOUT).is_err());
+        assert!(EntryAssembler::with_pattern("[unclosed", 500, DEFAULT_TIMEOUT).is_err());
+        assert!(
+            EntryAssembler::new(
+                &["^ok".to_string(), "[unclosed".to_string()],
+                500,
+                DEFAULT_TIMEOUT
+            )
+            .is_err(),
+            "one bad pattern rejects the whole set"
+        );
+    }
+
+    /// Kill-test: two programs writing distinct formats into one source. With a
+    /// single anchor only one format starts events and every line of the other
+    /// is glued onto the wrong event; with the set, each format anchors itself.
+    #[test]
+    fn any_pattern_in_the_set_starts_an_event() {
+        let patterns = vec![
+            r"^\d{4}-\d{2}-\d{2}".to_string(),
+            r"^\S+ - - \[".to_string(),
+        ];
+        let mut asm = EntryAssembler::new(&patterns, 500, DEFAULT_TIMEOUT).unwrap();
+
+        assert!(
+            asm.process(b"2026-08-06 INFO app started".to_vec(), ctx(0, 1))
+                .is_none()
+        );
+        assert!(
+            asm.process(b"    at Worker#run".to_vec(), ctx(1, 2))
+                .is_none()
+        );
+
+        // An access-log line matches the second pattern, so it closes the app
+        // event instead of extending it.
+        let (event, meta) = asm
+            .process(b"10.0.0.7 - - [06/Aug/2026] GET /".to_vec(), ctx(2, 3))
+            .expect("a line matching any pattern flushes the prior event");
+        assert_eq!(event, b"2026-08-06 INFO app started\n    at Worker#run");
+        assert_eq!(meta.line_count, 2);
+
+        let (event, _) = asm
+            .process(b"2026-08-06 INFO next".to_vec(), ctx(3, 4))
+            .expect("the access line is its own event");
+        assert_eq!(event, b"10.0.0.7 - - [06/Aug/2026] GET /");
+    }
+
+    #[test]
+    fn single_pattern_set_matches_the_convenience_ctor() {
+        let from_set = EntryAssembler::new(&[r"^\d{4}".to_string()], 500, DEFAULT_TIMEOUT).unwrap();
+        let from_one = EntryAssembler::with_pattern(r"^\d{4}", 500, DEFAULT_TIMEOUT).unwrap();
+
+        for line in [b"2026 start".as_slice(), b"    continuation".as_slice()] {
+            assert_eq!(
+                from_set.start_patterns.is_match(&lossy(line)),
+                from_one.start_patterns.is_match(&lossy(line))
+            );
+        }
     }
 
     #[test]
@@ -449,11 +528,7 @@ mod tests {
     /// is the assembler the wire uses, so this proves sample==wire for multiline.
     #[test]
     fn assemble_batch_matches_streaming_assembler() {
-        let cfg = MultilineConfig {
-            start_pattern: r"^\d{4}-\d{2}-\d{2}".to_string(),
-            max_lines: 500,
-            timeout_secs: 5,
-        };
+        let cfg = MultilineConfig::from_patterns(vec![r"^\d{4}-\d{2}-\d{2}".to_string()], 500, 5);
         let lines = vec![
             b"2026-07-13 INFO starting up".to_vec(),
             b"    with a continuation".to_vec(),
@@ -465,8 +540,7 @@ mod tests {
         // Wire reference: drive EntryAssembler directly, exactly like the
         // streaming path, then flush the trailing event.
         let mut wire =
-            EntryAssembler::new(&cfg.start_pattern, cfg.max_lines as usize, DEFAULT_TIMEOUT)
-                .unwrap();
+            EntryAssembler::new(cfg.patterns(), cfg.max_lines as usize, DEFAULT_TIMEOUT).unwrap();
         let mut wire_events = Vec::new();
         for (i, line) in lines.iter().enumerate() {
             let ctx = ctx(i as u64, i as u64 + 1);
@@ -492,7 +566,8 @@ mod tests {
 
     #[test]
     fn empty_buffer_check_timeout_returns_none() {
-        let mut asm = EntryAssembler::new(r"^\d{4}", 500, Duration::from_millis(10)).unwrap();
+        let mut asm =
+            EntryAssembler::with_pattern(r"^\d{4}", 500, Duration::from_millis(10)).unwrap();
         std::thread::sleep(Duration::from_millis(20));
         assert!(asm.check_timeout().is_none());
     }

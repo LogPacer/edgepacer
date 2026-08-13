@@ -14,6 +14,20 @@ const UNIT_SUFFIXES: &[&str] = &[
     ".scope",
 ];
 
+/// The units this agent and its manager run under.
+///
+/// Their output is the agent's own log. Collecting it closes a loop —
+/// shipping logs writes logs about shipping, which are then shipped — and
+/// sampling it teaches the control plane the agent's own line format instead
+/// of a source's, which is exactly what format detection must not learn.
+const AGENT_UNITS: &[&str] = &["edgepacer.service", "edgepacer-manager.service"];
+
+/// Whether a unit is one the agent itself runs under.
+pub fn is_agent_unit(identifier: &str) -> bool {
+    let unit = canonical_unit(identifier);
+    AGENT_UNITS.iter().any(|own| unit.eq_ignore_ascii_case(own))
+}
+
 /// Heuristic: identifier is a systemd unit when it has a known unit suffix
 /// and no path separators. Mirrors the agent's discovery taxonomy
 /// (loggable_type=systemd_service in Rails).
@@ -62,6 +76,18 @@ mod tests {
         // native exact `_SYSTEMD_UNIT` match sees the same effective unit.
         assert_eq!(canonical_unit("nginx"), "nginx.service");
         assert_eq!(canonical_unit("foo@bar"), "foo@bar.service");
+    }
+
+    #[test]
+    fn agent_units_are_recognised_by_bare_or_suffixed_name() {
+        assert!(is_agent_unit("edgepacer.service"));
+        assert!(is_agent_unit("edgepacer"));
+        assert!(is_agent_unit("edgepacer-manager.service"));
+
+        // Negative control: a source whose name merely resembles the agent's
+        // must keep being collected.
+        assert!(!is_agent_unit("edgepacer-proxy.service"));
+        assert!(!is_agent_unit("nginx.service"));
     }
 
     #[test]

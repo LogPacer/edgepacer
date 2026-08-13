@@ -17,6 +17,7 @@ use tokio::time::MissedTickBehavior;
 use tracing::{debug, error, info, warn};
 
 use crate::config::MultilineConfig;
+use crate::cri::LogStream;
 use crate::streaming_actor::StreamHandle;
 use crate::streaming_checkpoint::StreamingCheckpoint;
 use crate::streaming_multiline::{StreamingEmit, StreamingEntryAssembler};
@@ -35,6 +36,19 @@ pub(crate) enum DockerStreamEnd {
     ContainerStopped,
     /// The Docker API returned 404 for this container: it's gone.
     ContainerNotFound,
+}
+
+/// Which container output stream a Docker API frame came from. The API keeps
+/// stdout and stderr in separate frames; keeping the tag is what lets a stack
+/// trace on stderr assemble while stdout lines arrive between its frames.
+fn log_output_stream(output: &bollard::container::LogOutput) -> LogStream {
+    use bollard::container::LogOutput;
+
+    match output {
+        LogOutput::StdOut { .. } => LogStream::Stdout,
+        LogOutput::StdErr { .. } => LogStream::Stderr,
+        LogOutput::StdIn { .. } | LogOutput::Console { .. } => LogStream::Unspecified,
+    }
 }
 
 /// True for the 404 the Docker API returns when a container id no longer
@@ -227,8 +241,10 @@ pub async fn stream_container_logs(
             item = stream.next() => {
                 match item {
                     Some(Ok(output)) => {
+                        let stream = log_output_stream(&output);
                         let raw = output.to_string();
                         let (timestamp, line) = parse_docker_log_line(&raw);
+                        let line = crate::ansi::strip_str(line);
 
                         if line.is_empty() {
                             continue;
@@ -255,7 +271,13 @@ pub async fn stream_container_logs(
                         });
 
                         match assembler
-                            .process_line(handle, line.as_bytes().to_vec(), now_ns, checkpoint)
+                            .process_stream_line(
+                                handle,
+                                stream,
+                                line.as_bytes().to_vec(),
+                                now_ns,
+                                checkpoint,
+                            )
                             .await
                         {
                             Ok(emit) => {

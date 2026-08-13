@@ -31,7 +31,7 @@ use std::time::Duration;
 #[cfg(target_os = "linux")]
 use tokio::time::MissedTickBehavior;
 
-pub use unit::is_systemd_unit;
+pub use unit::{is_agent_unit, is_systemd_unit};
 
 /// Checkpoint every N emitted entries. One definition, shared by both backends.
 const CHECKPOINT_INTERVAL: u64 = 100;
@@ -52,10 +52,11 @@ fn is_blank(message: &str) -> bool {
     message.trim().is_empty()
 }
 
-/// Decode raw MESSAGE bytes exactly as the native backend does — lossy UTF-8 —
-/// and drop blanks. `None` means "skip this entry".
+/// Decode raw MESSAGE bytes exactly as the native backend does — lossy UTF-8,
+/// terminal escapes stripped — and drop blanks. `None` means "skip this entry".
 fn decode_message(message_bytes: &[u8]) -> Option<String> {
-    let message = String::from_utf8_lossy(message_bytes).into_owned();
+    let message = String::from_utf8_lossy(message_bytes);
+    let message = crate::ansi::strip_str(&message).into_owned();
     if is_blank(&message) {
         None
     } else {

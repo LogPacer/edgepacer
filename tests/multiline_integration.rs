@@ -17,7 +17,7 @@ use edgepacer::entry_assembler::{EntryAssembler, LineContext};
 /// followed by a new header line — flushes the stack trace as ONE event.
 #[test]
 fn stack_trace_aggregates_into_single_buffered_event() {
-    let mut asm = EntryAssembler::new(r"^\d{4}-\d{2}-\d{2}", 500, Duration::from_secs(5))
+    let mut asm = EntryAssembler::with_pattern(r"^\d{4}-\d{2}-\d{2}", 500, Duration::from_secs(5))
         .expect("regex compiles");
 
     let lines: Vec<(&[u8], u64, u64)> = vec![
@@ -77,7 +77,7 @@ fn checkpoint_cannot_advance_past_buffered_lines() {
     let dir = tempfile::tempdir().unwrap();
     let buf_path = dir.path().join("buf.redb");
 
-    let mut asm = EntryAssembler::new(r"^HEAD", 500, Duration::from_secs(5)).unwrap();
+    let mut asm = EntryAssembler::with_pattern(r"^HEAD", 500, Duration::from_secs(5)).unwrap();
     let mut buffer = DiskBuffer::open(&buf_path, 10).unwrap();
     let mut tracker = BatchTracker::new();
 
@@ -141,7 +141,7 @@ fn checkpoint_cannot_advance_past_buffered_lines() {
 /// keep lines stuck in the aggregator indefinitely.
 #[test]
 fn idle_timeout_emits_buffered_event() {
-    let mut asm = EntryAssembler::new(r"^START", 500, Duration::from_millis(40)).unwrap();
+    let mut asm = EntryAssembler::with_pattern(r"^START", 500, Duration::from_millis(40)).unwrap();
 
     let ctx = LineContext {
         start_offset: 0,

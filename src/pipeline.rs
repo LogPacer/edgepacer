@@ -28,6 +28,7 @@ use crate::buffer::{DiskBuffer, Durability};
 use crate::checkpoint::{Checkpoint, CheckpointStore};
 use crate::config::{FileSourceFormat, MultilineConfig};
 use crate::container_reader::ContainerReader;
+use crate::cri::{DockerJsonReassembler, LogStream};
 use crate::entry_assembler::{EntryAssembler, EventMetadata, LineContext};
 use crate::overflow::SharedOverflow;
 use crate::shipper::{CappedShipOutcome, Shipper};
@@ -57,13 +58,16 @@ pub(crate) fn ship_batch_max_bytes_for(override_mb: Option<u64>) -> usize {
 /// File-backed reader used by the delivery pipeline.
 enum LogTailer {
     File(FileTailer),
-    DockerJson(FileTailer),
+    DockerJson(FileTailer, DockerJsonReassembler),
     Kubernetes(ContainerReader),
 }
 
 struct TailedLine {
     payload: Vec<u8>,
     source_len: u64,
+    /// Which container output stream produced the line. Plain files are
+    /// single-stream and always `Unspecified`.
+    stream: LogStream,
 }
 
 /// The exact Docker json-file payload the wire ships for a raw line — the
@@ -71,7 +75,11 @@ struct TailedLine {
 /// extraction equals the shipping path's byte-for-byte.
 #[cfg(test)]
 pub(crate) fn docker_json_wire_payload(raw: Vec<u8>) -> Vec<u8> {
-    docker_json_payload_line(raw).payload
+    DockerJsonReassembler::default()
+        .push(raw)
+        .map(docker_json_tailed_line)
+        .expect("a newline-terminated record is a complete line")
+        .payload
 }
 
 impl LogTailer {
@@ -82,23 +90,35 @@ impl LogTailer {
                 .into_iter()
                 .map(line_with_payload_as_source)
                 .collect()),
-            Self::DockerJson(t) => Ok(t
+            Self::DockerJson(t, reassembler) => Ok(t
                 .read_lines(max_lines)?
                 .into_iter()
-                .map(docker_json_payload_line)
+                .filter_map(|raw| reassembler.push(raw))
+                .map(docker_json_tailed_line)
                 .collect()),
             Self::Kubernetes(t) => Ok(t
                 .read_lines(max_lines)?
                 .into_iter()
-                .map(line_with_payload_as_source)
+                .map(container_tailed_line)
                 .collect()),
         }
     }
 
     fn position(&self) -> crate::tailer::ReadPosition {
         match self {
-            Self::File(t) | Self::DockerJson(t) => t.position(),
+            Self::File(t) | Self::DockerJson(t, _) => t.position(),
             Self::Kubernetes(t) => t.position(),
+        }
+    }
+
+    /// Raw bytes the reader has consumed for fragments that have not yet
+    /// completed a line. They sit inside `position().offset` but no emitted
+    /// line spans them, so byte accounting must stay behind them.
+    fn pending_partial_bytes(&self) -> u64 {
+        match self {
+            Self::File(_) => 0,
+            Self::DockerJson(_, reassembler) => reassembler.pending_bytes(),
+            Self::Kubernetes(t) => t.pending_partial_bytes(),
         }
     }
 }
@@ -106,25 +126,33 @@ impl LogTailer {
 fn line_with_payload_as_source(payload: Vec<u8>) -> TailedLine {
     TailedLine {
         source_len: payload.len() as u64 + 1,
-        payload,
+        payload: crate::ansi::strip_owned(payload),
+        stream: LogStream::Unspecified,
     }
 }
 
-fn docker_json_payload_line(raw: Vec<u8>) -> TailedLine {
-    let source_len = raw.len() as u64 + 1;
-    let payload = crate::cri::parse_docker_json_line(&raw)
-        .map(|(payload, _)| payload)
-        .unwrap_or(raw);
+fn docker_json_tailed_line(line: crate::cri::DockerJsonLine) -> TailedLine {
     TailedLine {
-        payload,
-        source_len,
+        payload: crate::ansi::strip_owned(line.payload),
+        source_len: line.source_len,
+        stream: line.stream,
+    }
+}
+
+fn container_tailed_line(line: crate::container_reader::ContainerLine) -> TailedLine {
+    TailedLine {
+        payload: line.message,
+        source_len: line.source_len,
+        stream: line.stream,
     }
 }
 
 fn file_tailer_for_format(source_format: FileSourceFormat, tailer: FileTailer) -> LogTailer {
     match source_format {
         FileSourceFormat::Plain => LogTailer::File(tailer),
-        FileSourceFormat::DockerJson => LogTailer::DockerJson(tailer),
+        FileSourceFormat::DockerJson => {
+            LogTailer::DockerJson(tailer, DockerJsonReassembler::default())
+        }
         FileSourceFormat::KubernetesCri => {
             unreachable!("Kubernetes CRI sources use ContainerReader")
         }
@@ -190,13 +218,80 @@ pub struct DeliveryPipeline {
     overflow: Option<Arc<SharedOverflow>>,
     /// Whether reads are paused due to backpressure.
     blocked: bool,
-    /// Optional multi-line assembler. When present, raw tailed lines are
-    /// fed through it and only complete events are enqueued to the buffer.
-    assembler: Option<EntryAssembler>,
+    /// Optional multi-line assembly. When present, raw tailed lines are fed
+    /// through the assembler for their stream and only complete events are
+    /// enqueued to the buffer.
+    assemblers: Option<StreamAssemblers>,
     /// Running estimate of the current tailer file offset used to assign
     /// per-line byte ranges to EntryAssembler. Updated after each read
     /// cycle from the tailer's authoritative `position()`.
     running_offset: u64,
+}
+
+/// One multi-line assembler per container output stream.
+///
+/// stdout and stderr are separate conversations that happen to share a file. A
+/// single assembler would let a request logged on stdout land in the middle of
+/// a stack trace on stderr and close it early — or worse, become one of its
+/// lines. Each stream buffers its own in-progress event; assemblers are created
+/// on first sight of a stream, so a plain file only ever owns one.
+struct StreamAssemblers {
+    patterns: Vec<String>,
+    max_lines: usize,
+    timeout: Duration,
+    per_stream: Vec<(LogStream, EntryAssembler)>,
+}
+
+impl StreamAssemblers {
+    /// Compile the pattern set once up front, so an invalid regex fails the
+    /// pipeline at open rather than on the first line of a second stream.
+    fn new(cfg: &MultilineConfig) -> Result<Self, regex::Error> {
+        let timeout = Duration::from_secs(cfg.timeout_secs.max(1) as u64);
+        let max_lines = cfg.max_lines as usize;
+        let patterns = cfg.patterns().to_vec();
+        let first = EntryAssembler::new(&patterns, max_lines, timeout)?;
+
+        Ok(Self {
+            patterns,
+            max_lines,
+            timeout,
+            per_stream: vec![(LogStream::Unspecified, first)],
+        })
+    }
+
+    fn for_stream(&mut self, stream: LogStream) -> &mut EntryAssembler {
+        if let Some(index) = self
+            .per_stream
+            .iter()
+            .position(|(candidate, _)| *candidate == stream)
+        {
+            return &mut self.per_stream[index].1;
+        }
+
+        let assembler = EntryAssembler::new(&self.patterns, self.max_lines, self.timeout)
+            .expect("pattern set already compiled at pipeline open");
+        self.per_stream.push((stream, assembler));
+        &mut self
+            .per_stream
+            .last_mut()
+            .expect("just pushed an assembler for this stream")
+            .1
+    }
+
+    fn iter_mut(&mut self) -> impl Iterator<Item = &mut EntryAssembler> {
+        self.per_stream.iter_mut().map(|(_, assembler)| assembler)
+    }
+
+    /// The lowest start offset still buffered across every stream, or `None`
+    /// when all streams are idle. The checkpoint may never pass it: an event
+    /// completing on one stream says nothing about the lines another stream is
+    /// still holding, and those lines have not been shipped.
+    fn buffered_start_offset(&self) -> Option<u64> {
+        self.per_stream
+            .iter()
+            .filter_map(|(_, assembler)| assembler.buffered_start_offset())
+            .min()
+    }
 }
 
 /// Grouped inputs for opening a pipeline. Keeps the internal open path to a
@@ -385,13 +480,9 @@ impl DeliveryPipeline {
             }
         };
 
-        let assembler = match multiline {
+        let assemblers = match multiline {
             Some(cfg) => {
-                let timeout = Duration::from_secs(cfg.timeout_secs.max(1) as u64);
-                Some(
-                    EntryAssembler::new(&cfg.start_pattern, cfg.max_lines as usize, timeout)
-                        .map_err(PipelineError::InvalidMultilinePattern)?,
-                )
+                Some(StreamAssemblers::new(cfg).map_err(PipelineError::InvalidMultilinePattern)?)
             }
             None => None,
         };
@@ -409,7 +500,7 @@ impl DeliveryPipeline {
             source_id: source_id.to_string(),
             overflow,
             blocked: false,
-            assembler,
+            assemblers,
             running_offset: starting_offset,
         })
     }
@@ -476,21 +567,26 @@ impl DeliveryPipeline {
         let pos = self.tailer.position();
         let now_ns = now_nanos();
 
-        if self.assembler.is_none() {
+        // Fragments the reader consumed but has not yet turned into a line sit
+        // inside `pos.offset`; the line spanning them is still to come, so byte
+        // accounting resumes behind them.
+        let next_offset = pos
+            .offset
+            .saturating_sub(self.tailer.pending_partial_bytes());
+
+        if self.assemblers.is_none() {
             // Fast path: no aggregation, enqueue raw lines as before.
             let count = lines.len();
             let batch_bytes: u64 = lines.iter().map(|l| l.source_len).sum();
-            let start_offset = pos.offset.saturating_sub(batch_bytes);
+            let start_offset = next_offset.saturating_sub(batch_bytes);
 
-            self.enqueue_batch(lines, start_offset, pos.offset, pos.inode, now_ns, count);
-            self.running_offset = pos.offset;
+            self.enqueue_batch(lines, start_offset, next_offset, pos.inode, now_ns, count);
+            self.running_offset = next_offset;
             return;
         }
 
-        // Aggregation path: feed each line through the assembler, collecting
-        // any events it emits. Per-line byte ranges are approximated using
-        // `line.len() + 1` for the trailing newline — matches the rest of
-        // pipeline.rs's offset arithmetic.
+        // Aggregation path: feed each line through its stream's assembler,
+        // collecting any events they emit.
         let mut running = self.running_offset;
         let mut emitted: Vec<(Vec<u8>, EventMetadata)> = Vec::new();
         for line in lines {
@@ -502,15 +598,16 @@ impl DeliveryPipeline {
             };
             running += line_len;
             if let Some(event) = self
-                .assembler
+                .assemblers
                 .as_mut()
-                .expect("assembler checked above")
+                .expect("assemblers checked above")
+                .for_stream(line.stream)
                 .process(line.payload, ctx)
             {
                 emitted.push(event);
             }
         }
-        self.running_offset = pos.offset;
+        self.running_offset = next_offset;
 
         if emitted.is_empty() {
             return;
@@ -670,13 +767,18 @@ impl DeliveryPipeline {
     /// the in-progress event if no new line has arrived within
     /// `timeout_secs`, so idle events don't sit buffered forever.
     fn assembler_check_cycle(&mut self) {
-        let Some(asm) = self.assembler.as_mut() else {
+        let Some(assemblers) = self.assemblers.as_mut() else {
             return;
         };
-        if let Some(event) = asm.check_timeout() {
-            let pos = self.tailer.position();
-            self.enqueue_events(vec![event], pos.inode, now_nanos());
+        let timed_out: Vec<(Vec<u8>, EventMetadata)> = assemblers
+            .iter_mut()
+            .filter_map(EntryAssembler::check_timeout)
+            .collect();
+        if timed_out.is_empty() {
+            return;
         }
+        let pos = self.tailer.position();
+        self.enqueue_events(timed_out, pos.inode, now_nanos());
     }
 
     fn spill_to_overflow(&self, lines: &[Vec<u8>], now_ns: i64) -> usize {
@@ -826,15 +928,33 @@ impl DeliveryPipeline {
         }
     }
 
+    /// The furthest offset a checkpoint may reach right now.
+    ///
+    /// Delivering an event proves nothing about lines another stream is still
+    /// buffering: with stdout and stderr interleaved, a stdout event can
+    /// complete and be acked while an earlier stderr line sits unshipped in its
+    /// assembler. Checkpointing past it would skip it on restart, so the
+    /// checkpoint is capped at the oldest buffered line across all streams.
+    fn checkpoint_ceiling(&self) -> Option<u64> {
+        self.assemblers
+            .as_ref()
+            .and_then(StreamAssemblers::buffered_start_offset)
+    }
+
     /// Flush checkpoint if consecutive-ack rule allows advancement.
     fn checkpoint_cycle(&mut self) {
         let Some(safe_cp) = self.tracker.safe_checkpoint() else {
             return;
         };
 
+        let offset = match self.checkpoint_ceiling() {
+            Some(ceiling) => safe_cp.offset.min(ceiling),
+            None => safe_cp.offset,
+        };
+
         let checkpoint = Checkpoint {
             path: self.file_path.clone(),
-            offset: safe_cp.offset,
+            offset,
             inode: safe_cp.inode,
             updated_at: SystemTime::now(),
             streaming: None,
@@ -845,11 +965,7 @@ impl DeliveryPipeline {
             return;
         }
 
-        debug!(
-            offset = safe_cp.offset,
-            inode = safe_cp.inode,
-            "checkpoint advanced"
-        );
+        debug!(offset, inode = safe_cp.inode, "checkpoint advanced");
         self.tracker.drain_acked();
     }
 
@@ -857,12 +973,16 @@ impl DeliveryPipeline {
     async fn shutdown(&mut self) {
         self.read_cycle(); // capture trailing lines
 
-        // Flush any in-progress multi-line event so it isn't lost.
-        if let Some(asm) = self.assembler.as_mut()
-            && let Some(event) = asm.flush()
-        {
-            let pos = self.tailer.position();
-            self.enqueue_events(vec![event], pos.inode, now_nanos());
+        // Flush every stream's in-progress event so none is lost.
+        if let Some(assemblers) = self.assemblers.as_mut() {
+            let remaining: Vec<(Vec<u8>, EventMetadata)> = assemblers
+                .iter_mut()
+                .filter_map(EntryAssembler::flush)
+                .collect();
+            if !remaining.is_empty() {
+                let pos = self.tailer.position();
+                self.enqueue_events(remaining, pos.inode, now_nanos());
+            }
         }
 
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
@@ -931,6 +1051,14 @@ mod tests {
         lines.into_iter().map(line_with_payload_as_source).collect()
     }
 
+    /// One complete json-file line, as the Docker lane produces it.
+    fn docker_json_line(raw: Vec<u8>) -> TailedLine {
+        DockerJsonReassembler::default()
+            .push(raw)
+            .map(docker_json_tailed_line)
+            .expect("a newline-terminated record is a complete line")
+    }
+
     #[test]
     fn sanitize_paths() {
         assert_eq!(sanitize_filename("/var/log/app.log"), "var_log_app_log");
@@ -941,10 +1069,257 @@ mod tests {
     fn docker_json_payload_strips_wrapper_and_keeps_source_length() {
         let raw = br#"{"log":"http: TLS handshake error\n","stream":"stdout","time":"2026-07-04T23:35:09.566698461Z"}"#.to_vec();
 
-        let line = docker_json_payload_line(raw.clone());
+        let line = docker_json_line(raw.clone());
 
         assert_eq!(line.payload, b"http: TLS handshake error");
         assert_eq!(line.source_len, raw.len() as u64 + 1);
+    }
+
+    /// Kill-test: a colourised source must reach the assembler as plain text.
+    /// Before stripping, the leading SGR code sat in front of the timestamp, so
+    /// a pattern mined from the source's plain text matched nothing and the
+    /// whole stream folded into one event.
+    #[test]
+    fn coloured_lines_are_stripped_before_assembly_and_shipping() {
+        let anchor = regex::Regex::new(r"^\d{4}-").unwrap();
+
+        let coloured = "\x1b[2m2026-08-06T15:03:17Z\x1b[0m \x1b[32m INFO\x1b[0m msg";
+        let plain = line_with_payload_as_source(coloured.as_bytes().to_vec());
+        assert_eq!(plain.payload, b"2026-08-06T15:03:17Z  INFO msg");
+        assert!(anchor.is_match(&String::from_utf8_lossy(&plain.payload)));
+        assert_eq!(
+            plain.source_len,
+            coloured.len() as u64 + 1,
+            "offsets still span the raw bytes read from the file"
+        );
+
+        // Docker escapes the ESC byte as \u001b inside the json-file wrapper.
+        let raw = br#"{"log":"\u001b[36m2026-08-06T15:03:17Z\u001b[0m boot\n","stream":"stdout","time":"2026-08-06T15:03:17Z"}"#.to_vec();
+        let source_len = raw.len() as u64 + 1;
+        let wrapped = docker_json_line(raw);
+        assert_eq!(wrapped.payload, b"2026-08-06T15:03:17Z boot");
+        assert!(anchor.is_match(&String::from_utf8_lossy(&wrapped.payload)));
+        assert_eq!(wrapped.source_len, source_len);
+    }
+
+    /// Kill-test: a container writing two programs' output into one json-file.
+    /// Each stream must assemble on its own, and — the harder half — a stdout
+    /// event completing and being delivered must NOT carry the checkpoint past
+    /// a stderr line still buffered behind it. With one shared assembler the
+    /// stdout line joined the stderr event; with per-stream assemblers but no
+    /// checkpoint ceiling, the resume point skipped the buffered stderr line.
+    #[tokio::test]
+    async fn per_stream_assembly_keeps_the_checkpoint_behind_a_buffered_line() {
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/wire"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_raw(encoded_wire_response(1, 0, ""), "application/x-protobuf"),
+            )
+            .mount(&mock_server)
+            .await;
+
+        let dir = tempfile::tempdir().unwrap();
+        let log_path = dir.path().join("container-json.log");
+        std::fs::write(&log_path, "").unwrap();
+
+        let shipper = Shipper::new(
+            &format!("{}/wire", mock_server.uri()),
+            "arc_stream",
+            "repo_stream",
+            None,
+        )
+        .unwrap();
+        let multiline =
+            MultilineConfig::from_patterns(vec![r"^\d{4}-\d{2}-\d{2}".to_string()], 500, 5);
+        let mut pipeline = DeliveryPipeline::open_file_source(
+            log_path.to_str().unwrap(),
+            dir.path(),
+            shipper,
+            PipelineConfig {
+                // One entry per request keeps the mock's accepted count exact.
+                ship_batch_size: 1,
+                ship_batch_max: 1,
+                ship_batch_max_bytes: usize::MAX,
+                ..Default::default()
+            },
+            PipelineSourceOptions {
+                multiline: Some(&multiline),
+                source_id: "container-src",
+                overflow: None,
+                source_format: FileSourceFormat::DockerJson,
+            },
+        )
+        .unwrap();
+
+        // The tailer opened at end-of-file, so append the fixture now. stderr
+        // opens an event, then stdout's two lines interleave with it.
+        let record = |stream: &str, text: &str| {
+            format!(
+                "{}\n",
+                serde_json::json!({
+                    "log": format!("{text}\n"),
+                    "stream": stream,
+                    "time": "2026-08-06T15:03:17Z",
+                })
+            )
+        };
+        let records = [
+            record("stderr", "2026-08-06 ERROR boom"),
+            record("stdout", "2026-08-06 INFO one"),
+            record("stdout", "2026-08-06 INFO two"),
+        ];
+        std::fs::write(&log_path, records.concat()).unwrap();
+        let stderr_line_start = 0u64;
+        let total_bytes: u64 = records.iter().map(|r| r.len() as u64).sum();
+
+        pipeline.read_cycle();
+
+        let buffered: Vec<Vec<u8>> = pipeline
+            .buffer
+            .peek(10)
+            .unwrap()
+            .into_iter()
+            .map(|entry| entry.data)
+            .collect();
+        assert_eq!(
+            buffered,
+            vec![b"2026-08-06 INFO one".to_vec()],
+            "the stdout event closes on the next stdout line and excludes the stderr line"
+        );
+
+        pipeline.drain_cycle().await;
+        pipeline.checkpoint_cycle();
+
+        let checkpoint = pipeline
+            .checkpoint_store
+            .load(&pipeline.file_path)
+            .unwrap()
+            .expect("checkpoint saved");
+        assert_eq!(
+            checkpoint.offset, stderr_line_start,
+            "the delivered stdout event must not carry the checkpoint past the buffered stderr line"
+        );
+
+        // Shutdown flushes both streams; with nothing buffered the checkpoint
+        // is free to reach the end of the file.
+        pipeline.shutdown().await;
+
+        let shipped: Vec<Vec<u8>> = pipeline
+            .buffer
+            .peek(10)
+            .unwrap()
+            .into_iter()
+            .map(|entry| entry.data)
+            .collect();
+        assert!(shipped.is_empty(), "shutdown drains the buffer");
+
+        let checkpoint = pipeline
+            .checkpoint_store
+            .load(&pipeline.file_path)
+            .unwrap()
+            .expect("checkpoint saved");
+        assert_eq!(
+            checkpoint.offset, total_bytes,
+            "once every stream is flushed the checkpoint reaches the file end"
+        );
+    }
+
+    /// Kill-test: Docker chunks a line longer than 16K into several json
+    /// records, only the last of which ends in a newline. The chunks must
+    /// rejoin into one entry, and the bytes consumed by a chunk still waiting
+    /// for its terminator must not count toward the checkpoint — otherwise the
+    /// rejoined entry's range starts too late and the resume point overshoots
+    /// the end of the file.
+    #[tokio::test]
+    async fn docker_json_split_line_rejoins_without_overshooting_the_checkpoint() {
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/wire"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_raw(encoded_wire_response(1, 0, ""), "application/x-protobuf"),
+            )
+            .mount(&mock_server)
+            .await;
+
+        let dir = tempfile::tempdir().unwrap();
+        let log_path = dir.path().join("chunked-json.log");
+        std::fs::write(&log_path, "").unwrap();
+
+        let shipper = Shipper::new(
+            &format!("{}/wire", mock_server.uri()),
+            "arc_chunk",
+            "repo_chunk",
+            None,
+        )
+        .unwrap();
+        let multiline =
+            MultilineConfig::from_patterns(vec![r"^\d{4}-\d{2}-\d{2}".to_string()], 500, 5);
+        let mut pipeline = DeliveryPipeline::open_file_source(
+            log_path.to_str().unwrap(),
+            dir.path(),
+            shipper,
+            PipelineConfig {
+                ship_batch_size: 1,
+                ship_batch_max: 1,
+                ship_batch_max_bytes: usize::MAX,
+                ..Default::default()
+            },
+            PipelineSourceOptions {
+                multiline: Some(&multiline),
+                source_id: "chunked-src",
+                overflow: None,
+                source_format: FileSourceFormat::DockerJson,
+            },
+        )
+        .unwrap();
+
+        let first = "{\"log\":\"2026-08-06 ERROR first half \",\"stream\":\"stdout\",\"time\":\"2026-08-06T15:03:17Z\"}\n";
+        let second = "{\"log\":\"second half\\n\",\"stream\":\"stdout\",\"time\":\"2026-08-06T15:03:17Z\"}\n";
+
+        std::fs::write(&log_path, first).unwrap();
+        pipeline.read_cycle();
+        assert!(
+            pipeline.buffer.peek(10).unwrap().is_empty(),
+            "a chunk without its terminating record is not a line yet"
+        );
+
+        std::fs::write(&log_path, format!("{first}{second}")).unwrap();
+        pipeline.read_cycle();
+        pipeline.shutdown().await;
+
+        let checkpoint = pipeline
+            .checkpoint_store
+            .load(&pipeline.file_path)
+            .unwrap()
+            .expect("checkpoint saved");
+        assert_eq!(
+            checkpoint.offset,
+            (first.len() + second.len()) as u64,
+            "the rejoined entry spans both records and stops at the end of the file"
+        );
+
+        let request = &mock_server.received_requests().await.unwrap()[0];
+        let shipped = crate::test_support::decode_gzip_wire_request(request);
+        assert_eq!(
+            shipped
+                .batches
+                .iter()
+                .filter_map(|batch| match batch.payload.as_ref()? {
+                    logpacer_wire::routed_batch::Payload::Logs(logs) => Some(logs),
+                    _ => None,
+                })
+                .flat_map(|logs| logs.entries.iter())
+                .map(|entry| match entry.body.as_ref().unwrap() {
+                    logpacer_wire::wire_log_event::Body::RawText(text) => text.clone(),
+                    other => panic!("expected raw text, got {other:?}"),
+                })
+                .collect::<Vec<String>>(),
+            vec!["2026-08-06 ERROR first half second half".to_string()],
+            "the chunks ship as one entry, not two"
+        );
     }
 
     #[tokio::test]

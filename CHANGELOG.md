@@ -2,6 +2,28 @@
 
 ## Unreleased
 
+- Multiline aggregation accepts an ordered `start_patterns` set instead of a
+  single anchor, so a source carrying several line formats at once anchors
+  each of them rather than gluing the unmatched formats onto the wrong event.
+  The singular `start_pattern` is still accepted and hashes identically, so
+  existing sources do not reconcile.
+- Strip terminal escape sequences (colour, cursor moves, OSC) where a line
+  enters the agent, on every source path and in samples. Colour codes sit in
+  front of the bytes a start pattern anchors on, so a colourised source used
+  to collapse into one unbounded event; they were also stored and shipped for
+  nothing. Byte offsets still span the raw source bytes.
+- Assemble container multiline events per output stream. stdout and stderr
+  share one log but are separate conversations, so a request logged on stdout
+  no longer lands inside a stack trace on stderr. Resume points are held back
+  accordingly: neither the file checkpoint nor a streaming cursor advances
+  past a line another stream is still buffering.
+- Rejoin the json-file records Docker splits at 16K, per stream, so a long
+  line ships as one entry instead of several fragments.
+- Stop reporting the agent's own service units and log files as collectable
+  sources, and refuse to sample them — collecting the agent's own output
+  feeds it back into the agent, and sampling it teaches format detection the
+  agent's format instead of the source's.
+
 ## 0.2.14 - 2026-08-12
 
 - Stop double-reporting container runtime log files: file discovery now
