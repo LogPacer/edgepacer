@@ -16,6 +16,7 @@
 
 use std::path::Path;
 
+use crate::cri::LogStream;
 pub use crate::sqlite_sequence_buffer::Durability;
 use crate::sqlite_sequence_buffer::{
     SqliteSequenceBuffer, SqliteSequenceBufferConfig, SqliteSequenceBufferError,
@@ -74,20 +75,34 @@ pub struct BufferedEntry {
     pub timestamp_ns: i64,
     /// Raw log line data.
     pub data: Vec<u8>,
+    /// Which container output stream wrote the line — survives the disk
+    /// roundtrip so the wire envelope can carry it.
+    pub stream: LogStream,
 }
 
 /// Binary entry encoding: [8B timestamp_ns (big-endian i64)][4B data_len (big-endian u32)][data]
 /// Matches Go's `guaranteed_delivery_exporter.go` encoding with 12-byte overhead.
+/// A stdout/stderr entry appends one trailer byte after `data`; `data_len`
+/// excludes it, so entries written before the trailer existed (and entries
+/// from single-stream sources, which append none) decode as `Unspecified`.
 fn checked_data_len(len: usize) -> Result<u32, BufferError> {
     u32::try_from(len).map_err(|_| BufferError::EntryTooLarge { len })
 }
 
-fn encode_entry(timestamp_ns: i64, data: &[u8]) -> Result<Vec<u8>, BufferError> {
+const STREAM_TRAILER_STDOUT: u8 = 1;
+const STREAM_TRAILER_STDERR: u8 = 2;
+
+fn encode_entry(timestamp_ns: i64, data: &[u8], stream: LogStream) -> Result<Vec<u8>, BufferError> {
     let data_len = checked_data_len(data.len())?;
-    let mut buf = Vec::with_capacity(12 + data.len());
+    let mut buf = Vec::with_capacity(12 + data.len() + 1);
     buf.extend_from_slice(&timestamp_ns.to_be_bytes());
     buf.extend_from_slice(&data_len.to_be_bytes());
     buf.extend_from_slice(data);
+    match stream {
+        LogStream::Stdout => buf.push(STREAM_TRAILER_STDOUT),
+        LogStream::Stderr => buf.push(STREAM_TRAILER_STDERR),
+        LogStream::Unspecified => {}
+    }
     Ok(buf)
 }
 
@@ -100,10 +115,16 @@ fn decode_entry(sequence: u64, raw: &[u8]) -> Option<BufferedEntry> {
     if raw.len() < 12 + data_len {
         return None;
     }
+    let stream = match raw.get(12 + data_len) {
+        Some(&STREAM_TRAILER_STDOUT) => LogStream::Stdout,
+        Some(&STREAM_TRAILER_STDERR) => LogStream::Stderr,
+        _ => LogStream::Unspecified,
+    };
     Some(BufferedEntry {
         sequence,
         timestamp_ns,
         data: raw[12..12 + data_len].to_vec(),
+        stream,
     })
 }
 
@@ -193,20 +214,45 @@ impl DiskBuffer {
         lines: &[Vec<u8>],
         timestamp_ns: i64,
     ) -> Result<(u64, u64), BufferError> {
-        if lines.is_empty() {
+        self.append_encoded(
+            lines
+                .iter()
+                .map(|line| encode_entry(timestamp_ns, line, LogStream::Unspecified)),
+            lines.len(),
+        )
+    }
+
+    /// Enqueue a batch of log lines that keep the container output stream that
+    /// wrote them; the tag survives the disk roundtrip and reaches the wire.
+    pub fn enqueue_stream_batch(
+        &mut self,
+        lines: &[(Vec<u8>, LogStream)],
+        timestamp_ns: i64,
+    ) -> Result<(u64, u64), BufferError> {
+        self.append_encoded(
+            lines
+                .iter()
+                .map(|(line, stream)| encode_entry(timestamp_ns, line, *stream)),
+            lines.len(),
+        )
+    }
+
+    fn append_encoded(
+        &mut self,
+        encoded: impl Iterator<Item = Result<Vec<u8>, BufferError>>,
+        count: usize,
+    ) -> Result<(u64, u64), BufferError> {
+        if count == 0 {
             return Ok((0, 0));
         }
 
-        let encoded_entries: Vec<Vec<u8>> = lines
-            .iter()
-            .map(|line| encode_entry(timestamp_ns, line))
-            .collect::<Result<_, _>>()?;
+        let encoded_entries: Vec<Vec<u8>> = encoded.collect::<Result<_, _>>()?;
         let appended = self.core.append(&encoded_entries)?;
 
         debug!(
             first_seq = appended.first_sequence,
             last_seq = appended.last_sequence,
-            entries = lines.len(),
+            entries = count,
             bytes = appended.bytes_written,
             "batch enqueued to disk buffer"
         );
@@ -456,13 +502,53 @@ mod tests {
         let data = b"test log line with unicode: \xc3\xa9\xc3\xa0\xc3\xbc";
         let ts = 1_700_000_000_000_000_000i64;
 
-        let encoded = encode_entry(ts, data).unwrap();
+        let encoded = encode_entry(ts, data, LogStream::Unspecified).unwrap();
         assert_eq!(encoded.len(), 12 + data.len());
 
         let decoded = decode_entry(42, &encoded).unwrap();
         assert_eq!(decoded.sequence, 42);
         assert_eq!(decoded.timestamp_ns, ts);
         assert_eq!(decoded.data, data);
+        assert_eq!(decoded.stream, LogStream::Unspecified);
+    }
+
+    #[test]
+    fn stream_trailer_survives_the_disk_roundtrip() {
+        let (_dir, mut buf) = temp_buffer(10);
+
+        buf.enqueue_stream_batch(
+            &[
+                (b"out line".to_vec(), LogStream::Stdout),
+                (b"err line".to_vec(), LogStream::Stderr),
+                (b"bare line".to_vec(), LogStream::Unspecified),
+            ],
+            1000,
+        )
+        .unwrap();
+
+        let entries = buf.peek(10).unwrap();
+        assert_eq!(entries[0].data, b"out line");
+        assert_eq!(entries[0].stream, LogStream::Stdout);
+        assert_eq!(entries[1].data, b"err line");
+        assert_eq!(entries[1].stream, LogStream::Stderr);
+        assert_eq!(entries[2].data, b"bare line");
+        assert_eq!(entries[2].stream, LogStream::Unspecified);
+    }
+
+    /// Entries persisted before the stream trailer existed carry exactly
+    /// `12 + data_len` bytes; after an upgrade they must decode as untagged
+    /// rather than corrupt — the buffer replays across agent restarts.
+    #[test]
+    fn pre_trailer_entry_decodes_as_unspecified() {
+        let data = b"legacy buffered line";
+        let mut raw = Vec::new();
+        raw.extend_from_slice(&1000i64.to_be_bytes());
+        raw.extend_from_slice(&(data.len() as u32).to_be_bytes());
+        raw.extend_from_slice(data);
+
+        let decoded = decode_entry(7, &raw).unwrap();
+        assert_eq!(decoded.data, data);
+        assert_eq!(decoded.stream, LogStream::Unspecified);
     }
 
     #[test]

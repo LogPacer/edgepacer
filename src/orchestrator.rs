@@ -259,6 +259,7 @@ impl Orchestrator {
 
     fn build_shipper(
         &self,
+        log_source_id: &str,
         endpoint: &str,
         archive_id: &str,
         repo_id: &str,
@@ -266,10 +267,26 @@ impl Orchestrator {
     ) -> Result<Shipper, crate::common::EdgepacerError> {
         let identity = stamp_resource_identifier.then(|| self.identity.clone());
         match &self.counters {
-            Some(counters) => {
-                Shipper::with_counters(endpoint, archive_id, repo_id, identity, counters.clone())
-            }
+            Some(counters) => Ok(Shipper::with_counters(
+                endpoint,
+                archive_id,
+                repo_id,
+                identity,
+                counters.clone(),
+            )?
+            .with_body_variant_counters(counters.body_variants().counters_for(log_source_id))),
             None => Shipper::new(endpoint, archive_id, repo_id, identity),
+        }
+    }
+
+    /// Forget removed sources' body-variant counters so a later source reusing
+    /// the id starts at zero. Restarted sources keep theirs — the registry
+    /// entry survives and the new shipper picks it up by id.
+    fn forget_body_variants(&self, removed: &[String]) {
+        if let Some(ref counters) = self.counters {
+            for id in removed {
+                counters.body_variants().remove(id);
+            }
         }
     }
 
@@ -392,6 +409,7 @@ impl Orchestrator {
         for id in &plan.to_remove {
             info!(log_source_id = %id, "stopping removed file pipeline");
         }
+        self.forget_body_variants(&plan.to_remove);
         for id in &plan.to_restart {
             info!(log_source_id = %id, "restarting file pipeline (config changed)");
         }
@@ -442,6 +460,7 @@ impl Orchestrator {
         for id in &plan.to_remove {
             info!(log_source_id = %id, "stopping removed streaming source");
         }
+        self.forget_body_variants(&plan.to_remove);
         for id in &plan.to_restart {
             info!(log_source_id = %id, "restarting streaming source (config changed)");
         }
@@ -480,6 +499,7 @@ impl Orchestrator {
     fn start_file_pipeline(&mut self, stream: &LogStreamConfig) -> Result<(), PipelineError> {
         let shipper = self
             .build_shipper(
+                &stream.log_source_id,
                 &stream.endpoint,
                 &stream.archive_id,
                 &stream.repo_id,
@@ -542,6 +562,7 @@ impl Orchestrator {
         stream: &StreamingSourceConfig,
     ) -> Result<(), StreamingPipelineStartError> {
         let shipper = self.build_shipper(
+            &stream.log_source_id,
             &stream.endpoint,
             &stream.archive_id,
             &stream.repo_id,
@@ -966,10 +987,14 @@ mod tests {
             .with_monitoring(counters.clone(), Arc::new(ErrorCollector::new()));
 
         let shipper = orchestrator
-            .build_shipper("http://relay/wire", "arc", "repo", true)
+            .build_shipper("src-1", "http://relay/wire", "arc", "repo", true)
             .unwrap();
 
         assert!(shipper.uses_counters(&counters));
+        assert!(
+            counters.body_variants().snapshot_for("src-1").is_some(),
+            "building a monitored shipper registers the source's body-variant counters"
+        );
     }
 
     #[tokio::test]

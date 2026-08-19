@@ -12,6 +12,15 @@
 
 mod common;
 
+/// Wrap bare line bytes as untagged ship entries (single-stream sources).
+fn untagged(lines: &[Vec<u8>]) -> Vec<edgepacer::shipper::ShipEntry> {
+    lines
+        .iter()
+        .cloned()
+        .map(edgepacer::shipper::ShipEntry::untagged)
+        .collect()
+}
+
 use std::io::Write;
 use std::time::Duration;
 
@@ -361,7 +370,7 @@ async fn e2e_file_tail_to_logrelay() {
     assert_eq!(lines.len(), 3, "should read 3 lines from test file");
 
     // Ship to mock logrelay
-    let result = shipper.ship(&lines).await.unwrap();
+    let result = shipper.ship(&untagged(&lines)).await.unwrap();
     match result {
         edgepacer::shipper::ShipResult::Accepted { count } => {
             assert_eq!(count, 3, "all 3 lines should be accepted");

@@ -32,14 +32,20 @@ use tokio::task::JoinHandle;
 use tokio::time::MissedTickBehavior;
 use tracing::{info, warn};
 
+use crate::cri::LogStream;
 use crate::shipper::CappedShipOutcome;
 use crate::streaming_checkpoint::StreamingCheckpoint;
 use crate::streaming_pipeline::{DrainPrep, StreamingDeliveryPipeline};
 
 /// Commands a producer can send to the pipeline actor.
 pub(crate) enum StreamCommand {
-    /// Persist one log line to the disk buffer.
-    Enqueue { line: Vec<u8>, timestamp_ns: i64 },
+    /// Persist one log line to the disk buffer, tagged with the container
+    /// output stream that wrote it (`Unspecified` for single-stream sources).
+    Enqueue {
+        line: Vec<u8>,
+        timestamp_ns: i64,
+        stream: LogStream,
+    },
     /// Set the pending resume checkpoint (persisted only when buffer empty).
     SetCheckpoint(StreamingCheckpoint),
     /// Query the resume point: pending checkpoint, else persisted.
@@ -85,8 +91,26 @@ impl StreamHandle {
     /// backpressure point for readers. Returns `false` only when the actor is
     /// gone; the caller should stop streaming.
     pub async fn enqueue(&self, line: Vec<u8>, timestamp_ns: i64) -> bool {
+        self.enqueue_from_stream(line, timestamp_ns, LogStream::Unspecified)
+            .await
+    }
+
+    /// [`enqueue`], keeping the container output stream that wrote the line so
+    /// the wire envelope can carry it.
+    ///
+    /// [`enqueue`]: Self::enqueue
+    pub async fn enqueue_from_stream(
+        &self,
+        line: Vec<u8>,
+        timestamp_ns: i64,
+        stream: LogStream,
+    ) -> bool {
         self.tx
-            .send(StreamCommand::Enqueue { line, timestamp_ns })
+            .send(StreamCommand::Enqueue {
+                line,
+                timestamp_ns,
+                stream,
+            })
             .await
             .is_ok()
     }
@@ -95,7 +119,11 @@ impl StreamHandle {
     /// loop). Returns `false` when the channel is full or the actor is gone.
     pub fn try_enqueue(&self, line: Vec<u8>, timestamp_ns: i64) -> bool {
         self.tx
-            .try_send(StreamCommand::Enqueue { line, timestamp_ns })
+            .try_send(StreamCommand::Enqueue {
+                line,
+                timestamp_ns,
+                stream: LogStream::Unspecified,
+            })
             .is_ok()
     }
 
@@ -173,7 +201,7 @@ async fn run_actor(mut pipeline: StreamingDeliveryPipeline, mut rx: mpsc::Receiv
     // A line the buffer (and overflow) had no room for. While `Some`, command
     // intake is gated off, so the bounded channel backpressures the reader —
     // stall, never drop.
-    let mut blocked: Option<(Vec<u8>, i64)> = None;
+    let mut blocked: Option<(Vec<u8>, i64, LogStream)> = None;
 
     // When the channel is closed but a blocked line gates intake, `recv()` is
     // never polled and closure can't end the loop. If the wedge outlasts the
@@ -184,9 +212,9 @@ async fn run_actor(mut pipeline: StreamingDeliveryPipeline, mut rx: mpsc::Receiv
     loop {
         tokio::select! {
             cmd = rx.recv(), if blocked.is_none() => match cmd {
-                Some(StreamCommand::Enqueue { line, timestamp_ns }) => {
-                    if !pipeline.enqueue(&line, timestamp_ns) {
-                        blocked = Some((line, timestamp_ns));
+                Some(StreamCommand::Enqueue { line, timestamp_ns, stream }) => {
+                    if !pipeline.enqueue(&line, timestamp_ns, stream) {
+                        blocked = Some((line, timestamp_ns, stream));
                     }
                 }
                 Some(StreamCommand::SetCheckpoint(checkpoint)) => {
@@ -260,8 +288,12 @@ fn drain_remaining_commands(
 ) {
     while let Ok(cmd) = rx.try_recv() {
         match cmd {
-            StreamCommand::Enqueue { line, timestamp_ns } => {
-                if !pipeline.enqueue(&line, timestamp_ns) {
+            StreamCommand::Enqueue {
+                line,
+                timestamp_ns,
+                stream,
+            } => {
+                if !pipeline.enqueue(&line, timestamp_ns, stream) {
                     warn!("dropping remaining commands at shutdown (buffer and overflow full)");
                     return;
                 }
@@ -290,11 +322,14 @@ async fn poll_inflight(inflight: &mut Option<ShipFuture>) -> CappedShipOutcome {
 }
 
 /// Re-attempt the stashed line once; un-gates command intake on success.
-fn retry_blocked(pipeline: &mut StreamingDeliveryPipeline, blocked: &mut Option<(Vec<u8>, i64)>) {
-    if let Some((line, timestamp_ns)) = blocked.take()
-        && !pipeline.enqueue(&line, timestamp_ns)
+fn retry_blocked(
+    pipeline: &mut StreamingDeliveryPipeline,
+    blocked: &mut Option<(Vec<u8>, i64, LogStream)>,
+) {
+    if let Some((line, timestamp_ns, stream)) = blocked.take()
+        && !pipeline.enqueue(&line, timestamp_ns, stream)
     {
-        *blocked = Some((line, timestamp_ns));
+        *blocked = Some((line, timestamp_ns, stream));
     }
 }
 

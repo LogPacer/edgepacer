@@ -40,6 +40,16 @@ impl LogStream {
             _ => Self::Unspecified,
         }
     }
+
+    /// The wire tag carried in envelope metadata — `None` when the source has
+    /// no stream identity (a plain file, journald, an event log).
+    pub fn tag(self) -> Option<&'static str> {
+        match self {
+            Self::Stdout => Some("stdout"),
+            Self::Stderr => Some("stderr"),
+            Self::Unspecified => None,
+        }
+    }
 }
 
 /// Parse a container log line and extract the message.

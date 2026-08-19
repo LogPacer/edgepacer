@@ -246,6 +246,7 @@ impl AgentTasks {
             identity.current(),
             shared_config.clone(),
             discovery_cache.clone(),
+            counters.body_variants().clone(),
             ebpf_status.clone(),
             shutdown.subscribe(),
         );
@@ -423,6 +424,7 @@ fn spawn_stats(
     resource_id: String,
     shared_config: config::SharedConfig,
     discovery_cache: discovery::SharedDiscoveryCache,
+    body_variants: counters::BodyVariantRegistry,
     ebpf_status: ebpf::SharedEbpfStatus,
     shutdown: watch::Receiver<bool>,
 ) -> JoinHandle<()> {
@@ -432,6 +434,7 @@ fn spawn_stats(
             &resource_id,
             shared_config,
             discovery_cache,
+            body_variants,
             ebpf_status,
             shutdown,
         )

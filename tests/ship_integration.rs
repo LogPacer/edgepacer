@@ -2,6 +2,15 @@
 
 mod common;
 
+/// Wrap bare line bytes as untagged ship entries (single-stream sources).
+fn untagged(lines: &[Vec<u8>]) -> Vec<edgepacer::shipper::ShipEntry> {
+    lines
+        .iter()
+        .cloned()
+        .map(edgepacer::shipper::ShipEntry::untagged)
+        .collect()
+}
+
 use edgepacer::shipper::{CappedShipDeferredReason, CappedShipOutcome};
 use logpacer_wire::{WireResponse, routed_batch, wire_log_event};
 use prost::Message;
@@ -99,7 +108,7 @@ async fn tail_encode_ship_roundtrip() {
     .unwrap();
 
     // Ship the batch
-    let result = shipper.ship(&lines).await.unwrap();
+    let result = shipper.ship(&untagged(&lines)).await.unwrap();
     match result {
         edgepacer::shipper::ShipResult::Accepted { count } => {
             assert_eq!(count, 3);
@@ -167,7 +176,7 @@ async fn shipper_attaches_cached_upload_token() {
     )
     .unwrap();
 
-    let result = shipper.ship(&[b"line".to_vec()]).await.unwrap();
+    let result = shipper.ship(&untagged(&[b"line".to_vec()])).await.unwrap();
 
     match result {
         edgepacer::shipper::ShipResult::Accepted { count } => assert_eq!(count, 1),
@@ -217,7 +226,7 @@ async fn retries_on_server_error() {
     .unwrap();
 
     let lines = vec![b"test line".to_vec()];
-    let result = shipper.ship(&lines).await.unwrap();
+    let result = shipper.ship(&untagged(&lines)).await.unwrap();
     match result {
         edgepacer::shipper::ShipResult::Accepted { count } => assert_eq!(count, 1),
         other => panic!("expected Accepted after retry, got {:?}", other),
@@ -247,7 +256,7 @@ async fn no_retry_on_client_error() {
     .unwrap();
 
     let lines = vec![b"bad line".to_vec()];
-    let result = shipper.ship(&lines).await;
+    let result = shipper.ship(&untagged(&lines)).await;
     assert!(result.is_err());
 }
 
@@ -289,7 +298,9 @@ async fn capped_ship_shrinks_after_payload_too_large() {
         b"four".to_vec(),
     ];
 
-    let outcome = shipper.ship_capped_with_shrink(&lines, usize::MAX).await;
+    let outcome = shipper
+        .ship_capped_with_shrink(&untagged(&lines), usize::MAX)
+        .await;
     assert_eq!(outcome, CappedShipOutcome::Delivered { count: 2 });
 
     let requests = mock_server.received_requests().await.unwrap();
@@ -322,7 +333,7 @@ async fn capped_ship_drops_single_entry_rejected_as_payload_too_large() {
     .unwrap();
 
     let outcome = shipper
-        .ship_capped_with_shrink(&[b"oversized".to_vec()], usize::MAX)
+        .ship_capped_with_shrink(&untagged(&[b"oversized".to_vec()]), usize::MAX)
         .await;
     assert_eq!(outcome, CappedShipOutcome::DroppedOversized { count: 1 });
 
@@ -359,7 +370,9 @@ async fn capped_ship_drops_fully_adjudicated_rejection() {
     .unwrap();
     let lines = vec![b"one".to_vec(), b"two".to_vec()];
 
-    let outcome = shipper.ship_capped_with_shrink(&lines, usize::MAX).await;
+    let outcome = shipper
+        .ship_capped_with_shrink(&untagged(&lines), usize::MAX)
+        .await;
     assert_eq!(
         outcome,
         CappedShipOutcome::RejectedAdjudicated {
@@ -397,7 +410,9 @@ async fn capped_ship_defers_partial_adjudication() {
     .unwrap();
     let lines = vec![b"one".to_vec(), b"two".to_vec(), b"three".to_vec()];
 
-    let outcome = shipper.ship_capped_with_shrink(&lines, usize::MAX).await;
+    let outcome = shipper
+        .ship_capped_with_shrink(&untagged(&lines), usize::MAX)
+        .await;
     assert_eq!(
         outcome,
         CappedShipOutcome::Deferred {
@@ -431,7 +446,9 @@ async fn capped_ship_defers_ambiguous_accepted_count() {
     .unwrap();
     let lines = vec![b"one".to_vec(), b"two".to_vec()];
 
-    let outcome = shipper.ship_capped_with_shrink(&lines, usize::MAX).await;
+    let outcome = shipper
+        .ship_capped_with_shrink(&untagged(&lines), usize::MAX)
+        .await;
     assert_eq!(
         outcome,
         CappedShipOutcome::Deferred {

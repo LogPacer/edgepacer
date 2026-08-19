@@ -31,7 +31,7 @@ use crate::container_reader::ContainerReader;
 use crate::cri::{DockerJsonReassembler, LogStream};
 use crate::entry_assembler::{EntryAssembler, EventMetadata, LineContext};
 use crate::overflow::SharedOverflow;
-use crate::shipper::{CappedShipOutcome, Shipper};
+use crate::shipper::{CappedShipOutcome, ShipEntry, Shipper};
 use crate::tailer::FileTailer;
 
 /// Default per-batch byte cap, in MiB. Keeps the encoded payload comfortably
@@ -228,6 +228,11 @@ pub struct DeliveryPipeline {
     running_offset: u64,
 }
 
+/// An event drained from one assembler, before its stream is attached.
+type AssembledEvent = (Vec<u8>, EventMetadata);
+/// The same event, tagged with the stream whose assembler produced it.
+type StreamEvent = (LogStream, Vec<u8>, EventMetadata);
+
 /// One multi-line assembler per container output stream.
 ///
 /// stdout and stderr are separate conversations that happen to share a file. A
@@ -278,8 +283,18 @@ impl StreamAssemblers {
             .1
     }
 
-    fn iter_mut(&mut self) -> impl Iterator<Item = &mut EntryAssembler> {
-        self.per_stream.iter_mut().map(|(_, assembler)| assembler)
+    /// Drain every stream's assembler with `drain`, keeping each emitted
+    /// event tagged with the stream whose assembler produced it.
+    fn collect_ready(
+        &mut self,
+        drain: fn(&mut EntryAssembler) -> Option<AssembledEvent>,
+    ) -> Vec<StreamEvent> {
+        self.per_stream
+            .iter_mut()
+            .filter_map(|(stream, assembler)| {
+                drain(assembler).map(|(event, meta)| (*stream, event, meta))
+            })
+            .collect()
     }
 
     /// The lowest start offset still buffered across every stream, or `None`
@@ -586,9 +601,10 @@ impl DeliveryPipeline {
         }
 
         // Aggregation path: feed each line through its stream's assembler,
-        // collecting any events they emit.
+        // collecting any events they emit. An assembler only ever holds one
+        // stream's lines, so the emitted event carries that stream.
         let mut running = self.running_offset;
-        let mut emitted: Vec<(Vec<u8>, EventMetadata)> = Vec::new();
+        let mut emitted: Vec<StreamEvent> = Vec::new();
         for line in lines {
             let line_len = line.source_len;
             let ctx = LineContext {
@@ -597,14 +613,14 @@ impl DeliveryPipeline {
                 inode: pos.inode,
             };
             running += line_len;
-            if let Some(event) = self
+            if let Some((event, meta)) = self
                 .assemblers
                 .as_mut()
                 .expect("assemblers checked above")
                 .for_stream(line.stream)
                 .process(line.payload, ctx)
             {
-                emitted.push(event);
+                emitted.push((line.stream, event, meta));
             }
         }
         self.running_offset = next_offset;
@@ -634,7 +650,7 @@ impl DeliveryPipeline {
         now_ns: i64,
         count: usize,
     ) {
-        let mut lines: Vec<Vec<u8>> = Vec::with_capacity(records.len());
+        let mut lines: Vec<(Vec<u8>, LogStream)> = Vec::with_capacity(records.len());
         let mut kept_offsets: Vec<(u64, u64)> = Vec::with_capacity(records.len());
         let mut skipped = 0usize;
         let mut line_start_offset = start_offset;
@@ -644,7 +660,7 @@ impl DeliveryPipeline {
                 skipped += 1;
             } else {
                 kept_offsets.push((line_start_offset, line_end_offset));
-                lines.push(line.payload);
+                lines.push((line.payload, line.stream));
             }
             line_start_offset = line_end_offset;
         }
@@ -660,7 +676,7 @@ impl DeliveryPipeline {
             return;
         }
 
-        match self.buffer.enqueue_batch(&lines, now_ns) {
+        match self.buffer.enqueue_stream_batch(&lines, now_ns) {
             Ok((buf_first, buf_last)) => {
                 debug_assert_eq!(buf_last - buf_first + 1, lines.len() as u64);
                 for (index, (line_start_offset, line_end_offset)) in
@@ -706,23 +722,26 @@ impl DeliveryPipeline {
     /// span from the first event's first-line start to the last event's
     /// last-line end — NOT the tailer's current position, which may already
     /// be past lines still buffered in the assembler.
-    fn enqueue_events(&mut self, events: Vec<(Vec<u8>, EventMetadata)>, inode: u64, now_ns: i64) {
+    fn enqueue_events(&mut self, events: Vec<StreamEvent>, inode: u64, now_ns: i64) {
         let count = events.len();
         let start_offset = events
             .first()
-            .map(|(_, m)| m.first.start_offset)
+            .map(|(_, _, m)| m.first.start_offset)
             .unwrap_or(0);
         let end_offset = events
             .last()
-            .map(|(_, m)| m.last.end_offset)
+            .map(|(_, _, m)| m.last.end_offset)
             .unwrap_or(start_offset);
         let event_ranges: Vec<(u64, u64)> = events
             .iter()
-            .map(|(_, m)| (m.first.start_offset, m.last.end_offset))
+            .map(|(_, _, m)| (m.first.start_offset, m.last.end_offset))
             .collect();
-        let bytes: Vec<Vec<u8>> = events.into_iter().map(|(e, _)| e).collect();
+        let bytes: Vec<(Vec<u8>, LogStream)> = events
+            .into_iter()
+            .map(|(stream, event, _)| (event, stream))
+            .collect();
 
-        match self.buffer.enqueue_batch(&bytes, now_ns) {
+        match self.buffer.enqueue_stream_batch(&bytes, now_ns) {
             Ok((buf_first, buf_last)) => {
                 debug_assert_eq!(buf_last - buf_first + 1, event_ranges.len() as u64);
                 for (index, (event_start_offset, event_end_offset)) in
@@ -770,10 +789,7 @@ impl DeliveryPipeline {
         let Some(assemblers) = self.assemblers.as_mut() else {
             return;
         };
-        let timed_out: Vec<(Vec<u8>, EventMetadata)> = assemblers
-            .iter_mut()
-            .filter_map(EntryAssembler::check_timeout)
-            .collect();
+        let timed_out = assemblers.collect_ready(EntryAssembler::check_timeout);
         if timed_out.is_empty() {
             return;
         }
@@ -781,15 +797,16 @@ impl DeliveryPipeline {
         self.enqueue_events(timed_out, pos.inode, now_nanos());
     }
 
-    fn spill_to_overflow(&self, lines: &[Vec<u8>], now_ns: i64) -> usize {
+    fn spill_to_overflow(&self, lines: &[(Vec<u8>, LogStream)], now_ns: i64) -> usize {
         let Some(ref overflow) = self.overflow else {
             return 0;
         };
         // Outer wrap: one core handoff for the whole loop — the per-line
-        // inner wraps hit run_blocking's free nested path.
+        // inner wraps hit run_blocking's free nested path. The overflow store
+        // keeps only the bytes; a replayed spill ships without its stream tag.
         crate::common::run_blocking(|| {
             let mut spilled = 0usize;
-            for line in lines {
+            for (line, _) in lines {
                 if overflow.write(&self.source_id, line, now_ns).is_ok() {
                     spilled += 1;
                 }
@@ -861,8 +878,10 @@ impl DeliveryPipeline {
 
         // Move data out of entries — no clone. The buffer still has the
         // authoritative copy (peek doesn't delete), so we can consume these.
-        let (lines, sequences): (Vec<Vec<u8>>, Vec<u64>) =
-            entries.into_iter().map(|e| (e.data, e.sequence)).unzip();
+        let (lines, sequences): (Vec<ShipEntry>, Vec<u64>) = entries
+            .into_iter()
+            .map(|e| (ShipEntry::new(e.data, e.stream), e.sequence))
+            .unzip();
 
         // Ship a byte-capped prefix, shrinking if the receiver rejects it as too
         // large. `handled` is how many leading entries went out (delivered, or a
@@ -975,10 +994,7 @@ impl DeliveryPipeline {
 
         // Flush every stream's in-progress event so none is lost.
         if let Some(assemblers) = self.assemblers.as_mut() {
-            let remaining: Vec<(Vec<u8>, EventMetadata)> = assemblers
-                .iter_mut()
-                .filter_map(EntryAssembler::flush)
-                .collect();
+            let remaining = assemblers.collect_ready(EntryAssembler::flush);
             if !remaining.is_empty() {
                 let pos = self.tailer.position();
                 self.enqueue_events(remaining, pos.inode, now_nanos());
@@ -1223,6 +1239,220 @@ mod tests {
         assert_eq!(
             checkpoint.offset, total_bytes,
             "once every stream is flushed the checkpoint reaches the file end"
+        );
+    }
+
+    /// The wire envelope must say which container output stream wrote each
+    /// entry: a stderr json-file record ships with `"stream":"stderr"` in
+    /// metadata_json, while a plain-file line keeps the bare `{}` envelope.
+    #[tokio::test]
+    async fn wire_envelope_carries_the_stream_that_wrote_the_entry() {
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/wire"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_raw(encoded_wire_response(1, 0, ""), "application/x-protobuf"),
+            )
+            .mount(&mock_server)
+            .await;
+
+        let dir = tempfile::tempdir().unwrap();
+        let log_path = dir.path().join("container-json.log");
+        std::fs::write(&log_path, "").unwrap();
+
+        let shipper = Shipper::new(
+            &format!("{}/wire", mock_server.uri()),
+            "arc_env",
+            "repo_env",
+            None,
+        )
+        .unwrap();
+        let mut pipeline = DeliveryPipeline::open_file_source(
+            log_path.to_str().unwrap(),
+            dir.path(),
+            shipper,
+            PipelineConfig {
+                ship_batch_size: 1,
+                ship_batch_max: 1,
+                ship_batch_max_bytes: usize::MAX,
+                ..Default::default()
+            },
+            PipelineSourceOptions {
+                multiline: None,
+                source_id: "envelope-src",
+                overflow: None,
+                source_format: FileSourceFormat::DockerJson,
+            },
+        )
+        .unwrap();
+
+        std::fs::write(
+            &log_path,
+            "{\"log\":\"boom\\n\",\"stream\":\"stderr\",\"time\":\"2026-08-19T09:00:00Z\"}\n",
+        )
+        .unwrap();
+        pipeline.read_cycle();
+        pipeline.drain_cycle().await;
+
+        let request = &mock_server.received_requests().await.unwrap()[0];
+        let shipped = crate::test_support::decode_gzip_wire_request(request);
+        let metadata: Vec<Vec<u8>> = shipped
+            .batches
+            .iter()
+            .filter_map(|batch| match batch.payload.as_ref()? {
+                logpacer_wire::routed_batch::Payload::Logs(logs) => Some(logs),
+                _ => None,
+            })
+            .flat_map(|logs| logs.entries.iter())
+            .map(|entry| entry.envelope.as_ref().unwrap().metadata_json.clone())
+            .collect();
+        assert_eq!(
+            metadata,
+            vec![br#"{"stream":"stderr"}"#.to_vec()],
+            "a stderr json-file record must ship with its stream in the envelope"
+        );
+    }
+
+    /// A CRI message reassembled from `P` fragments ships as one entry tagged
+    /// with its frames' stream — every fragment of a message shares it, so the
+    /// first frame's tag is the entry's tag.
+    #[tokio::test]
+    async fn cri_reassembled_entry_ships_with_its_frames_stream() {
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/wire"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_raw(encoded_wire_response(1, 0, ""), "application/x-protobuf"),
+            )
+            .mount(&mock_server)
+            .await;
+
+        let dir = tempfile::tempdir().unwrap();
+        let container_dir = dir.path().join("pod-logs");
+        std::fs::create_dir_all(&container_dir).unwrap();
+        std::fs::write(container_dir.join("0.log"), "").unwrap();
+
+        let shipper = Shipper::new(
+            &format!("{}/wire", mock_server.uri()),
+            "arc_cri",
+            "repo_cri",
+            None,
+        )
+        .unwrap();
+        let mut pipeline = DeliveryPipeline::open_kubernetes(
+            container_dir.to_str().unwrap(),
+            dir.path(),
+            shipper,
+            PipelineConfig {
+                ship_batch_size: 1,
+                ship_batch_max: 1,
+                ship_batch_max_bytes: usize::MAX,
+                ..Default::default()
+            },
+            None,
+            "cri-src",
+            None,
+        )
+        .unwrap();
+
+        std::fs::write(
+            container_dir.join("0.log"),
+            "2026-08-19T09:00:00.000000000Z stdout P Hello, \n\
+             2026-08-19T09:00:00.100000000Z stdout F world\n",
+        )
+        .unwrap();
+        pipeline.read_cycle();
+        pipeline.drain_cycle().await;
+
+        let request = &mock_server.received_requests().await.unwrap()[0];
+        let shipped = crate::test_support::decode_gzip_wire_request(request);
+        let entries: Vec<&logpacer_wire::WireLogEvent> = shipped
+            .batches
+            .iter()
+            .filter_map(|batch| match batch.payload.as_ref()? {
+                logpacer_wire::routed_batch::Payload::Logs(logs) => Some(logs),
+                _ => None,
+            })
+            .flat_map(|logs| logs.entries.iter())
+            .collect();
+        assert_eq!(entries.len(), 1, "the fragments rejoin into one entry");
+        assert_eq!(
+            entries[0].body,
+            Some(logpacer_wire::wire_log_event::Body::RawText(
+                "Hello, world".to_string()
+            ))
+        );
+        assert_eq!(
+            entries[0].envelope.as_ref().unwrap().metadata_json,
+            br#"{"stream":"stdout"}"#.to_vec()
+        );
+    }
+
+    /// Negative control for the stream envelope: a plain-file line has no
+    /// container output stream and must keep the bare `{}` metadata exactly.
+    #[tokio::test]
+    async fn plain_file_entries_ship_without_a_stream_key() {
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/wire"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_raw(encoded_wire_response(1, 0, ""), "application/x-protobuf"),
+            )
+            .mount(&mock_server)
+            .await;
+
+        let dir = tempfile::tempdir().unwrap();
+        let log_path = dir.path().join("app.log");
+        std::fs::write(&log_path, "").unwrap();
+        let shipper = Shipper::new(
+            &format!("{}/wire", mock_server.uri()),
+            "arc_plain",
+            "repo_plain",
+            None,
+        )
+        .unwrap();
+        let mut pipeline = DeliveryPipeline::open(
+            log_path.to_str().unwrap(),
+            dir.path(),
+            shipper,
+            PipelineConfig {
+                ship_batch_size: 1,
+                ship_batch_max: 1,
+                ship_batch_max_bytes: usize::MAX,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        pipeline.enqueue_batch(
+            tailed_lines(vec![b"plain line".to_vec()]),
+            0,
+            11,
+            42,
+            now_nanos(),
+            1,
+        );
+        pipeline.drain_cycle().await;
+
+        let request = &mock_server.received_requests().await.unwrap()[0];
+        let shipped = crate::test_support::decode_gzip_wire_request(request);
+        let entry = shipped
+            .batches
+            .iter()
+            .filter_map(|batch| match batch.payload.as_ref()? {
+                logpacer_wire::routed_batch::Payload::Logs(logs) => Some(logs),
+                _ => None,
+            })
+            .flat_map(|logs| logs.entries.iter())
+            .next()
+            .unwrap();
+        assert_eq!(
+            entry.envelope.as_ref().unwrap().metadata_json,
+            b"{}".to_vec(),
+            "no stream and no identity stamping must keep the empty envelope"
         );
     }
 
