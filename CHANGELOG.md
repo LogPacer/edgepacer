@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.2.16 - 2026-08-19
+
 - Track per-stream body-variant counts (`entry_json` / `raw_text` /
   `raw_bytes`) at the shipper classification seam, settle-exact: only
   delivered or adjudicated batches count, so deferred retries and 413-shrunk
