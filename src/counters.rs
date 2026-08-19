@@ -3,7 +3,7 @@
 //! All fields use relaxed ordering because exact consistency isn't needed —
 //! stats are sampled periodically and slight lag is acceptable.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
@@ -82,6 +82,81 @@ impl QueueDepthGauge {
     }
 }
 
+/// How a stream's shipped entries split across the wire body variants
+/// (`EntryJson` / `RawText` / `RawBytes`). Also the per-batch tally the
+/// shipper records once a batch settles.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+pub struct BodyVariantSplit {
+    pub entry_json: u64,
+    pub raw_text: u64,
+    pub raw_bytes: u64,
+}
+
+/// Per-source counters of the body-variant split, incremented by that
+/// source's shipper as batches settle and read by the stats reporter.
+#[derive(Default)]
+pub struct BodyVariantCounters {
+    entry_json: AtomicU64,
+    raw_text: AtomicU64,
+    raw_bytes: AtomicU64,
+}
+
+impl BodyVariantCounters {
+    pub fn record(&self, split: BodyVariantSplit) {
+        self.entry_json
+            .fetch_add(split.entry_json, Ordering::Relaxed);
+        self.raw_text.fetch_add(split.raw_text, Ordering::Relaxed);
+        self.raw_bytes.fetch_add(split.raw_bytes, Ordering::Relaxed);
+    }
+
+    pub fn snapshot(&self) -> BodyVariantSplit {
+        BodyVariantSplit {
+            entry_json: self.entry_json.load(Ordering::Relaxed),
+            raw_text: self.raw_text.load(Ordering::Relaxed),
+            raw_bytes: self.raw_bytes.load(Ordering::Relaxed),
+        }
+    }
+}
+
+/// Registry of per-source [`BodyVariantCounters`], keyed by `log_source_id`.
+/// The orchestrator hands each source's shipper its counters at start; the
+/// stats reporter snapshots them per stream each interval.
+#[derive(Clone, Default)]
+pub struct BodyVariantRegistry(Arc<Mutex<HashMap<String, Arc<BodyVariantCounters>>>>);
+
+impl BodyVariantRegistry {
+    fn entries(&self) -> MutexGuard<'_, HashMap<String, Arc<BodyVariantCounters>>> {
+        match self.0.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => {
+                warn!("body variant registry lock poisoned; recovering state");
+                self.0.clear_poison();
+                poisoned.into_inner()
+            }
+        }
+    }
+
+    /// The counters for a source, created on first sight.
+    pub fn counters_for(&self, log_source_id: &str) -> Arc<BodyVariantCounters> {
+        self.entries()
+            .entry(log_source_id.to_string())
+            .or_default()
+            .clone()
+    }
+
+    /// The current split for a source, `None` when it has never shipped.
+    pub fn snapshot_for(&self, log_source_id: &str) -> Option<BodyVariantSplit> {
+        self.entries()
+            .get(log_source_id)
+            .map(|counters| counters.snapshot())
+    }
+
+    /// Forget a removed source so a later source reusing the id starts at zero.
+    pub fn remove(&self, log_source_id: &str) {
+        self.entries().remove(log_source_id);
+    }
+}
+
 /// Shared counters incremented by pipeline components, read by stats reporter.
 pub struct AgentCounters {
     pub bytes_sent: AtomicU64,
@@ -100,6 +175,7 @@ pub struct AgentCounters {
     pub spans_kind_from_bytes: AtomicU64,
     pub ebpf_capture_read_faults: AtomicU64,
     error_window: ErrorWindow,
+    body_variants: BodyVariantRegistry,
 }
 
 impl AgentCounters {
@@ -121,7 +197,14 @@ impl AgentCounters {
             spans_kind_from_bytes: AtomicU64::new(0),
             ebpf_capture_read_faults: AtomicU64::new(0),
             error_window: ErrorWindow::new(),
+            body_variants: BodyVariantRegistry::default(),
         })
+    }
+
+    /// The per-source body-variant registry shared between the orchestrator's
+    /// shippers and the stats reporter.
+    pub fn body_variants(&self) -> &BodyVariantRegistry {
+        &self.body_variants
     }
 
     pub fn add_bytes_sent(&self, n: u64) {
@@ -357,6 +440,65 @@ mod tests {
         // Saturating: an accounting bug must never wrap the heartbeat value.
         gauge.sub(10_000);
         assert_eq!(gauge.get(), 0);
+    }
+
+    #[test]
+    fn body_variant_counters_accumulate_recorded_splits() {
+        let counters = BodyVariantCounters::default();
+        counters.record(BodyVariantSplit {
+            entry_json: 2,
+            raw_text: 1,
+            raw_bytes: 0,
+        });
+        counters.record(BodyVariantSplit {
+            entry_json: 1,
+            raw_text: 0,
+            raw_bytes: 3,
+        });
+
+        assert_eq!(
+            counters.snapshot(),
+            BodyVariantSplit {
+                entry_json: 3,
+                raw_text: 1,
+                raw_bytes: 3,
+            }
+        );
+    }
+
+    /// The split is per-stream, not agent-wide: two sources' counters must
+    /// never bleed into each other, and a source that never shipped has none.
+    #[test]
+    fn body_variant_registry_keeps_sources_apart() {
+        let registry = BodyVariantRegistry::default();
+
+        registry.counters_for("src-a").record(BodyVariantSplit {
+            entry_json: 5,
+            raw_text: 0,
+            raw_bytes: 0,
+        });
+        registry.counters_for("src-b").record(BodyVariantSplit {
+            entry_json: 0,
+            raw_text: 7,
+            raw_bytes: 0,
+        });
+
+        assert_eq!(registry.snapshot_for("src-a").unwrap().entry_json, 5);
+        assert_eq!(registry.snapshot_for("src-a").unwrap().raw_text, 0);
+        assert_eq!(registry.snapshot_for("src-b").unwrap().raw_text, 7);
+        assert!(registry.snapshot_for("src-never-shipped").is_none());
+
+        // Handing out the same source's counters twice shares one instance.
+        let again = registry.counters_for("src-a");
+        again.record(BodyVariantSplit {
+            entry_json: 1,
+            raw_text: 0,
+            raw_bytes: 0,
+        });
+        assert_eq!(registry.snapshot_for("src-a").unwrap().entry_json, 6);
+
+        registry.remove("src-a");
+        assert!(registry.snapshot_for("src-a").is_none());
     }
 
     #[test]

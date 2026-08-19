@@ -19,6 +19,15 @@
 
 mod common;
 
+/// Wrap bare line bytes as untagged ship entries (single-stream sources).
+fn untagged(lines: &[Vec<u8>]) -> Vec<edgepacer::shipper::ShipEntry> {
+    lines
+        .iter()
+        .cloned()
+        .map(edgepacer::shipper::ShipEntry::untagged)
+        .collect()
+}
+
 use logpacer_wire::{WireResponse, routed_batch, wire_log_event};
 use prost::Message;
 use std::io::Write;
@@ -186,7 +195,7 @@ async fn m2_parity_native_vs_otlp_path() {
     .unwrap();
 
     let lines: Vec<Vec<u8>> = log_lines.iter().map(|l| l.as_bytes().to_vec()).collect();
-    let result = shipper.ship(&lines).await.unwrap();
+    let result = shipper.ship(&untagged(&lines)).await.unwrap();
     match &result {
         edgepacer::shipper::ShipResult::Accepted { count } => {
             assert_eq!(*count, log_lines.len() as u32);
@@ -299,7 +308,7 @@ async fn m2_parity_from_file_tail() {
     )
     .unwrap();
 
-    shipper.ship(&tailed_lines).await.unwrap();
+    shipper.ship(&untagged(&tailed_lines)).await.unwrap();
 
     // Verify parity
     let requests = mock_server.received_requests().await.unwrap();

@@ -11,6 +11,7 @@ use tokio::sync::watch;
 use tracing::{debug, info, warn};
 
 use crate::config::{SharedConfig, effective_stats_interval, stats_reporting_enabled};
+use crate::counters::{BodyVariantRegistry, BodyVariantSplit};
 use crate::discovery::cache::CollectMatch;
 const DEFAULT_STATS_INTERVAL: Duration = Duration::from_secs(60);
 
@@ -62,6 +63,11 @@ pub struct StreamConfigStatus {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
     pub last_checked: String,
+    /// How this stream's shipped entries split across the wire body variants,
+    /// cumulative since the source started. Omitted while the source has no
+    /// running pipeline (its shipper registers the counters at start).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub body_variants: Option<BodyVariantSplit>,
 }
 
 impl StreamConfigStatus {
@@ -75,6 +81,7 @@ impl StreamConfigStatus {
             confidence: None,
             reason: None,
             last_checked: last_checked.to_string(),
+            body_variants: None,
         }
     }
 }
@@ -113,18 +120,27 @@ impl StreamStatusReporter {
 }
 
 /// Order-independent fingerprint of the meaningful status fields, excluding the
-/// per-report `last_checked` timestamp (which always changes).
+/// per-report `last_checked` timestamp (which always changes). The body-variant
+/// counts are part of the fingerprint on purpose: a count change makes the next
+/// interval's report carry the fresh split, so the control plane observes it
+/// within one reporting interval — sends still only happen on the interval
+/// tick, never per increment.
 fn status_signature(statuses: &[StreamConfigStatus]) -> String {
     let mut lines: Vec<String> = statuses
         .iter()
         .map(|s| {
+            let variants = s
+                .body_variants
+                .map(|v| format!("{}/{}/{}", v.entry_json, v.raw_text, v.raw_bytes))
+                .unwrap_or_default();
             format!(
-                "{}|{}|{}|{}|{}",
+                "{}|{}|{}|{}|{}|{}",
                 s.log_source_id,
                 s.status,
                 s.matched_via.as_deref().unwrap_or(""),
                 s.confidence.as_deref().unwrap_or(""),
                 s.reason.as_deref().unwrap_or(""),
+                variants,
             )
         })
         .collect();
@@ -140,6 +156,7 @@ pub async fn run(
     resource_id: &str,
     shared_config: SharedConfig,
     discovery_cache: crate::discovery::SharedDiscoveryCache,
+    body_variants: BodyVariantRegistry,
     ebpf_status: crate::ebpf::SharedEbpfStatus,
     mut shutdown: watch::Receiver<bool>,
 ) {
@@ -170,8 +187,13 @@ pub async fn run(
             .unwrap_or_default()
             .as_millis() as i64;
         let last_checked = chrono::Utc::now().to_rfc3339();
-        let collected =
-            collect_stream_status(&shared_config, &discovery_cache, &last_checked).await;
+        let collected = collect_stream_status(
+            &shared_config,
+            &discovery_cache,
+            &body_variants,
+            &last_checked,
+        )
+        .await;
         let (stream_status, pending_signature) = status_reporter.plan(collected);
 
         let ebpf = ebpf_status.read().await.clone();
@@ -216,6 +238,7 @@ fn reported_ebpf_error(status: &crate::ebpf::EbpfStatus) -> Option<String> {
 async fn collect_stream_status(
     shared_config: &SharedConfig,
     discovery_cache: &crate::discovery::SharedDiscoveryCache,
+    body_variants: &BodyVariantRegistry,
     last_checked: &str,
 ) -> Option<Vec<StreamConfigStatus>> {
     let collect_streams = {
@@ -232,7 +255,11 @@ async fn collect_stream_status(
     Some(
         collect_streams
             .into_iter()
-            .map(|stream| stream_status_for_collect_stream(&stream, &cache, last_checked))
+            .map(|stream| {
+                let mut status = stream_status_for_collect_stream(&stream, &cache, last_checked);
+                status.body_variants = body_variants.snapshot_for(&stream.log_source_id);
+                status
+            })
             .collect(),
     )
 }
@@ -333,6 +360,11 @@ mod tests {
                 confidence: Some("explicit".to_string()),
                 reason: None,
                 last_checked: "2026-06-22T19:30:00Z".to_string(),
+                body_variants: Some(BodyVariantSplit {
+                    entry_json: 12,
+                    raw_text: 3,
+                    raw_bytes: 1,
+                }),
             }]),
             ebpf_available: false,
             ebpf_kernel_version: None,
@@ -356,6 +388,9 @@ mod tests {
         assert_eq!(v["stream_status"][0]["status"], "collecting");
         assert_eq!(v["stream_status"][0]["matched_via"], "stable_id");
         assert_eq!(v["stream_status"][0]["confidence"], "explicit");
+        assert_eq!(v["stream_status"][0]["body_variants"]["entry_json"], 12);
+        assert_eq!(v["stream_status"][0]["body_variants"]["raw_text"], 3);
+        assert_eq!(v["stream_status"][0]["body_variants"]["raw_bytes"], 1);
         assert_eq!(
             v["stream_status"][0]["last_checked"],
             "2026-06-22T19:30:00Z"
@@ -532,6 +567,7 @@ mod tests {
             confidence: None,
             reason: None,
             last_checked: last_checked.to_string(),
+            body_variants: None,
         }
     }
 
@@ -597,6 +633,104 @@ mod tests {
         // Now that it is confirmed, an unchanged snapshot is omitted.
         let (payload, _) = reporter.plan(snapshot());
         assert!(payload.is_none());
+    }
+
+    /// Each stream's status carries its OWN split from the registry — keyed by
+    /// log_source_id — and a stream that never shipped carries none.
+    #[tokio::test]
+    async fn collect_stream_status_attaches_each_sources_own_split() {
+        let config = crate::config::UnifiedConfig::new(
+            json!({
+                "collect": {
+                    "src-shipped": {
+                        "locator": "/var/log/a.log",
+                        "matching_strategy": "file_path",
+                        "subbox_endpoint": "https://s/wire",
+                        "archive_id": "arc",
+                        "repo_id": "repo"
+                    },
+                    "src-quiet": {
+                        "locator": "/var/log/b.log",
+                        "matching_strategy": "file_path",
+                        "subbox_endpoint": "https://s/wire",
+                        "archive_id": "arc",
+                        "repo_id": "repo"
+                    }
+                }
+            }),
+            "etag".to_string(),
+        );
+        let shared_config: SharedConfig =
+            std::sync::Arc::new(tokio::sync::RwLock::new(Some(config)));
+        let discovery_cache = crate::discovery::shared_discovery_cache();
+
+        let registry = BodyVariantRegistry::default();
+        registry
+            .counters_for("src-shipped")
+            .record(BodyVariantSplit {
+                entry_json: 4,
+                raw_text: 2,
+                raw_bytes: 0,
+            });
+
+        let statuses = collect_stream_status(&shared_config, &discovery_cache, &registry, "now")
+            .await
+            .expect("configured streams produce statuses");
+
+        let by_id = |id: &str| {
+            statuses
+                .iter()
+                .find(|s| s.log_source_id == id)
+                .unwrap()
+                .body_variants
+        };
+        assert_eq!(
+            by_id("src-shipped"),
+            Some(BodyVariantSplit {
+                entry_json: 4,
+                raw_text: 2,
+                raw_bytes: 0,
+            })
+        );
+        assert_eq!(
+            by_id("src-quiet"),
+            None,
+            "a stream that never shipped reports no split — and never another stream's"
+        );
+    }
+
+    /// Freshness contract: a body-variant count change must be observable in
+    /// the next reporting interval — the change re-fingerprints the snapshot,
+    /// so the periodic plan sends it. Increments between plans never trigger a
+    /// send of their own; they coalesce into that one interval report.
+    #[test]
+    fn count_change_is_sent_on_the_next_interval_without_per_increment_resends() {
+        let with_counts = |entry_json: u64, last_checked: &str| {
+            let mut s = status("a", "collecting", last_checked);
+            s.body_variants = Some(BodyVariantSplit {
+                entry_json,
+                raw_text: 0,
+                raw_bytes: 0,
+            });
+            vec![s]
+        };
+
+        let mut reporter = StreamStatusReporter::default();
+        assert!(send_ok(&mut reporter, Some(with_counts(10, "t1"))));
+
+        // No count movement → the next interval omits the snapshot.
+        assert!(
+            !send_ok(&mut reporter, Some(with_counts(10, "t2"))),
+            "unchanged counts must not resend every interval"
+        );
+
+        // Many increments land between plans; the single next plan carries
+        // the fresh split — one send per interval, not one per increment.
+        assert!(
+            send_ok(&mut reporter, Some(with_counts(25, "t3"))),
+            "a count change must be observable in the next reporting interval"
+        );
+        assert!(!send_ok(&mut reporter, Some(with_counts(25, "t4"))));
     }
 
     #[test]

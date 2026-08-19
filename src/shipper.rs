@@ -6,7 +6,8 @@
 //! dual-accept logrelay wire contract.
 
 use crate::common::EdgepacerError;
-use crate::counters::AgentCounters;
+use crate::counters::{AgentCounters, BodyVariantCounters, BodyVariantSplit};
+use crate::cri::LogStream;
 use crate::identity::AgentIdentity;
 use crate::retry::RetryPolicy;
 
@@ -70,16 +71,36 @@ pub(crate) fn encode_single_batch(
     Ok(encoded)
 }
 
+/// One log entry bound for the wire: the body bytes plus the container output
+/// stream that wrote it, which the envelope's `metadata_json` carries as
+/// `"stream"` (`Unspecified` adds no key — plain files, journald, event logs).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ShipEntry {
+    pub body: Vec<u8>,
+    pub stream: LogStream,
+}
+
+impl ShipEntry {
+    pub fn new(body: Vec<u8>, stream: LogStream) -> Self {
+        Self { body, stream }
+    }
+
+    /// An entry from a single-stream source.
+    pub fn untagged(body: Vec<u8>) -> Self {
+        Self::new(body, LogStream::Unspecified)
+    }
+}
+
 /// Number of leading entries to ship, bounded by `max_bytes` (each entry costed
 /// as its line length plus [`ENTRY_WIRE_OVERHEAD`]). Always at least 1 for a
 /// non-empty slice, so a single entry larger than the cap still goes out — the
 /// shrink path then handles a real payload-too-large rejection.
 #[must_use]
-fn byte_capped_take(lines: &[Vec<u8>], max_bytes: usize) -> usize {
+fn byte_capped_take(entries: &[ShipEntry], max_bytes: usize) -> usize {
     let mut total = 0usize;
     let mut take = 0usize;
-    for line in lines {
-        let cost = line.len() + ENTRY_WIRE_OVERHEAD;
+    for entry in entries {
+        let cost = entry.body.len() + ENTRY_WIRE_OVERHEAD;
         // The first entry is always taken (the `take > 0` guard skips the cap
         // check for it) so a lone over-cap entry still ships.
         if take > 0 && total + cost > max_bytes {
@@ -130,6 +151,10 @@ pub struct Shipper {
     /// empty metadata object and adds no per-line identity bytes.
     identity: Option<AgentIdentity>,
     retry_policy: RetryPolicy,
+    /// When `Some`, the body-variant split of every settled log batch is
+    /// recorded here — one instance per collect stream, wired by the
+    /// orchestrator and read by the stats reporter.
+    body_variants: Option<Arc<BodyVariantCounters>>,
 }
 
 /// Result of a ship attempt.
@@ -432,7 +457,14 @@ impl Shipper {
             repo_id: repo_id.to_string(),
             identity,
             retry_policy: RetryPolicy::default(),
+            body_variants: None,
         })
+    }
+
+    /// Record the body-variant split of settled batches into `counters`.
+    pub fn with_body_variant_counters(mut self, counters: Arc<BodyVariantCounters>) -> Self {
+        self.body_variants = Some(counters);
+        self
     }
 
     /// Create a shipper that tracks bytes_sent via shared counters.
@@ -453,26 +485,34 @@ impl Shipper {
         self.transport.uses_counters(counters)
     }
 
-    /// Envelope metadata bytes for a batch. `{}` when this shipper doesn't stamp
-    /// identity; otherwise `{"resource_identifier": <live value>}`, read from the
-    /// shared cell at encode time. Built once per batch — the bytes are then
-    /// cloned into each event envelope.
-    fn envelope_metadata_bytes(&self) -> Vec<u8> {
-        match &self.identity {
-            None => b"{}".to_vec(),
+    /// Envelope metadata bytes for one entry. `{}` when this shipper doesn't
+    /// stamp identity and the entry has no stream; otherwise the present keys:
+    /// `{"resource_identifier": <live value>}` (read from the shared cell at
+    /// encode time) and `{"stream": "stdout"|"stderr"}`.
+    fn envelope_metadata_bytes(&self, stream: LogStream) -> Vec<u8> {
+        let mut metadata = serde_json::Map::new();
+        if let Some(identity) = &self.identity {
             // Wire key stays `resource_identifier` (the relay's field name).
-            Some(identity) => serde_json::json!({ "resource_identifier": identity.current() })
-                .to_string()
-                .into_bytes(),
+            metadata.insert(
+                "resource_identifier".to_string(),
+                serde_json::Value::String(identity.current()),
+            );
         }
+        if let Some(tag) = stream.tag() {
+            metadata.insert(
+                "stream".to_string(),
+                serde_json::Value::String(tag.to_string()),
+            );
+        }
+        serde_json::Value::Object(metadata).to_string().into_bytes()
     }
 
     /// Ship a batch of log lines — convenience wrapper that encodes + sends with retry.
-    pub async fn ship(&self, lines: &[Vec<u8>]) -> Result<ShipResult, EdgepacerError> {
-        if lines.is_empty() {
+    pub async fn ship(&self, entries: &[ShipEntry]) -> Result<ShipResult, EdgepacerError> {
+        if entries.is_empty() {
             return Ok(ShipResult::Accepted { count: 0 });
         }
-        let (encoded, _) = self.encode_batch(lines)?;
+        let (encoded, _) = self.encode_batch(entries)?;
         self.send_with_retry(&encoded).await
     }
 
@@ -485,18 +525,21 @@ impl Shipper {
     /// identical regardless of source type.
     pub async fn ship_capped_with_shrink(
         &self,
-        lines: &[Vec<u8>],
+        entries: &[ShipEntry],
         max_bytes: usize,
     ) -> CappedShipOutcome {
-        if lines.is_empty() {
+        if entries.is_empty() {
             return CappedShipOutcome::Deferred {
                 reason: CappedShipDeferredReason::EmptyBatch,
             };
         }
-        let mut n = byte_capped_take(lines, max_bytes);
+        let mut n = byte_capped_take(entries, max_bytes);
         loop {
-            let encoded = match self.encode_batch(&lines[..n]) {
-                Ok((bytes, _)) => bytes,
+            // The tally is recorded only when THIS encoding settles (delivered
+            // or fully adjudicated) — a deferred batch re-encodes on the next
+            // drain cycle and must not count twice.
+            let (encoded, _, tally) = match self.encode_batch_counted(&entries[..n]) {
+                Ok(encoded) => encoded,
                 Err(e) => {
                     error!(error = %e, "failed to encode batch");
                     return CappedShipOutcome::Deferred {
@@ -507,6 +550,7 @@ impl Shipper {
 
             match self.send_with_retry(&encoded).await {
                 Ok(ShipResult::Accepted { count }) if count as usize == n => {
+                    self.record_body_variants(tally);
                     return CappedShipOutcome::Delivered { count: n };
                 }
                 Ok(ShipResult::Accepted { count }) => {
@@ -536,6 +580,7 @@ impl Shipper {
                             error = %message,
                             "batch rejected by relay, fully adjudicated: dropping rejected entries"
                         );
+                        self.record_body_variants(tally);
                         return CappedShipOutcome::RejectedAdjudicated {
                             accepted: accepted as usize,
                             rejected: rejected as usize,
@@ -561,7 +606,7 @@ impl Shipper {
                     }
                     error!(
                         error = %msg,
-                        bytes = lines[0].len(),
+                        bytes = entries[0].body.len(),
                         "dropping a single entry the receiver rejects as too large (cannot ship)"
                     );
                     return CappedShipOutcome::DroppedOversized { count: 1 };
@@ -578,31 +623,67 @@ impl Shipper {
 
     /// Encode a batch of log lines into protobuf.
     ///
-    /// Borrows the lines so a caller can re-encode sub-slices (e.g. shrinking a
-    /// batch on a payload-too-large rejection) without cloning the outer Vec.
+    /// Borrows the entries so a caller can re-encode sub-slices (e.g. shrinking
+    /// a batch on a payload-too-large rejection) without cloning the outer Vec.
     /// JSON object entries are reported as `EntryJson`, other valid UTF-8 as
     /// `RawText`, and rare non-UTF-8 lines as `RawBytes`.
-    pub fn encode_batch(&self, lines: &[Vec<u8>]) -> Result<(Vec<u8>, u32), EdgepacerError> {
-        let count = checked_wire_count("log entries", lines.len())?;
+    pub fn encode_batch(&self, entries: &[ShipEntry]) -> Result<(Vec<u8>, u32), EdgepacerError> {
+        let (encoded, count, _) = self.encode_batch_counted(entries)?;
+        Ok((encoded, count))
+    }
+
+    /// [`encode_batch`], also returning the batch's body-variant tally so the
+    /// ship loop can record it once this exact encoding settles.
+    ///
+    /// [`encode_batch`]: Self::encode_batch
+    fn encode_batch_counted(
+        &self,
+        entries: &[ShipEntry],
+    ) -> Result<(Vec<u8>, u32, BodyVariantSplit), EdgepacerError> {
+        let count = checked_wire_count("log entries", entries.len())?;
         let now_ms = unix_epoch_millis_i64();
 
-        let metadata = self.envelope_metadata_bytes();
-        let entries: Vec<WireLogEvent> = lines
+        // Metadata bytes are identical for every entry of the same stream —
+        // build each variant once per batch and clone into the envelopes.
+        let mut metadata_by_stream: Vec<(LogStream, Vec<u8>)> = Vec::with_capacity(3);
+        let mut tally = BodyVariantSplit::default();
+        let wire_entries: Vec<WireLogEvent> = entries
             .iter()
-            .map(|body| WireLogEvent {
-                envelope: Some(EventEnvelope {
-                    source_at_ms: Some(now_ms),
-                    logtime_ms: None,
-                    metadata_json: metadata.clone(),
-                }),
-                body: Some(log_line_body(body)),
+            .map(|entry| {
+                let metadata = match metadata_by_stream
+                    .iter()
+                    .find(|(stream, _)| *stream == entry.stream)
+                {
+                    Some((_, bytes)) => bytes.clone(),
+                    None => {
+                        let bytes = self.envelope_metadata_bytes(entry.stream);
+                        metadata_by_stream.push((entry.stream, bytes.clone()));
+                        bytes
+                    }
+                };
+                let body = log_line_body(&entry.body);
+                match body {
+                    wire_log_event::Body::EntryJson(_) => tally.entry_json += 1,
+                    wire_log_event::Body::RawText(_) => tally.raw_text += 1,
+                    wire_log_event::Body::RawBytes(_) => tally.raw_bytes += 1,
+                }
+                WireLogEvent {
+                    envelope: Some(EventEnvelope {
+                        source_at_ms: Some(now_ms),
+                        logtime_ms: None,
+                        metadata_json: metadata,
+                    }),
+                    body: Some(body),
+                }
             })
             .collect();
 
         let encoded = encode_single_batch(
             &self.archive_id,
             &self.repo_id,
-            routed_batch::Payload::Logs(WireLogBatch { entries }),
+            routed_batch::Payload::Logs(WireLogBatch {
+                entries: wire_entries,
+            }),
         )?;
 
         debug!(
@@ -611,7 +692,13 @@ impl Shipper {
             "encoded logpacer-wire batch"
         );
 
-        Ok((encoded, count))
+        Ok((encoded, count, tally))
+    }
+
+    fn record_body_variants(&self, tally: BodyVariantSplit) {
+        if let Some(counters) = &self.body_variants {
+            counters.record(tally);
+        }
     }
 
     /// Encode JSON log entries (self-telemetry) as EntryJson wire events.
@@ -622,7 +709,7 @@ impl Shipper {
         let count = checked_wire_count("json log entries", json_lines.len())?;
         let now_ms = unix_epoch_millis_i64();
 
-        let metadata = self.envelope_metadata_bytes();
+        let metadata = self.envelope_metadata_bytes(LogStream::Unspecified);
         let entries: Vec<WireLogEvent> = json_lines
             .into_iter()
             .map(|body| WireLogEvent {
@@ -655,7 +742,7 @@ impl Shipper {
         let count = checked_wire_count("service-map edges", json_lines.len())?;
         let now_ms = unix_epoch_millis_i64();
 
-        let metadata = self.envelope_metadata_bytes();
+        let metadata = self.envelope_metadata_bytes(LogStream::Unspecified);
         let entries: Vec<WireJsonEvent> = json_lines
             .into_iter()
             .map(|body| WireJsonEvent {
@@ -688,7 +775,7 @@ impl Shipper {
         let count = checked_wire_count("network flows", flows.len())?;
         let now_ms = unix_epoch_millis_i64();
 
-        let metadata = self.envelope_metadata_bytes();
+        let metadata = self.envelope_metadata_bytes(LogStream::Unspecified);
         let entries: Vec<WireEbpfEvent> = flows
             .into_iter()
             .map(|flow| WireEbpfEvent {
@@ -727,7 +814,7 @@ impl Shipper {
         let count = checked_wire_count("request signals", signals.len())?;
         let now_ms = unix_epoch_millis_i64();
 
-        let metadata = self.envelope_metadata_bytes();
+        let metadata = self.envelope_metadata_bytes(LogStream::Unspecified);
         let entries: Vec<WireEbpfEvent> = signals
             .into_iter()
             .map(|signal| WireEbpfEvent {
@@ -812,35 +899,245 @@ mod tests {
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
-    fn encoded_log_body(line: Vec<u8>) -> wire_log_event::Body {
-        let shipper = Shipper::new("http://localhost:8080", "arc_test", "repo_app", None).unwrap();
-        let lines = vec![line];
-        let (buf, count) = shipper.encode_batch(&lines).unwrap();
-        assert_eq!(count, 1);
-
-        let decoded = WireRequest::decode(&buf[..]).unwrap();
+    fn decoded_log_entries(buf: &[u8]) -> Vec<WireLogEvent> {
+        let decoded = WireRequest::decode(buf).unwrap();
         let Some(routed_batch::Payload::Logs(logs)) = &decoded.batches[0].payload else {
             panic!("expected routed log payload");
         };
-        logs.entries[0].body.clone().unwrap()
+        logs.entries.clone()
+    }
+
+    fn encoded_log_body(line: Vec<u8>) -> wire_log_event::Body {
+        let shipper = Shipper::new("http://localhost:8080", "arc_test", "repo_app", None).unwrap();
+        let entries = vec![ShipEntry::untagged(line)];
+        let (buf, count) = shipper.encode_batch(&entries).unwrap();
+        assert_eq!(count, 1);
+
+        decoded_log_entries(&buf)[0].body.clone().unwrap()
+    }
+
+    fn untagged(lines: Vec<Vec<u8>>) -> Vec<ShipEntry> {
+        lines.into_iter().map(ShipEntry::untagged).collect()
     }
 
     #[test]
     fn byte_cap_limits_batch_and_always_takes_one() {
         // Four 100-byte lines; with overhead each costs 228 bytes.
-        let lines: Vec<Vec<u8>> = (0..4).map(|_| vec![b'x'; 100]).collect();
+        let entries = untagged((0..4).map(|_| vec![b'x'; 100]).collect());
 
         // Budget for ~2 entries (2 * 228 = 456) → exactly 2 taken.
-        assert_eq!(byte_capped_take(&lines, 500), 2);
+        assert_eq!(byte_capped_take(&entries, 500), 2);
         // Generous budget → all four.
-        assert_eq!(byte_capped_take(&lines, 10_000), 4);
+        assert_eq!(byte_capped_take(&entries, 10_000), 4);
         // Budget smaller than a single entry → still takes 1 (guarantees progress).
-        assert_eq!(byte_capped_take(&lines, 1), 1);
+        assert_eq!(byte_capped_take(&entries, 1), 1);
     }
 
     #[test]
     fn byte_cap_on_empty_is_zero() {
         assert_eq!(byte_capped_take(&[], 1024), 0);
+    }
+
+    /// The envelope metadata is per-entry: each entry carries the stream that
+    /// wrote it, entries without one carry no stream key, and with identity
+    /// stamping off the untagged envelope stays `{}` byte-for-byte.
+    #[test]
+    fn envelope_metadata_carries_each_entrys_stream() {
+        let shipper = Shipper::new("http://localhost:8080", "arc_test", "repo_app", None).unwrap();
+        let entries = vec![
+            ShipEntry::new(b"out".to_vec(), LogStream::Stdout),
+            ShipEntry::new(b"err".to_vec(), LogStream::Stderr),
+            ShipEntry::untagged(b"bare".to_vec()),
+        ];
+
+        let (buf, count) = shipper.encode_batch(&entries).unwrap();
+        assert_eq!(count, 3);
+
+        let metadata: Vec<Vec<u8>> = decoded_log_entries(&buf)
+            .iter()
+            .map(|entry| entry.envelope.as_ref().unwrap().metadata_json.clone())
+            .collect();
+        assert_eq!(
+            metadata,
+            vec![
+                br#"{"stream":"stdout"}"#.to_vec(),
+                br#"{"stream":"stderr"}"#.to_vec(),
+                b"{}".to_vec(),
+            ]
+        );
+    }
+
+    #[test]
+    fn envelope_metadata_merges_stream_beside_resource_identifier() {
+        let shipper = Shipper::new(
+            "http://localhost:8080",
+            "arc_test",
+            "repo_app",
+            Some(crate::identity::AgentIdentity::new("lp_host_1".to_string())),
+        )
+        .unwrap();
+        let entries = vec![
+            ShipEntry::new(b"err".to_vec(), LogStream::Stderr),
+            ShipEntry::untagged(b"bare".to_vec()),
+        ];
+
+        let (buf, _) = shipper.encode_batch(&entries).unwrap();
+
+        let metadata: Vec<Vec<u8>> = decoded_log_entries(&buf)
+            .iter()
+            .map(|entry| entry.envelope.as_ref().unwrap().metadata_json.clone())
+            .collect();
+        assert_eq!(
+            metadata,
+            vec![
+                br#"{"resource_identifier":"lp_host_1","stream":"stderr"}"#.to_vec(),
+                br#"{"resource_identifier":"lp_host_1"}"#.to_vec(),
+            ]
+        );
+    }
+
+    /// A delivered mixed batch records its exact body-variant split into the
+    /// attached per-stream counters.
+    #[tokio::test]
+    async fn delivered_batch_records_its_body_variant_split() {
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/wire"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(
+                {
+                    let mut buf = Vec::new();
+                    WireResponse {
+                        accepted: 4,
+                        rejected: 0,
+                        error_message: String::new(),
+                    }
+                    .encode(&mut buf)
+                    .unwrap();
+                    buf
+                },
+                "application/x-protobuf",
+            ))
+            .mount(&mock_server)
+            .await;
+
+        let counters = Arc::new(crate::counters::BodyVariantCounters::default());
+        let shipper = Shipper::new(
+            &format!("{}/wire", mock_server.uri()),
+            "arc_test",
+            "repo_app",
+            None,
+        )
+        .unwrap()
+        .with_body_variant_counters(counters.clone());
+
+        let entries = untagged(vec![
+            br#"{"level":"INFO","msg":"json object"}"#.to_vec(),
+            b"plain text".to_vec(),
+            b"more text".to_vec(),
+            vec![0xff, 0xfe, 0x00],
+        ]);
+        let outcome = shipper.ship_capped_with_shrink(&entries, usize::MAX).await;
+
+        assert!(matches!(outcome, CappedShipOutcome::Delivered { count: 4 }));
+        assert_eq!(
+            counters.snapshot(),
+            BodyVariantSplit {
+                entry_json: 1,
+                raw_text: 2,
+                raw_bytes: 1,
+            }
+        );
+    }
+
+    /// Only the encoding that actually settles is counted: the oversized first
+    /// attempt (413) re-encodes a smaller prefix, and only the delivered
+    /// prefix's split lands in the counters — no double counting.
+    #[tokio::test]
+    async fn shrunk_batch_counts_only_the_delivered_prefix() {
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/wire"))
+            .respond_with(ResponseTemplate::new(413).set_body_string("too large"))
+            .up_to_n_times(1)
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/wire"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(
+                {
+                    let mut buf = Vec::new();
+                    WireResponse {
+                        accepted: 2,
+                        rejected: 0,
+                        error_message: String::new(),
+                    }
+                    .encode(&mut buf)
+                    .unwrap();
+                    buf
+                },
+                "application/x-protobuf",
+            ))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let counters = Arc::new(crate::counters::BodyVariantCounters::default());
+        let shipper = Shipper::new(
+            &format!("{}/wire", mock_server.uri()),
+            "arc_test",
+            "repo_app",
+            None,
+        )
+        .unwrap()
+        .with_body_variant_counters(counters.clone());
+
+        let entries = untagged(vec![
+            br#"{"msg":"delivered json"}"#.to_vec(),
+            b"delivered text".to_vec(),
+            b"left behind".to_vec(),
+            b"also left behind".to_vec(),
+        ]);
+        let outcome = shipper.ship_capped_with_shrink(&entries, usize::MAX).await;
+
+        assert!(matches!(outcome, CappedShipOutcome::Delivered { count: 2 }));
+        assert_eq!(
+            counters.snapshot(),
+            BodyVariantSplit {
+                entry_json: 1,
+                raw_text: 1,
+                raw_bytes: 0,
+            },
+            "the rejected oversized encoding must not be counted, only the delivered prefix"
+        );
+    }
+
+    /// A deferred ship (relay refuses, entries stay buffered for retry) must
+    /// not count — the retry re-encodes and would otherwise double-count.
+    #[tokio::test]
+    async fn deferred_ship_records_nothing() {
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/wire"))
+            .respond_with(ResponseTemplate::new(400).set_body_string("bad request"))
+            .mount(&mock_server)
+            .await;
+
+        let counters = Arc::new(crate::counters::BodyVariantCounters::default());
+        let shipper = Shipper::new(
+            &format!("{}/wire", mock_server.uri()),
+            "arc_test",
+            "repo_app",
+            None,
+        )
+        .unwrap()
+        .with_body_variant_counters(counters.clone());
+
+        let entries = untagged(vec![b"never settled".to_vec()]);
+        let outcome = shipper.ship_capped_with_shrink(&entries, usize::MAX).await;
+
+        assert!(matches!(outcome, CappedShipOutcome::Deferred { .. }));
+        assert_eq!(counters.snapshot(), BodyVariantSplit::default());
     }
 
     #[test]
@@ -1222,7 +1519,7 @@ mod tests {
     fn stamps_resource_identifier_only_when_identity_present() {
         // Default (no identity): empty metadata object, no per-line identity bytes.
         let off = Shipper::new("http://x/wire", "arc", "repo", None).unwrap();
-        assert_eq!(off.envelope_metadata_bytes(), b"{}");
+        assert_eq!(off.envelope_metadata_bytes(LogStream::Unspecified), b"{}");
 
         // Opted in: the live identity is stamped under the relay's field name.
         let on = Shipper::new(
@@ -1233,7 +1530,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            on.envelope_metadata_bytes(),
+            on.envelope_metadata_bytes(LogStream::Unspecified),
             br#"{"resource_identifier":"host-1"}"#.to_vec()
         );
     }
@@ -1245,12 +1542,12 @@ mod tests {
         let identity = AgentIdentity::new("before".into());
         let shipper = Shipper::new("http://x/wire", "arc", "repo", Some(identity.clone())).unwrap();
         assert_eq!(
-            shipper.envelope_metadata_bytes(),
+            shipper.envelope_metadata_bytes(LogStream::Unspecified),
             br#"{"resource_identifier":"before"}"#.to_vec()
         );
         identity.apply_config("after");
         assert_eq!(
-            shipper.envelope_metadata_bytes(),
+            shipper.envelope_metadata_bytes(LogStream::Unspecified),
             br#"{"resource_identifier":"after"}"#.to_vec()
         );
     }

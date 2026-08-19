@@ -470,6 +470,40 @@ fn parse_since_timestamp(since: &str) -> i64 {
 mod tests {
     use super::*;
 
+    /// The mapping seam for the Docker API lane: stdout/stderr frames keep
+    /// their identity, while stdin/console frames — which carry no output
+    /// stream — map to none.
+    #[test]
+    fn log_output_maps_stdout_and_stderr_and_nothing_else() {
+        use bollard::container::LogOutput;
+
+        let frame = |output: LogOutput| log_output_stream(&output);
+        assert_eq!(
+            frame(LogOutput::StdOut {
+                message: "out".into()
+            }),
+            LogStream::Stdout
+        );
+        assert_eq!(
+            frame(LogOutput::StdErr {
+                message: "err".into()
+            }),
+            LogStream::Stderr
+        );
+        assert_eq!(
+            frame(LogOutput::StdIn {
+                message: "in".into()
+            }),
+            LogStream::Unspecified
+        );
+        assert_eq!(
+            frame(LogOutput::Console {
+                message: "tty".into()
+            }),
+            LogStream::Unspecified
+        );
+    }
+
     #[test]
     fn not_found_is_only_the_404_status() {
         assert!(is_container_not_found(

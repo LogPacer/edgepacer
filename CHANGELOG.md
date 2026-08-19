@@ -2,6 +2,20 @@
 
 ## Unreleased
 
+- Track per-stream body-variant counts (`entry_json` / `raw_text` /
+  `raw_bytes`) at the shipper classification seam, settle-exact: only
+  delivered or adjudicated batches count, so deferred retries and 413-shrunk
+  encodings never inflate them. The counts reach the control plane as
+  `body_variants` on each stream status and re-send on the next interval
+  tick when they change, never per increment.
+- Carry container stream identity (stdout/stderr) on the wire: it was parsed
+  and then discarded in every container lane until now, so each entry's
+  envelope `metadata_json` gains `{"stream":"stderr"}` beside the optional
+  resource identifier. The disk buffer encodes the stream as one
+  backward-compatible trailer byte, so entries written before the upgrade
+  still decode untagged. Multiline-assembled entries take their assembler's
+  stream; plain-file sources carry none.
+
 ## 0.2.15 - 2026-08-13
 
 - Multiline aggregation accepts an ordered `start_patterns` set instead of a

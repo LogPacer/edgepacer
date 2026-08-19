@@ -14,7 +14,7 @@ use std::io::{self, BufRead, BufReader, Read};
 use flate2::read::GzDecoder;
 use tracing::{error, info, warn};
 
-use crate::shipper::{ShipResult, Shipper};
+use crate::shipper::{ShipEntry, ShipResult, Shipper};
 
 /// An import request from Rails — specifies which files to import.
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -176,8 +176,12 @@ async fn ship_batch(lines: &[Vec<u8>], shipper: &Shipper) -> Result<(u64, u64), 
     let bytes: u64 = lines.iter().map(|l| l.len() as u64).sum();
     let count = lines.len() as u64;
 
+    let entries: Vec<ShipEntry> = lines
+        .iter()
+        .map(|line| ShipEntry::untagged(line.clone()))
+        .collect();
     let (encoded, _) = shipper
-        .encode_batch(lines)
+        .encode_batch(&entries)
         .map_err(|e| format!("encode failed: {e}"))?;
     match shipper.send_with_retry(&encoded).await {
         Ok(ShipResult::Accepted { .. }) => Ok((count, bytes)),

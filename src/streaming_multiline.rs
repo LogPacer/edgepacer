@@ -111,7 +111,7 @@ impl StreamingEntryAssembler {
         checkpoint: Option<StreamingCheckpoint>,
     ) -> Result<Option<StreamingEmit>, StreamingActorGone> {
         if self.spec.is_none() {
-            return enqueue(handle, line, timestamp_ns, checkpoint).await;
+            return enqueue(handle, line, timestamp_ns, checkpoint, stream).await;
         }
 
         let start_offset = self.next_offset;
@@ -208,7 +208,7 @@ impl StreamingEntryAssembler {
         meta: EventMetadata,
     ) -> Result<Option<StreamingEmit>, StreamingActorGone> {
         let (timestamp_ns, checkpoint) = self.consume_pending(stream, meta.line_count);
-        enqueue(handle, event, timestamp_ns, checkpoint).await
+        enqueue(handle, event, timestamp_ns, checkpoint, stream).await
     }
 
     /// Mark this event's lines finished and release whatever resume point the
@@ -257,8 +257,9 @@ async fn enqueue(
     line: Vec<u8>,
     timestamp_ns: i64,
     checkpoint: Option<StreamingCheckpoint>,
+    stream: LogStream,
 ) -> Result<Option<StreamingEmit>, StreamingActorGone> {
-    if !handle.enqueue(line, timestamp_ns).await {
+    if !handle.enqueue_from_stream(line, timestamp_ns, stream).await {
         return Err(StreamingActorGone);
     }
     Ok(Some(StreamingEmit { checkpoint }))
@@ -343,6 +344,70 @@ mod tests {
                 other => panic!("expected raw log body, got {other:?}"),
             })
             .collect()
+    }
+
+    /// The streaming lane (Docker API) keeps the stream tag all the way to the
+    /// wire: a stderr line — passed through with no multiline config — ships
+    /// with `"stream":"stderr"` in its envelope, an untagged line with `{}`.
+    #[tokio::test]
+    async fn streamed_lines_ship_with_their_stream_in_the_envelope() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/wire"))
+            .respond_with(AcceptEveryEntry)
+            .mount(&server)
+            .await;
+
+        let dir = tempfile::tempdir().unwrap();
+        let pipeline = test_pipeline(&format!("{}/wire", server.uri()), dir.path(), fast_config());
+        let (handle, actor) = spawn_streaming_actor(pipeline);
+
+        let mut assembler = StreamingEntryAssembler::new(None).unwrap();
+        assembler
+            .process_stream_line(&handle, LogStream::Stderr, b"boom".to_vec(), 100, None)
+            .await
+            .unwrap();
+        assembler
+            .process_line(&handle, b"untagged".to_vec(), 200, None)
+            .await
+            .unwrap();
+
+        drop(handle);
+        actor.await.unwrap();
+
+        let metadata: Vec<(String, Vec<u8>)> = server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .flat_map(|request| {
+                let decoded = crate::test_support::decode_gzip_wire_request(request);
+                decoded
+                    .batches
+                    .iter()
+                    .filter_map(|batch| match batch.payload.as_ref()? {
+                        routed_batch::Payload::Logs(logs) => Some(logs.clone()),
+                        _ => None,
+                    })
+                    .flat_map(|logs| logs.entries.into_iter())
+                    .map(|entry| {
+                        let body = match entry.body.as_ref().unwrap() {
+                            wire_log_event::Body::RawText(text) => text.clone(),
+                            other => panic!("expected raw text, got {other:?}"),
+                        };
+                        (body, entry.envelope.as_ref().unwrap().metadata_json.clone())
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+
+        assert_eq!(
+            metadata,
+            vec![
+                ("boom".to_string(), br#"{"stream":"stderr"}"#.to_vec()),
+                ("untagged".to_string(), b"{}".to_vec()),
+            ]
+        );
     }
 
     #[tokio::test]

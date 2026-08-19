@@ -24,8 +24,9 @@ use tracing::{debug, error, info, warn};
 
 use crate::buffer::{DiskBuffer, Durability};
 use crate::checkpoint::{CheckpointError, CheckpointStore};
+use crate::cri::LogStream;
 use crate::overflow::SharedOverflow;
-use crate::shipper::{CappedShipOutcome, Shipper};
+use crate::shipper::{CappedShipOutcome, ShipEntry, Shipper};
 use crate::streaming_checkpoint::StreamingCheckpoint;
 
 /// Result of [`StreamingDeliveryPipeline::prepare_drain`] — what the actor's
@@ -36,7 +37,7 @@ pub(crate) enum DrainPrep {
     /// Lines peeked from the buffer, ready to encode + ship as an in-flight
     /// future, with their buffer sequences to delete once delivery is confirmed.
     Batch {
-        lines: Vec<Vec<u8>>,
+        lines: Vec<ShipEntry>,
         sequences: Vec<u64>,
     },
 }
@@ -178,11 +179,14 @@ impl StreamingDeliveryPipeline {
     ///
     /// Returns `true` if enqueued (or dropped as blank), `false` if buffer is
     /// full (backpressure).
-    pub fn enqueue(&mut self, line: &[u8], timestamp_ns: i64) -> bool {
+    pub fn enqueue(&mut self, line: &[u8], timestamp_ns: i64, stream: LogStream) -> bool {
         if crate::common::is_blank_log_line(line) {
             return true;
         }
-        match self.buffer.enqueue_batch(&[line.to_vec()], timestamp_ns) {
+        match self
+            .buffer
+            .enqueue_stream_batch(&[(line.to_vec(), stream)], timestamp_ns)
+        {
             Ok(_) => true,
             Err(crate::buffer::BufferError::Full { .. }) => {
                 if self.spill_to_overflow(&[line.to_vec()], timestamp_ns) > 0 {
@@ -312,8 +316,10 @@ impl StreamingDeliveryPipeline {
 
         // Move the data out — the buffer still holds the authoritative copy
         // (peek doesn't delete), so no clone is needed.
-        let (lines, sequences): (Vec<Vec<u8>>, Vec<u64>) =
-            entries.into_iter().map(|e| (e.data, e.sequence)).unzip();
+        let (lines, sequences): (Vec<ShipEntry>, Vec<u64>) = entries
+            .into_iter()
+            .map(|e| (ShipEntry::new(e.data, e.stream), e.sequence))
+            .unzip();
         DrainPrep::Batch { lines, sequences }
     }
 
@@ -509,7 +515,13 @@ mod tests {
         let DrainPrep::Batch { lines, sequences } = pipeline.prepare_drain() else {
             panic!("expected buffered batch");
         };
-        assert_eq!(lines, input);
+        assert_eq!(
+            lines,
+            input
+                .iter()
+                .map(|line| ShipEntry::untagged(line.clone()))
+                .collect::<Vec<_>>()
+        );
         assert_eq!(sequences.len(), 3);
 
         pipeline.confirm_drained(&sequences[..2]);
@@ -641,10 +653,10 @@ mod tests {
         )
         .unwrap();
 
-        assert!(pipeline.enqueue(b"real line", 1000));
-        assert!(pipeline.enqueue(b"", 1000));
-        assert!(pipeline.enqueue(b"   \t  ", 1000));
-        assert!(pipeline.enqueue(b"another real line", 1000));
+        assert!(pipeline.enqueue(b"real line", 1000, LogStream::Unspecified));
+        assert!(pipeline.enqueue(b"", 1000, LogStream::Unspecified));
+        assert!(pipeline.enqueue(b"   \t  ", 1000, LogStream::Unspecified));
+        assert!(pipeline.enqueue(b"another real line", 1000, LogStream::Unspecified));
 
         let buffered: Vec<Vec<u8>> = pipeline
             .buffer

@@ -15,6 +15,15 @@
 
 use edgepacer::shipper::{ShipResult, Shipper};
 
+/// Wrap bare line bytes as untagged ship entries (single-stream sources).
+fn untagged(lines: &[Vec<u8>]) -> Vec<edgepacer::shipper::ShipEntry> {
+    lines
+        .iter()
+        .cloned()
+        .map(edgepacer::shipper::ShipEntry::untagged)
+        .collect()
+}
+
 #[tokio::test]
 #[ignore] // Requires running logrelay
 async fn live_ship_to_logrelay() {
@@ -34,7 +43,7 @@ async fn live_ship_to_logrelay() {
         b"2026-04-05T19:00:02Z INFO All 10 milestones complete, 101 tests passing".to_vec(),
     ];
 
-    let result = shipper.ship(&lines).await.unwrap();
+    let result = shipper.ship(&untagged(&lines)).await.unwrap();
 
     match result {
         ShipResult::Accepted { count } => {
@@ -83,7 +92,7 @@ async fn live_file_tail_and_ship() {
     )
     .unwrap();
 
-    let result = shipper.ship(&lines).await.unwrap();
+    let result = shipper.ship(&untagged(&lines)).await.unwrap();
     match result {
         ShipResult::Accepted { count } => {
             println!("SUCCESS: tailed {count} lines from file and shipped to live logrelay");
