@@ -2,6 +2,24 @@
 
 ## Unreleased
 
+## 0.2.17 - 2026-08-26
+
+- Resolve shared service and workload aliases to a running container during
+  overlapping deployments, while exact runtime identifiers still select their
+  own container and exited-only workloads remain available for stopped-container
+  diagnostics.
+- Assemble container samples independently per stdout/stderr stream, matching
+  delivery behavior and applying the tail limit to complete assembled events
+  instead of raw lines.
+- Report per-source pipeline liveness as `running`, `failed`, or `not_started`
+  alongside discovery status, including the exact startup error for failed
+  sources.
+- Start the OTLP HTTP/gRPC trace proxy in local mode, with retrying listener
+  startup, safe rollback, atomic listener binding, and bounded shutdown.
+- Recover eBPF protocol trackers after explicit capture gaps only at trustworthy
+  request boundaries, and expose current-generation gaps as
+  `agent_ebpf_stream_gaps`.
+
 ## 0.2.16 - 2026-08-19
 
 - Track per-stream body-variant counts (`entry_json` / `raw_text` /
