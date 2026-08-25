@@ -1,4 +1,4 @@
-#![cfg(unix)]
+#![cfg(target_os = "linux")]
 
 use std::net::TcpListener;
 use std::process::Stdio;

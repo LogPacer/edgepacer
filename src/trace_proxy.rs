@@ -371,7 +371,7 @@ async fn drain_loop(state: Arc<ProxyState>) {
             // them verbatim through the same transport the request path uses.
             let outcome = tokio::select! {
                 outcome = ship_payload(&state.transport, state.retry_policy, &entry.payload) => outcome,
-                _ = wait_for_proxy_shutdown(state.shutdown.subscribe()) => return,
+                _ = wait_for_proxy_shutdown(state.shutdown.subscribe()) => break,
             };
 
             match outcome {
@@ -764,7 +764,9 @@ mod tests {
     use std::collections::HashMap;
     use std::path::Path;
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
+    use axum::response::IntoResponse;
     use logpacer_wire::{WireRequest, WireResponse, routed_batch};
     use opentelemetry_proto::tonic::trace::v1::{ScopeSpans, Span};
     use prost::Message as WireMessage;
@@ -776,6 +778,25 @@ mod tests {
     ) {
         entered.notify_one();
         std::future::pending::<()>().await;
+    }
+
+    async fn accept_once_then_stall(
+        axum::extract::State((requests, stalled)): axum::extract::State<(
+            Arc<AtomicUsize>,
+            Arc<tokio::sync::Notify>,
+        )>,
+    ) -> axum::response::Response {
+        if requests.fetch_add(1, Ordering::SeqCst) == 0 {
+            return (
+                StatusCode::OK,
+                [("content-type", "application/x-protobuf")],
+                wire_response(1, 0, ""),
+            )
+                .into_response();
+        }
+
+        stalled.notify_one();
+        std::future::pending::<axum::response::Response>().await
     }
 
     /// Wire endpoint path the proxy POSTs to verbatim — the test subbox endpoint
@@ -1308,6 +1329,50 @@ mod tests {
             0,
             "drain should have replayed all entries"
         );
+    }
+
+    #[tokio::test]
+    async fn drain_shutdown_deletes_entries_confirmed_before_a_stalled_delivery() {
+        let requests = Arc::new(AtomicUsize::new(0));
+        let stalled = Arc::new(tokio::sync::Notify::new());
+        let relay_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let relay_address = relay_listener.local_addr().unwrap();
+        let relay = tokio::spawn(
+            axum::serve(
+                relay_listener,
+                Router::new()
+                    .route(WIRE_PATH, post(accept_once_then_stall))
+                    .with_state((requests, stalled.clone())),
+            )
+            .into_future(),
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let buffer_path = dir.path().join("trace-buffer.sqlite");
+        let config = test_config(format!("http://{relay_address}{WIRE_PATH}"), &buffer_path);
+        {
+            let mut buffer = TraceBuffer::open(&buffer_path, 10).unwrap();
+            let payload = sample_wire_payload();
+            buffer.enqueue("arc_test", "repo_test", &payload).unwrap();
+            buffer.enqueue("arc_test", "repo_test", &payload).unwrap();
+        }
+
+        let mut proxy = TraceProxy::new(config);
+        proxy.start().await.expect("proxy should start");
+        tokio::time::timeout(Duration::from_secs(2), stalled.notified())
+            .await
+            .expect("the second buffered delivery should stall");
+
+        proxy.stop().await;
+
+        let buffer = TraceBuffer::open(&buffer_path, 10).unwrap();
+        assert_eq!(
+            buffer.count().unwrap(),
+            1,
+            "shutdown should retain only the delivery whose outcome is unknown"
+        );
+        relay.abort();
+        let _ = relay.await;
     }
 
     #[tokio::test]
