@@ -259,6 +259,7 @@ pub(crate) fn agent_metrics_to_map(
             "ebpf_capture_read_faults",
             counters.ebpf_capture_read_faults as f64,
         ),
+        ("ebpf_stream_gaps", counters.ebpf_stream_gaps as f64),
     ]
     .into_iter()
     .map(|(key, value)| (format!("agent_{key}"), value))
@@ -541,11 +542,12 @@ mod tests {
             spans_cross_linked: 3,
             spans_kind_from_bytes: 5,
             ebpf_capture_read_faults: 8,
+            ebpf_stream_gaps: 2,
         };
 
         let map = agent_metrics_to_map(&counters, 7, 12.5, 64, 300);
 
-        assert_eq!(map.len(), 17);
+        assert_eq!(map.len(), 18);
         assert!(map.keys().all(|k| k.starts_with("agent_")));
         assert_eq!(map["agent_cpu_percent"], 12.5);
         assert_eq!(map["agent_memory_mb"], 64.0);
@@ -560,6 +562,7 @@ mod tests {
         assert_eq!(map["agent_spans_cross_linked"], 3.0);
         assert_eq!(map["agent_spans_kind_from_bytes"], 5.0);
         assert_eq!(map["agent_ebpf_capture_read_faults"], 8.0);
+        assert_eq!(map["agent_ebpf_stream_gaps"], 2.0);
     }
 
     #[test]

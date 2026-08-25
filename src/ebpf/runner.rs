@@ -1072,6 +1072,7 @@ pub async fn run_with_counters(
                 if !capture_generation_is_current(seg.capture_generation, active_listener_generation) {
                     continue;
                 }
+                counters.observe_ebpf_stream_gap(seg.stream_gap);
                 let pid = seg.pid;
                 let ts = seg.timestamp_nano;
                 let Some(service) = route_captured_event(
