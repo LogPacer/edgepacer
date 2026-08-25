@@ -270,7 +270,13 @@ impl DiscoveryCache {
     // directive means no pipeline.
     fn update_containers(&mut self, containers: &[Container]) {
         self.containers.clear();
-        for container in containers {
+        // Index stopped generations first so a running generation wins shared
+        // aliases while every generation remains available by its unique keys.
+        for container in containers
+            .iter()
+            .filter(|c| c.state != "running")
+            .chain(containers.iter().filter(|c| c.state == "running"))
+        {
             let c = container.clone();
             let spec_name = if !c.container_name.is_empty() {
                 c.container_name.clone()
@@ -661,6 +667,17 @@ mod tests {
         c
     }
 
+    fn kamal_generation(id: &str, name: &str, state: &str) -> Container {
+        let mut c = container_with_id(id, name, "");
+        c.state = state.into();
+        c.service_name = "checkout".into();
+        c.service_name_explicit = true;
+        c.labels.insert("service".into(), "checkout".into());
+        c.labels.insert("role".into(), "web".into());
+        c.labels.insert("destination".into(), "prod".into());
+        c
+    }
+
     fn cache_with(containers: Vec<Container>) -> DiscoveryCache {
         let census = Census {
             containers,
@@ -1034,6 +1051,44 @@ mod tests {
         let access = matched(cache.resolve("billing", "container"));
         assert_eq!(access.matched_via, MatchVia::ServiceName);
         assert_eq!(access.confidence(), Confidence::Explicit);
+    }
+
+    #[test]
+    fn shared_aliases_prefer_a_running_generation_and_keep_exact_ids() {
+        let cache = cache_with(vec![
+            kamal_generation("running-id", "checkout-web-prod-new", "running"),
+            kamal_generation("exited-id", "checkout-web-prod-old", "exited"),
+        ]);
+
+        let service = matched(cache.resolve("checkout", "container"));
+        assert_eq!(service.matched_via, MatchVia::ServiceName);
+        assert_eq!(service.access_locator, "running-id");
+
+        let stable = matched(cache.resolve("checkout-prod", "container"));
+        assert_eq!(stable.matched_via, MatchVia::StableId);
+        assert_eq!(stable.access_locator, "running-id");
+
+        let exited = matched(cache.resolve("exited-id", "container"));
+        assert_eq!(exited.matched_via, MatchVia::ContainerId);
+        assert_eq!(exited.access_locator, "exited-id");
+    }
+
+    #[test]
+    fn shared_aliases_still_resolve_an_exited_only_generation() {
+        let cache = cache_with(vec![kamal_generation(
+            "exited-id",
+            "checkout-web-prod-old",
+            "exited",
+        )]);
+
+        assert_eq!(
+            matched(cache.resolve("checkout", "container")).access_locator,
+            "exited-id"
+        );
+        assert_eq!(
+            matched(cache.resolve("checkout-prod", "container")).access_locator,
+            "exited-id"
+        );
     }
 
     #[test]
