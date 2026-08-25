@@ -41,7 +41,7 @@ pub(crate) enum DockerStreamEnd {
 /// Which container output stream a Docker API frame came from. The API keeps
 /// stdout and stderr in separate frames; keeping the tag is what lets a stack
 /// trace on stderr assemble while stdout lines arrive between its frames.
-fn log_output_stream(output: &bollard::container::LogOutput) -> LogStream {
+pub(crate) fn log_output_stream(output: &bollard::container::LogOutput) -> LogStream {
     use bollard::container::LogOutput;
 
     match output {

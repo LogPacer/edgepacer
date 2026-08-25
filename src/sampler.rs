@@ -6,7 +6,7 @@
 //!
 //! Rails uses samples for LLM-based log format detection and parsing schema generation.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::io::{BufRead, BufReader};
 use std::path::Path;
 use std::time::Duration;
@@ -18,9 +18,10 @@ use tokio::sync::watch;
 use tracing::{debug, info, warn};
 
 use crate::config::{self, MultilineConfig, StreamAccessMethod};
+use crate::cri::LogStream;
 use crate::discovery::SharedDiscoveryCache;
 use crate::discovery::cache::AccessMethod;
-use crate::entry_assembler::assemble_batch;
+use crate::entry_assembler::{EntryAssembler, LineContext};
 use crate::journal;
 use crate::sender::Client;
 
@@ -51,6 +52,26 @@ const DEFAULT_MAX_LINES: usize = 1000;
 struct SampleBounds {
     min_lines: Option<usize>,
     max_lines: usize,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct SampleLine {
+    content: String,
+    stream: LogStream,
+}
+
+impl SampleLine {
+    fn new(content: String, stream: LogStream) -> Self {
+        Self { content, stream }
+    }
+
+    fn untagged(content: String) -> Self {
+        Self::new(content, LogStream::Unspecified)
+    }
+}
+
+fn untagged(lines: Vec<String>) -> Vec<SampleLine> {
+    lines.into_iter().map(SampleLine::untagged).collect()
 }
 
 /// Map a wire request's optional bounds to the concrete bounds used for reading.
@@ -304,17 +325,17 @@ async fn read_sample_lines_for_identifier(
     // (journald/docker/event-log) cap at the source since their history is not
     // rewindable, and the final tail is then a no-op for them.
     let lines = match resolved {
-        Some((AccessMethod::File, locator)) => read_file_lines(&locator)?,
+        Some((AccessMethod::File, locator)) => untagged(read_file_lines(&locator)?),
         Some((AccessMethod::Kubernetes, locator)) => read_kubernetes_lines(&locator)?,
         Some((AccessMethod::DockerJsonFile, locator)) => read_docker_json_file_lines(&locator)?,
-        Some((AccessMethod::Journald, unit)) => sample_journald_unit(&unit, max_lines)?,
+        Some((AccessMethod::Journald, unit)) => untagged(sample_journald_unit(&unit, max_lines)?),
         Some((AccessMethod::DockerApi, container_id)) => {
             read_docker_lines(&container_id, max_lines).await?
         }
         Some((AccessMethod::WindowsEventLog, channel)) => {
-            crate::windows_event_log::sample_channel_lines(&channel, max_lines).await?
+            untagged(crate::windows_event_log::sample_channel_lines(&channel, max_lines).await?)
         }
-        None => read_sample_lines(identifier, max_lines)?,
+        None => untagged(read_sample_lines(identifier, max_lines)?),
     };
 
     Ok(finalize_sample(lines, multiline.as_ref(), max_lines))
@@ -374,35 +395,84 @@ fn resolve_multiline(
 /// multiline pattern would also stop the shipping pipeline, so dropping the
 /// sample there keeps the two paths consistent.
 fn finalize_sample(
-    lines: Vec<String>,
+    lines: Vec<SampleLine>,
     multiline: Option<&MultilineConfig>,
     max_lines: usize,
 ) -> Vec<String> {
-    let assembled = match multiline {
-        None => lines,
+    match multiline {
+        None => {
+            let start = lines.len().saturating_sub(max_lines);
+            lines
+                .into_iter()
+                .skip(start)
+                .map(|line| line.content)
+                .collect()
+        }
         Some(config) => {
-            let bytes: Vec<Vec<u8>> = lines.into_iter().map(String::into_bytes).collect();
-            match assemble_batch(bytes, Some(config)) {
-                Ok(events) => events
-                    .into_iter()
-                    .map(|event| String::from_utf8_lossy(&event).into_owned())
-                    .collect(),
-                Err(error) => {
-                    warn!(%error, "invalid sample multiline pattern; skipping assembly");
-                    return Vec::new();
+            let timeout = Duration::from_secs(u64::from(config.timeout_secs.max(1)));
+            let mut assemblers: Vec<(LogStream, EntryAssembler)> = Vec::new();
+            let mut events = VecDeque::new();
+
+            for (offset, line) in lines.into_iter().enumerate() {
+                let index = match assemblers
+                    .iter()
+                    .position(|(candidate, _)| *candidate == line.stream)
+                {
+                    Some(index) => index,
+                    None => match EntryAssembler::new(
+                        config.patterns(),
+                        config.max_lines as usize,
+                        timeout,
+                    ) {
+                        Ok(assembler) => {
+                            assemblers.push((line.stream, assembler));
+                            assemblers.len() - 1
+                        }
+                        Err(error) => {
+                            warn!(%error, "invalid sample multiline pattern; skipping assembly");
+                            return Vec::new();
+                        }
+                    },
+                };
+                let start = offset as u64;
+                let context = LineContext {
+                    start_offset: start,
+                    end_offset: start + 1,
+                    inode: 0,
+                };
+                if let Some((event, _)) = assemblers[index]
+                    .1
+                    .process(line.content.into_bytes(), context)
+                {
+                    push_sample_event(&mut events, event, max_lines);
                 }
             }
-        }
-    };
 
-    let start = assembled.len().saturating_sub(max_lines);
-    assembled[start..].to_vec()
+            for (_, assembler) in &mut assemblers {
+                if let Some((event, _)) = assembler.flush() {
+                    push_sample_event(&mut events, event, max_lines);
+                }
+            }
+
+            events.into()
+        }
+    }
+}
+
+fn push_sample_event(events: &mut VecDeque<String>, event: Vec<u8>, max_lines: usize) {
+    if max_lines == 0 {
+        return;
+    }
+    if events.len() == max_lines {
+        events.pop_front();
+    }
+    events.push_back(String::from_utf8_lossy(&event).into_owned());
 }
 
 /// Read the assembled CRI messages from a Kubernetes container log directory,
 /// reusing the streaming tailer's parse + partial reassembly so samples equal
 /// the bare messages shipped on the wire (not raw CRI lines).
-fn read_kubernetes_lines(dir: &str) -> Result<Vec<String>, String> {
+fn read_kubernetes_lines(dir: &str) -> Result<Vec<SampleLine>, String> {
     let raw = crate::container_reader::sample_lines(Path::new(dir)).map_err(|e| {
         if e.kind() == std::io::ErrorKind::NotFound {
             format!("file not found: {dir}")
@@ -413,7 +483,12 @@ fn read_kubernetes_lines(dir: &str) -> Result<Vec<String>, String> {
 
     Ok(raw
         .into_iter()
-        .map(|line| String::from_utf8_lossy(&line).into_owned())
+        .map(|line| {
+            SampleLine::new(
+                String::from_utf8_lossy(&line.message).into_owned(),
+                line.stream,
+            )
+        })
         .collect())
 }
 
@@ -486,7 +561,10 @@ fn sample_error_reason(error: &str) -> &'static str {
     }
 }
 
-async fn read_docker_lines(container_id: &str, max_lines: usize) -> Result<Vec<String>, String> {
+async fn read_docker_lines(
+    container_id: &str,
+    max_lines: usize,
+) -> Result<Vec<SampleLine>, String> {
     let docker = match crate::discovery::docker::connect_docker() {
         Ok(Some(docker)) => docker,
         Ok(None) => return Err("no Docker-compatible endpoint configured".to_string()),
@@ -510,16 +588,17 @@ async fn read_docker_lines(container_id: &str, max_lines: usize) -> Result<Vec<S
     let mut lines = Vec::new();
 
     while let Some(item) = stream.next().await {
-        let raw = item
-            .map_err(|error| format!("docker logs failed for {container_id}: {error}"))?
-            .to_string();
+        let output =
+            item.map_err(|error| format!("docker logs failed for {container_id}: {error}"))?;
+        let stream = crate::docker_stream::log_output_stream(&output);
+        let raw = output.to_string();
 
         let (_, line) = crate::docker_stream::parse_docker_log_line(&raw);
         let line = crate::ansi::strip_str(line);
         if line.is_empty() {
             continue;
         }
-        lines.push(line.into_owned());
+        lines.push(SampleLine::new(line.into_owned(), stream));
     }
 
     let start = lines.len().saturating_sub(max_lines);
@@ -532,22 +611,31 @@ async fn read_docker_lines(container_id: &str, max_lines: usize) -> Result<Vec<S
 /// assembler and then takes the tail (`finalize_sample`), so an assembled entry
 /// is never split at the window edge.
 fn read_file_lines(path: &str) -> Result<Vec<String>, String> {
-    read_file_lines_with(path, |line| crate::ansi::strip_str(line).into_owned())
+    read_file_lines_with(path, |line| {
+        let line = crate::ansi::strip_str(line).into_owned();
+        (!line.trim().is_empty()).then_some(line)
+    })
 }
 
-fn read_docker_json_file_lines(path: &str) -> Result<Vec<String>, String> {
+fn read_docker_json_file_lines(path: &str) -> Result<Vec<SampleLine>, String> {
     // Count lines that are NOT Docker-wrapped and reach the sample raw. A raw
     // line here can misclassify a plaintext app as JSON downstream, so it is a
     // signal worth surfacing rather than silently swallowing.
     let raw_fallbacks = std::cell::Cell::new(0usize);
     let lines = read_file_lines_with(path, |line| {
+        if line.trim().is_empty() {
+            return None;
+        }
         match crate::cri::parse_docker_json_line(line.as_bytes()) {
             Some(record) => {
-                String::from_utf8_lossy(&crate::ansi::strip_owned(record.payload)).into_owned()
+                let content =
+                    String::from_utf8_lossy(&crate::ansi::strip_owned(record.payload)).into_owned();
+                (!content.trim().is_empty()).then(|| SampleLine::new(content, record.stream))
             }
             None => {
                 raw_fallbacks.set(raw_fallbacks.get() + 1);
-                crate::ansi::strip_str(line).into_owned()
+                let content = crate::ansi::strip_str(line).into_owned();
+                (!content.trim().is_empty()).then(|| SampleLine::untagged(content))
             }
         }
     })?;
@@ -564,10 +652,10 @@ fn read_docker_json_file_lines(path: &str) -> Result<Vec<String>, String> {
     Ok(lines)
 }
 
-fn read_file_lines_with(
+fn read_file_lines_with<T>(
     path: &str,
-    transform: impl Fn(&str) -> String,
-) -> Result<Vec<String>, String> {
+    transform: impl Fn(&str) -> Option<T>,
+) -> Result<Vec<T>, String> {
     let file_path = Path::new(path);
     if !file_path.exists() {
         return Err(format!("file not found: {path}"));
@@ -579,8 +667,7 @@ fn read_file_lines_with(
     Ok(reader
         .lines()
         .map_while(Result::ok)
-        .map(|line| transform(&line))
-        .filter(|l| !l.trim().is_empty())
+        .filter_map(|line| transform(&line))
         .collect())
 }
 
@@ -592,8 +679,15 @@ fn sample_fetch_retry_delay(failures: u32, poll_interval: Duration) -> Duration 
 }
 
 #[cfg(test)]
+mod container_stream_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
+
+    fn sample_contents(lines: &[SampleLine]) -> Vec<String> {
+        lines.iter().map(|line| line.content.clone()).collect()
+    }
 
     #[test]
     fn read_sample_from_file() {
@@ -634,7 +728,14 @@ mod tests {
 
         let lines = read_docker_json_file_lines(path.to_str().unwrap()).unwrap();
 
-        assert_eq!(lines, vec!["first", r#"{"level":"INFO","msg":"second"}"#]);
+        assert_eq!(
+            sample_contents(&lines),
+            vec!["first", r#"{"level":"INFO","msg":"second"}"#]
+        );
+        assert_eq!(
+            lines.iter().map(|line| line.stream).collect::<Vec<_>>(),
+            vec![LogStream::Stdout, LogStream::Stdout]
+        );
     }
 
     /// Kill-test extension: the docker json-file sample must strip the wrapper
@@ -660,7 +761,13 @@ mod tests {
             })
             .collect();
 
-        assert_eq!(sample, wire, "sample payload must equal the wire payload");
+        assert_eq!(
+            sample_contents(&sample),
+            wire,
+            "sample payload must equal the wire payload"
+        );
+        assert_eq!(sample[0].stream, LogStream::Stdout);
+        assert_eq!(sample[1].stream, LogStream::Stderr);
     }
 
     #[test]
@@ -672,7 +779,7 @@ mod tests {
             "    indented body".to_string(),
             "2026-07-13 second".to_string(),
         ];
-        assert_eq!(finalize_sample(lines.clone(), None, 1000), lines);
+        assert_eq!(finalize_sample(untagged(lines.clone()), None, 1000), lines);
     }
 
     /// Drive the shipper's assembler (`EntryAssembler`, the component both the
@@ -715,7 +822,7 @@ mod tests {
             "2026-07-13 INFO request done".to_string(),
         ];
 
-        let sample = finalize_sample(lines.clone(), Some(&cfg), 1000);
+        let sample = finalize_sample(untagged(lines.clone()), Some(&cfg), 1000);
 
         assert_eq!(sample, shipper_assembled(&cfg, &lines));
     }
@@ -736,7 +843,7 @@ mod tests {
             "    body three".to_string(),
         ];
 
-        let sample = finalize_sample(lines, Some(&cfg), 2);
+        let sample = finalize_sample(untagged(lines), Some(&cfg), 2);
 
         assert_eq!(
             sample,

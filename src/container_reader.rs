@@ -261,18 +261,20 @@ fn inode_of(_meta: &std::fs::Metadata) -> u64 {
 /// This is the reader seam only — it does not apply a tail window. The sampler
 /// composes the optional multiline assembler on top and then takes the tail, so
 /// the window covers whole assembled entries, matching the shipping pipeline.
-pub fn sample_lines(container_dir: &Path) -> io::Result<Vec<Vec<u8>>> {
+pub fn sample_lines(container_dir: &Path) -> io::Result<Vec<ContainerLine>> {
     let active = find_highest_log_file(container_dir)?;
     let file = File::open(container_dir.join(&active))?;
     let mut reader = BufReader::new(file);
     let mut partial_buffer = Vec::new();
+    let mut partial_source_len = 0u64;
     let mut lines = Vec::new();
 
     loop {
         let mut raw = Vec::new();
         match reader.read_until(b'\n', &mut raw) {
             Ok(0) => break,
-            Ok(_) => {
+            Ok(n) => {
+                partial_source_len += n as u64;
                 if raw.last() == Some(&b'\n') {
                     raw.pop();
                 }
@@ -280,12 +282,16 @@ pub fn sample_lines(container_dir: &Path) -> io::Result<Vec<Vec<u8>>> {
                     raw.pop();
                 }
 
-                if let Some((out, _)) = cri::reassemble_partial(&raw, &mut partial_buffer) {
+                if let Some((out, stream)) = cri::reassemble_partial(&raw, &mut partial_buffer) {
                     let mut out = crate::ansi::strip_owned(out);
                     if out.len() > DEFAULT_MAX_LINE_BYTES {
                         out.truncate(DEFAULT_MAX_LINE_BYTES);
                     }
-                    lines.push(out);
+                    lines.push(ContainerLine {
+                        message: out,
+                        stream,
+                        source_len: std::mem::take(&mut partial_source_len),
+                    });
                 }
             }
             Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
@@ -310,6 +316,7 @@ pub fn is_kubernetes_log_path(path: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cri::LogStream;
 
     /// Kill-test: a Kubernetes sample must be byte-identical to the bare
     /// messages the streaming tailer ships — CRI prefix stripped and `P`/`F`
@@ -352,7 +359,16 @@ mod tests {
             .into_iter()
             .map(|line| line.message)
             .collect();
-        let sample_messages = sample_lines(dir.path()).unwrap();
+        let sample_lines = sample_lines(dir.path()).unwrap();
+        assert_eq!(
+            sample_lines
+                .iter()
+                .map(|line| line.stream)
+                .collect::<Vec<_>>(),
+            vec![LogStream::Stdout, LogStream::Stdout, LogStream::Stdout]
+        );
+        let sample_messages: Vec<Vec<u8>> =
+            sample_lines.into_iter().map(|line| line.message).collect();
 
         assert_eq!(
             wire_messages, sample_messages,
