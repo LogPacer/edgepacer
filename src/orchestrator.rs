@@ -248,12 +248,16 @@ impl Orchestrator {
         }
         if let Some(ref c) = self.counters {
             c.increment_errors();
+            c.body_variants().mark_pipeline_failed(stream_id, err);
         }
     }
 
     fn clear_pipeline_error(&self, stream_id: &str) {
         if let Some(ref ec) = self.error_collector {
             ec.clear_error("collect", stream_id);
+        }
+        if let Some(ref counters) = self.counters {
+            counters.body_variants().mark_pipeline_running(stream_id);
         }
     }
 

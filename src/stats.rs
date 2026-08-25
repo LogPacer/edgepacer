@@ -11,7 +11,7 @@ use tokio::sync::watch;
 use tracing::{debug, info, warn};
 
 use crate::config::{SharedConfig, effective_stats_interval, stats_reporting_enabled};
-use crate::counters::{BodyVariantRegistry, BodyVariantSplit};
+use crate::counters::{BodyVariantRegistry, BodyVariantSplit, PipelineLiveness};
 use crate::discovery::cache::CollectMatch;
 const DEFAULT_STATS_INTERVAL: Duration = Duration::from_secs(60);
 
@@ -62,6 +62,9 @@ pub struct StreamConfigStatus {
     pub confidence: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
+    /// Whether this matched source has a live pipeline. Additive to `status`,
+    /// which retains its discovery-match meaning for existing consumers.
+    pub pipeline: String,
     pub last_checked: String,
     /// How this stream's shipped entries split across the wire body variants,
     /// cumulative since the source started. Omitted while the source has no
@@ -80,6 +83,7 @@ impl StreamConfigStatus {
             matched_via: None,
             confidence: None,
             reason: None,
+            pipeline: "not_started".to_string(),
             last_checked: last_checked.to_string(),
             body_variants: None,
         }
@@ -134,12 +138,13 @@ fn status_signature(statuses: &[StreamConfigStatus]) -> String {
                 .map(|v| format!("{}/{}/{}", v.entry_json, v.raw_text, v.raw_bytes))
                 .unwrap_or_default();
             format!(
-                "{}|{}|{}|{}|{}|{}",
+                "{}|{}|{}|{}|{}|{}|{}",
                 s.log_source_id,
                 s.status,
                 s.matched_via.as_deref().unwrap_or(""),
                 s.confidence.as_deref().unwrap_or(""),
                 s.reason.as_deref().unwrap_or(""),
+                s.pipeline,
                 variants,
             )
         })
@@ -258,6 +263,16 @@ async fn collect_stream_status(
             .map(|stream| {
                 let mut status = stream_status_for_collect_stream(&stream, &cache, last_checked);
                 status.body_variants = body_variants.snapshot_for(&stream.log_source_id);
+                match body_variants.pipeline_liveness_for(&stream.log_source_id) {
+                    Some(PipelineLiveness::Running) => status.pipeline = "running".to_string(),
+                    Some(PipelineLiveness::Failed { reason }) => {
+                        status.pipeline = "failed".to_string();
+                        if status.status == "collecting" {
+                            status.reason = Some(reason);
+                        }
+                    }
+                    None => {}
+                }
                 status
             })
             .collect(),
@@ -359,6 +374,7 @@ mod tests {
                 matched_via: Some("stable_id".to_string()),
                 confidence: Some("explicit".to_string()),
                 reason: None,
+                pipeline: "running".to_string(),
                 last_checked: "2026-06-22T19:30:00Z".to_string(),
                 body_variants: Some(BodyVariantSplit {
                     entry_json: 12,
@@ -388,6 +404,7 @@ mod tests {
         assert_eq!(v["stream_status"][0]["status"], "collecting");
         assert_eq!(v["stream_status"][0]["matched_via"], "stable_id");
         assert_eq!(v["stream_status"][0]["confidence"], "explicit");
+        assert_eq!(v["stream_status"][0]["pipeline"], "running");
         assert_eq!(v["stream_status"][0]["body_variants"]["entry_json"], 12);
         assert_eq!(v["stream_status"][0]["body_variants"]["raw_text"], 3);
         assert_eq!(v["stream_status"][0]["body_variants"]["raw_bytes"], 1);
@@ -566,6 +583,7 @@ mod tests {
             matched_via: None,
             confidence: None,
             reason: None,
+            pipeline: "not_started".to_string(),
             last_checked: last_checked.to_string(),
             body_variants: None,
         }
@@ -610,6 +628,22 @@ mod tests {
         assert!(
             send_ok(&mut reporter, Some(vec![status("a", "collecting", "t4")])),
             "re-adding a source after it cleared must resend"
+        );
+    }
+
+    #[test]
+    fn reporter_sends_when_only_pipeline_liveness_changes() {
+        let mut reporter = StreamStatusReporter::default();
+        assert!(send_ok(
+            &mut reporter,
+            Some(vec![status("a", "collecting", "t1")])
+        ));
+
+        let mut running = status("a", "collecting", "t2");
+        running.pipeline = "running".to_string();
+        assert!(
+            send_ok(&mut reporter, Some(vec![running])),
+            "a pipeline transition must not be hidden by status deduplication"
         );
     }
 
@@ -672,6 +706,7 @@ mod tests {
                 raw_text: 2,
                 raw_bytes: 0,
             });
+        registry.mark_pipeline_running("src-shipped");
 
         let statuses = collect_stream_status(&shared_config, &discovery_cache, &registry, "now")
             .await
@@ -697,6 +732,117 @@ mod tests {
             None,
             "a stream that never shipped reports no split — and never another stream's"
         );
+    }
+
+    #[tokio::test]
+    async fn collect_stream_status_distinguishes_pipeline_liveness() {
+        let dir = tempfile::tempdir().unwrap();
+        let running_path = dir.path().join("running.log");
+        let failed_path = dir.path().join("failed.log");
+        let never_started_path = dir.path().join("never-started.log");
+        for path in [&running_path, &failed_path, &never_started_path] {
+            std::fs::write(path, "line\n").unwrap();
+        }
+
+        let config = crate::config::UnifiedConfig::new(
+            json!({
+                "collect": {
+                    "src-running": {
+                        "locator": running_path,
+                        "matching_strategy": "file_path",
+                        "subbox_endpoint": "http://127.0.0.1:9/wire",
+                        "archive_id": "arc",
+                        "repo_id": "repo"
+                    },
+                    "src-failed": {
+                        "locator": failed_path,
+                        "matching_strategy": "file_path",
+                        "subbox_endpoint": "http://127.0.0.1:9/wire",
+                        "archive_id": "arc",
+                        "repo_id": "repo"
+                    },
+                    "src-never-started": {
+                        "locator": never_started_path,
+                        "matching_strategy": "file_path",
+                        "subbox_endpoint": "http://127.0.0.1:9/wire",
+                        "archive_id": "arc",
+                        "repo_id": "repo"
+                    }
+                }
+            }),
+            "etag".to_string(),
+        );
+        let discovery_cache = crate::discovery::shared_discovery_cache();
+        let resolved = {
+            let cache = discovery_cache.read().await;
+            crate::config::resolved_collect_from_config(&config, &cache)
+        };
+
+        // Force the second pipeline's state directory creation to fail after
+        // discovery has successfully matched its source file.
+        std::fs::write(dir.path().join("src-failed"), "not a directory").unwrap();
+
+        let counters = crate::counters::AgentCounters::new();
+        let mut orchestrator = crate::orchestrator::Orchestrator::new(
+            dir.path(),
+            crate::identity::AgentIdentity::new("test-agent".to_string()),
+        )
+        .with_monitoring(
+            counters.clone(),
+            std::sync::Arc::new(crate::error_collector::ErrorCollector::new()),
+        );
+        let attempted = resolved
+            .file_streams
+            .iter()
+            .filter(|stream| stream.log_source_id != "src-never-started")
+            .cloned()
+            .collect::<Vec<_>>();
+        orchestrator.reconcile(&attempted, &[], &[]).await;
+        let recorded_failure = match counters.body_variants().pipeline_liveness_for("src-failed") {
+            Some(PipelineLiveness::Failed { reason }) => reason,
+            state => panic!("expected recorded pipeline failure, got {state:?}"),
+        };
+
+        let shared_config: SharedConfig =
+            std::sync::Arc::new(tokio::sync::RwLock::new(Some(config)));
+        let statuses = collect_stream_status(
+            &shared_config,
+            &discovery_cache,
+            counters.body_variants(),
+            "now",
+        )
+        .await
+        .expect("configured streams produce statuses");
+        let payload = serde_json::to_value(statuses).unwrap();
+        let by_id = |id: &str| {
+            payload
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|status| status["log_source_id"] == id)
+                .unwrap()
+                .clone()
+        };
+
+        let running = by_id("src-running");
+        assert_eq!(running["status"], "collecting");
+        assert_eq!(running["pipeline"], "running");
+        assert!(running.get("reason").is_none());
+
+        let failed = by_id("src-failed");
+        assert_eq!(failed["status"], "collecting");
+        assert_eq!(failed["pipeline"], "failed");
+        assert_eq!(
+            failed["reason"], recorded_failure,
+            "the exact startup failure recorded by the orchestrator must reach stream_status"
+        );
+
+        let never_started = by_id("src-never-started");
+        assert_eq!(never_started["status"], "collecting");
+        assert_eq!(never_started["pipeline"], "not_started");
+        assert!(never_started.get("reason").is_none());
+
+        orchestrator.shutdown_all().await;
     }
 
     /// Freshness contract: a body-variant count change must be observable in
