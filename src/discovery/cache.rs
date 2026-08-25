@@ -270,15 +270,19 @@ impl DiscoveryCache {
     // directive means no pipeline.
     fn update_containers(&mut self, containers: &[Container]) {
         self.containers.clear();
-        for container in containers {
+        // Index stopped generations first so a running generation wins shared
+        // aliases while every generation remains available by its unique keys.
+        for container in containers
+            .iter()
+            .filter(|c| c.state != "running")
+            .chain(containers.iter().filter(|c| c.state == "running"))
+        {
             let c = container.clone();
             let spec_name = if !c.container_name.is_empty() {
                 c.container_name.clone()
             } else {
                 c.name.clone()
             };
-
-            self.containers.insert(c.id.clone(), c.clone());
 
             if !c.name.is_empty() {
                 self.containers.insert(c.name.clone(), c.clone());
@@ -313,9 +317,16 @@ impl DiscoveryCache {
             if !c.log_path.is_empty() {
                 self.containers.insert(c.log_path.clone(), c.clone());
             }
+        }
 
-            if !c.container_id.is_empty() && c.container_id != c.id {
-                self.containers.insert(c.container_id.clone(), c.clone());
+        // Exact runtime identifiers outrank every shared alias, even when an
+        // unrelated container happens to use the identifier text as an alias.
+        for container in containers {
+            self.containers
+                .insert(container.id.clone(), container.clone());
+            if !container.container_id.is_empty() && container.container_id != container.id {
+                self.containers
+                    .insert(container.container_id.clone(), container.clone());
             }
         }
     }
@@ -658,6 +669,17 @@ mod tests {
             .insert("com.docker.compose.service".into(), service.into());
         c.labels
             .insert("com.docker.compose.container-number".into(), ordinal.into());
+        c
+    }
+
+    fn kamal_generation(id: &str, name: &str, state: &str) -> Container {
+        let mut c = container_with_id(id, name, "");
+        c.state = state.into();
+        c.service_name = "checkout".into();
+        c.service_name_explicit = true;
+        c.labels.insert("service".into(), "checkout".into());
+        c.labels.insert("role".into(), "web".into());
+        c.labels.insert("destination".into(), "prod".into());
         c
     }
 
@@ -1034,6 +1056,62 @@ mod tests {
         let access = matched(cache.resolve("billing", "container"));
         assert_eq!(access.matched_via, MatchVia::ServiceName);
         assert_eq!(access.confidence(), Confidence::Explicit);
+    }
+
+    #[test]
+    fn shared_aliases_prefer_a_running_generation_and_keep_exact_ids() {
+        let cache = cache_with(vec![
+            kamal_generation("running-id", "checkout-web-prod-new", "running"),
+            kamal_generation("exited-id", "checkout-web-prod-old", "exited"),
+        ]);
+
+        let service = matched(cache.resolve("checkout", "container"));
+        assert_eq!(service.matched_via, MatchVia::ServiceName);
+        assert_eq!(service.access_locator, "running-id");
+
+        let stable = matched(cache.resolve("checkout-prod", "container"));
+        assert_eq!(stable.matched_via, MatchVia::StableId);
+        assert_eq!(stable.access_locator, "running-id");
+
+        let exited = matched(cache.resolve("exited-id", "container"));
+        assert_eq!(exited.matched_via, MatchVia::ContainerId);
+        assert_eq!(exited.access_locator, "exited-id");
+    }
+
+    #[test]
+    fn shared_aliases_still_resolve_an_exited_only_generation() {
+        let cache = cache_with(vec![kamal_generation(
+            "exited-id",
+            "checkout-web-prod-old",
+            "exited",
+        )]);
+
+        assert_eq!(
+            matched(cache.resolve("checkout", "container")).access_locator,
+            "exited-id"
+        );
+        assert_eq!(
+            matched(cache.resolve("checkout-prod", "container")).access_locator,
+            "exited-id"
+        );
+    }
+
+    #[test]
+    fn exact_container_ids_outrank_another_containers_shared_alias() {
+        let mut exited = kamal_generation("exited-id", "archive-web-prod-old", "exited");
+        exited.container_id = "checkout".into();
+        let cache = cache_with(vec![
+            kamal_generation("running-id", "checkout-web-prod-new", "running"),
+            exited,
+        ]);
+
+        let exact = matched(cache.resolve("checkout", "container"));
+        assert_eq!(exact.matched_via, MatchVia::ContainerId);
+        assert_eq!(exact.access_locator, "checkout");
+
+        let stable = matched(cache.resolve("checkout-prod", "container"));
+        assert_eq!(stable.matched_via, MatchVia::StableId);
+        assert_eq!(stable.access_locator, "running-id");
     }
 
     #[test]
