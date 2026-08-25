@@ -866,7 +866,7 @@ mod tests {
         let counters = counters::AgentCounters::new();
         let shutdown = SharedShutdown::new();
         let data_dir = tempfile::tempdir().unwrap();
-        let identity = identity::AgentIdentity::seed(None, "host-test", "host-test");
+        let identity = identity::AgentIdentity::new("host-test".into());
         let tasks = LocalTasks::spawn(
             shared_config.clone(),
             discovery::shared_discovery_cache(),
