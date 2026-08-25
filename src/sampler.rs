@@ -6,7 +6,7 @@
 //!
 //! Rails uses samples for LLM-based log format detection and parsing schema generation.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::io::{BufRead, BufReader};
 use std::path::Path;
 use std::time::Duration;
@@ -399,12 +399,19 @@ fn finalize_sample(
     multiline: Option<&MultilineConfig>,
     max_lines: usize,
 ) -> Vec<String> {
-    let assembled = match multiline {
-        None => lines.into_iter().map(|line| line.content).collect(),
+    match multiline {
+        None => {
+            let start = lines.len().saturating_sub(max_lines);
+            lines
+                .into_iter()
+                .skip(start)
+                .map(|line| line.content)
+                .collect()
+        }
         Some(config) => {
             let timeout = Duration::from_secs(u64::from(config.timeout_secs.max(1)));
             let mut assemblers: Vec<(LogStream, EntryAssembler)> = Vec::new();
-            let mut events = Vec::new();
+            let mut events = VecDeque::new();
 
             for (offset, line) in lines.into_iter().enumerate() {
                 let index = match assemblers
@@ -437,22 +444,29 @@ fn finalize_sample(
                     .1
                     .process(line.content.into_bytes(), context)
                 {
-                    events.push(String::from_utf8_lossy(&event).into_owned());
+                    push_sample_event(&mut events, event, max_lines);
                 }
             }
 
             for (_, assembler) in &mut assemblers {
                 if let Some((event, _)) = assembler.flush() {
-                    events.push(String::from_utf8_lossy(&event).into_owned());
+                    push_sample_event(&mut events, event, max_lines);
                 }
             }
 
-            events
+            events.into()
         }
-    };
+    }
+}
 
-    let start = assembled.len().saturating_sub(max_lines);
-    assembled[start..].to_vec()
+fn push_sample_event(events: &mut VecDeque<String>, event: Vec<u8>, max_lines: usize) {
+    if max_lines == 0 {
+        return;
+    }
+    if events.len() == max_lines {
+        events.pop_front();
+    }
+    events.push_back(String::from_utf8_lossy(&event).into_owned());
 }
 
 /// Read the assembled CRI messages from a Kubernetes container log directory,
@@ -597,7 +611,10 @@ async fn read_docker_lines(
 /// assembler and then takes the tail (`finalize_sample`), so an assembled entry
 /// is never split at the window edge.
 fn read_file_lines(path: &str) -> Result<Vec<String>, String> {
-    read_file_lines_with(path, |line| crate::ansi::strip_str(line).into_owned())
+    read_file_lines_with(path, |line| {
+        let line = crate::ansi::strip_str(line).into_owned();
+        (!line.trim().is_empty()).then_some(line)
+    })
 }
 
 fn read_docker_json_file_lines(path: &str) -> Result<Vec<SampleLine>, String> {
@@ -605,21 +622,21 @@ fn read_docker_json_file_lines(path: &str) -> Result<Vec<SampleLine>, String> {
     // line here can misclassify a plaintext app as JSON downstream, so it is a
     // signal worth surfacing rather than silently swallowing.
     let raw_fallbacks = std::cell::Cell::new(0usize);
-    let lines = read_file_lines_with(path, str::to_owned)?
-        .into_iter()
-        .map(
-            |line| match crate::cri::parse_docker_json_line(line.as_bytes()) {
-                Some(record) => SampleLine::new(
-                    String::from_utf8_lossy(&crate::ansi::strip_owned(record.payload)).into_owned(),
-                    record.stream,
-                ),
-                None => {
-                    raw_fallbacks.set(raw_fallbacks.get() + 1);
-                    SampleLine::untagged(crate::ansi::strip_str(&line).into_owned())
-                }
-            },
-        )
-        .collect();
+    let lines = read_file_lines_with(path, |line| {
+        if line.trim().is_empty() {
+            return None;
+        }
+        Some(match crate::cri::parse_docker_json_line(line.as_bytes()) {
+            Some(record) => SampleLine::new(
+                String::from_utf8_lossy(&crate::ansi::strip_owned(record.payload)).into_owned(),
+                record.stream,
+            ),
+            None => {
+                raw_fallbacks.set(raw_fallbacks.get() + 1);
+                SampleLine::untagged(crate::ansi::strip_str(line).into_owned())
+            }
+        })
+    })?;
 
     let raw_fallbacks = raw_fallbacks.get();
     if raw_fallbacks > 0 {
@@ -633,10 +650,10 @@ fn read_docker_json_file_lines(path: &str) -> Result<Vec<SampleLine>, String> {
     Ok(lines)
 }
 
-fn read_file_lines_with(
+fn read_file_lines_with<T>(
     path: &str,
-    transform: impl Fn(&str) -> String,
-) -> Result<Vec<String>, String> {
+    transform: impl Fn(&str) -> Option<T>,
+) -> Result<Vec<T>, String> {
     let file_path = Path::new(path);
     if !file_path.exists() {
         return Err(format!("file not found: {path}"));
@@ -648,8 +665,7 @@ fn read_file_lines_with(
     Ok(reader
         .lines()
         .map_while(Result::ok)
-        .map(|line| transform(&line))
-        .filter(|l| !l.trim().is_empty())
+        .filter_map(|line| transform(&line))
         .collect())
 }
 
