@@ -118,14 +118,29 @@ impl BodyVariantCounters {
     }
 }
 
-/// Registry of per-source [`BodyVariantCounters`], keyed by `log_source_id`.
-/// The orchestrator hands each source's shipper its counters at start; the
-/// stats reporter snapshots them per stream each interval.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum PipelineLiveness {
+    /// The source pipeline was constructed and spawned successfully.
+    Running,
+    /// The most recent attempt to construct the source pipeline failed.
+    Failed { reason: String },
+}
+
+#[derive(Default)]
+struct BodyVariantEntry {
+    counters: Option<Arc<BodyVariantCounters>>,
+    pipeline: Option<PipelineLiveness>,
+}
+
+/// Registry of per-source pipeline state and [`BodyVariantCounters`], keyed by
+/// `log_source_id`. The orchestrator updates liveness as starts settle and
+/// hands each source's shipper its counters; the stats reporter snapshots both
+/// per stream each interval.
 #[derive(Clone, Default)]
-pub struct BodyVariantRegistry(Arc<Mutex<HashMap<String, Arc<BodyVariantCounters>>>>);
+pub struct BodyVariantRegistry(Arc<Mutex<HashMap<String, BodyVariantEntry>>>);
 
 impl BodyVariantRegistry {
-    fn entries(&self) -> MutexGuard<'_, HashMap<String, Arc<BodyVariantCounters>>> {
+    fn entries(&self) -> MutexGuard<'_, HashMap<String, BodyVariantEntry>> {
         match self.0.lock() {
             Ok(guard) => guard,
             Err(poisoned) => {
@@ -138,9 +153,12 @@ impl BodyVariantRegistry {
 
     /// The counters for a source, created on first sight.
     pub fn counters_for(&self, log_source_id: &str) -> Arc<BodyVariantCounters> {
-        self.entries()
+        let mut entries = self.entries();
+        entries
             .entry(log_source_id.to_string())
             .or_default()
+            .counters
+            .get_or_insert_with(Default::default)
             .clone()
     }
 
@@ -148,12 +166,45 @@ impl BodyVariantRegistry {
     pub fn snapshot_for(&self, log_source_id: &str) -> Option<BodyVariantSplit> {
         self.entries()
             .get(log_source_id)
+            .and_then(|entry| entry.counters.as_ref())
             .map(|counters| counters.snapshot())
     }
 
-    /// Forget a removed source so a later source reusing the id starts at zero.
-    pub fn remove(&self, log_source_id: &str) {
-        self.entries().remove(log_source_id);
+    /// Record that a source pipeline started successfully.
+    pub(crate) fn mark_pipeline_running(&self, log_source_id: &str) {
+        self.entries()
+            .entry(log_source_id.to_string())
+            .or_default()
+            .pipeline = Some(PipelineLiveness::Running);
+    }
+
+    /// Record the reason the most recent source pipeline start failed.
+    pub(crate) fn mark_pipeline_failed(&self, log_source_id: &str, reason: &str) {
+        self.entries()
+            .entry(log_source_id.to_string())
+            .or_default()
+            .pipeline = Some(PipelineLiveness::Failed {
+            reason: reason.to_string(),
+        });
+    }
+
+    /// Snapshot one source's counters and liveness under the same registry lock.
+    pub(crate) fn stream_snapshot_for(
+        &self,
+        log_source_id: &str,
+    ) -> (Option<BodyVariantSplit>, Option<PipelineLiveness>) {
+        let entries = self.entries();
+        let Some(entry) = entries.get(log_source_id) else {
+            return (None, None);
+        };
+        (
+            entry.counters.as_ref().map(|counters| counters.snapshot()),
+            entry.pipeline.clone(),
+        )
+    }
+
+    pub(crate) fn retain_sources(&self, mut keep: impl FnMut(&str) -> bool) {
+        self.entries().retain(|id, _| keep(id));
     }
 }
 
@@ -497,8 +548,23 @@ mod tests {
         });
         assert_eq!(registry.snapshot_for("src-a").unwrap().entry_json, 6);
 
-        registry.remove("src-a");
+        assert!(registry.stream_snapshot_for("src-a").1.is_none());
+        registry.mark_pipeline_running("src-a");
+        assert_eq!(
+            registry.stream_snapshot_for("src-a").1,
+            Some(PipelineLiveness::Running)
+        );
+        registry.mark_pipeline_failed("src-a", "buffer unavailable");
+        assert_eq!(
+            registry.stream_snapshot_for("src-a").1,
+            Some(PipelineLiveness::Failed {
+                reason: "buffer unavailable".to_string()
+            })
+        );
+
+        registry.retain_sources(|id| id != "src-a");
         assert!(registry.snapshot_for("src-a").is_none());
+        assert!(registry.stream_snapshot_for("src-a").1.is_none());
     }
 
     #[test]
