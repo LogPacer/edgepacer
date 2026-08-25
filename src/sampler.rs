@@ -626,16 +626,18 @@ fn read_docker_json_file_lines(path: &str) -> Result<Vec<SampleLine>, String> {
         if line.trim().is_empty() {
             return None;
         }
-        Some(match crate::cri::parse_docker_json_line(line.as_bytes()) {
-            Some(record) => SampleLine::new(
-                String::from_utf8_lossy(&crate::ansi::strip_owned(record.payload)).into_owned(),
-                record.stream,
-            ),
+        match crate::cri::parse_docker_json_line(line.as_bytes()) {
+            Some(record) => {
+                let content =
+                    String::from_utf8_lossy(&crate::ansi::strip_owned(record.payload)).into_owned();
+                (!content.trim().is_empty()).then(|| SampleLine::new(content, record.stream))
+            }
             None => {
                 raw_fallbacks.set(raw_fallbacks.get() + 1);
-                SampleLine::untagged(crate::ansi::strip_str(line).into_owned())
+                let content = crate::ansi::strip_str(line).into_owned();
+                (!content.trim().is_empty()).then(|| SampleLine::untagged(content))
             }
-        })
+        }
     })?;
 
     let raw_fallbacks = raw_fallbacks.get();
@@ -675,6 +677,9 @@ fn sample_fetch_retry_delay(failures: u32, poll_interval: Duration) -> Duration 
         .saturating_mul(multiplier)
         .min(SAMPLE_FETCH_BACKOFF_MAX)
 }
+
+#[cfg(test)]
+mod container_stream_tests;
 
 #[cfg(test)]
 mod tests {
@@ -847,66 +852,6 @@ mod tests {
                 "2026-07-13 three\n    body three".to_string(),
             ],
             "tail keeps the last 2 complete events, not the last 2 raw lines"
-        );
-    }
-
-    #[test]
-    fn container_sample_assembles_interleaved_streams_independently() {
-        let cfg = MultilineConfig::from_patterns(vec![r"^2026-".to_string()], 500, 5);
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("container-json.log");
-        std::fs::write(
-            &path,
-            concat!(
-                r#"{"log":"2026-08-25 stdout first\n","stream":"stdout","time":"2026-08-25T10:00:00Z"}"#,
-                "\n",
-                r#"{"log":"2026-08-25 stderr first\n","stream":"stderr","time":"2026-08-25T10:00:01Z"}"#,
-                "\n",
-                r#"{"log":"    stderr detail\n","stream":"stderr","time":"2026-08-25T10:00:02Z"}"#,
-                "\n",
-                r#"{"log":"    stdout detail\n","stream":"stdout","time":"2026-08-25T10:00:03Z"}"#,
-                "\n",
-                r#"{"log":"2026-08-25 stdout second\n","stream":"stdout","time":"2026-08-25T10:00:04Z"}"#,
-                "\n",
-                r#"{"log":"2026-08-25 stderr second\n","stream":"stderr","time":"2026-08-25T10:00:05Z"}"#,
-                "\n",
-            ),
-        )
-        .unwrap();
-
-        let lines = read_docker_json_file_lines(path.to_str().unwrap()).unwrap();
-        let sample = finalize_sample(lines, Some(&cfg), 1000);
-
-        assert_eq!(
-            sample,
-            vec![
-                "2026-08-25 stdout first\n    stdout detail".to_string(),
-                "2026-08-25 stderr first\n    stderr detail".to_string(),
-                "2026-08-25 stdout second".to_string(),
-                "2026-08-25 stderr second".to_string(),
-            ]
-        );
-    }
-
-    #[test]
-    fn container_sample_tail_window_uses_global_emission_order() {
-        let cfg = MultilineConfig::from_patterns(vec![r"^2026-".to_string()], 500, 5);
-        let lines = vec![
-            SampleLine::new("2026-08-25 stdout first".into(), LogStream::Stdout),
-            SampleLine::new("2026-08-25 stderr first".into(), LogStream::Stderr),
-            SampleLine::new("    stderr detail".into(), LogStream::Stderr),
-            SampleLine::new("    stdout detail".into(), LogStream::Stdout),
-            SampleLine::new("2026-08-25 stdout second".into(), LogStream::Stdout),
-            SampleLine::new("2026-08-25 stderr second".into(), LogStream::Stderr),
-        ];
-
-        assert_eq!(
-            finalize_sample(lines, Some(&cfg), 3),
-            vec![
-                "2026-08-25 stderr first\n    stderr detail".to_string(),
-                "2026-08-25 stdout second".to_string(),
-                "2026-08-25 stderr second".to_string(),
-            ]
         );
     }
 
