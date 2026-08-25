@@ -1098,9 +1098,11 @@ mod tests {
 
     #[test]
     fn exact_container_ids_outrank_another_containers_shared_alias() {
+        let mut exited = kamal_generation("exited-id", "archive-web-prod-old", "exited");
+        exited.container_id = "checkout".into();
         let cache = cache_with(vec![
             kamal_generation("running-id", "checkout-web-prod-new", "running"),
-            kamal_generation("checkout", "archive-web-prod-old", "exited"),
+            exited,
         ]);
 
         let exact = matched(cache.resolve("checkout", "container"));
