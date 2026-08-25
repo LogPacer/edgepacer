@@ -50,6 +50,25 @@ pub struct StatsReport {
 
 // --- Stream config status ---
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PipelineStatus {
+    #[default]
+    NotStarted,
+    Running,
+    Failed,
+}
+
+impl PipelineStatus {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::NotStarted => "not_started",
+            Self::Running => "running",
+            Self::Failed => "failed",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct StreamConfigStatus {
     pub log_source_id: String,
@@ -64,7 +83,7 @@ pub struct StreamConfigStatus {
     pub reason: Option<String>,
     /// Whether this matched source has a live pipeline. Additive to `status`,
     /// which retains its discovery-match meaning for existing consumers.
-    pub pipeline: String,
+    pub pipeline: PipelineStatus,
     pub last_checked: String,
     /// How this stream's shipped entries split across the wire body variants,
     /// cumulative since the source started. Omitted while the source has no
@@ -83,7 +102,7 @@ impl StreamConfigStatus {
             matched_via: None,
             confidence: None,
             reason: None,
-            pipeline: "not_started".to_string(),
+            pipeline: PipelineStatus::NotStarted,
             last_checked: last_checked.to_string(),
             body_variants: None,
         }
@@ -144,7 +163,7 @@ fn status_signature(statuses: &[StreamConfigStatus]) -> String {
                 s.matched_via.as_deref().unwrap_or(""),
                 s.confidence.as_deref().unwrap_or(""),
                 s.reason.as_deref().unwrap_or(""),
-                s.pipeline,
+                s.pipeline.as_str(),
                 variants,
             )
         })
@@ -264,9 +283,9 @@ async fn collect_stream_status(
                 let mut status = stream_status_for_collect_stream(&stream, &cache, last_checked);
                 status.body_variants = body_variants.snapshot_for(&stream.log_source_id);
                 match body_variants.pipeline_liveness_for(&stream.log_source_id) {
-                    Some(PipelineLiveness::Running) => status.pipeline = "running".to_string(),
+                    Some(PipelineLiveness::Running) => status.pipeline = PipelineStatus::Running,
                     Some(PipelineLiveness::Failed { reason }) => {
-                        status.pipeline = "failed".to_string();
+                        status.pipeline = PipelineStatus::Failed;
                         if status.status == "collecting" {
                             status.reason = Some(reason);
                         }
@@ -374,7 +393,7 @@ mod tests {
                 matched_via: Some("stable_id".to_string()),
                 confidence: Some("explicit".to_string()),
                 reason: None,
-                pipeline: "running".to_string(),
+                pipeline: PipelineStatus::Running,
                 last_checked: "2026-06-22T19:30:00Z".to_string(),
                 body_variants: Some(BodyVariantSplit {
                     entry_json: 12,
@@ -583,7 +602,7 @@ mod tests {
             matched_via: None,
             confidence: None,
             reason: None,
-            pipeline: "not_started".to_string(),
+            pipeline: PipelineStatus::NotStarted,
             last_checked: last_checked.to_string(),
             body_variants: None,
         }
@@ -640,7 +659,7 @@ mod tests {
         ));
 
         let mut running = status("a", "collecting", "t2");
-        running.pipeline = "running".to_string();
+        running.pipeline = PipelineStatus::Running;
         assert!(
             send_ok(&mut reporter, Some(vec![running])),
             "a pipeline transition must not be hidden by status deduplication"
