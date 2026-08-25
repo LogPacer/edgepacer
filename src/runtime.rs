@@ -350,7 +350,7 @@ impl AgentTasks {
                 wait_task(metrics, budgets.standard),
                 wait_task(errors, budgets.standard),
                 wait_task(telemetry, budgets.standard),
-                wait_task(trace, budgets.standard),
+                wait_trace_task(trace),
                 wait_task(sampler, budgets.standard),
                 wait_task(refresh, budgets.standard),
             );
@@ -698,7 +698,7 @@ impl LocalTasks {
     async fn wait(self, budgets: ShutdownBudgets) {
         tokio::join!(
             wait_task(self.orchestrator, budgets.orchestrator),
-            wait_task(self.trace, budgets.standard),
+            wait_trace_task(self.trace),
         );
     }
 }
@@ -752,6 +752,14 @@ impl ShutdownBudgets {
 
 async fn wait_task(handle: JoinHandle<()>, budget: Duration) {
     let _ = tokio::time::timeout(budget, handle).await;
+}
+
+/// Trace manager cleanup is already end-to-end bounded and cancellation-aware;
+/// await it directly so a shorter outer timeout cannot detach its proxy tasks.
+async fn wait_trace_task(handle: JoinHandle<()>) {
+    if let Err(error) = handle.await {
+        error!(%error, "trace proxy manager task panicked");
+    }
 }
 
 fn prepare_runtime_data_dir() -> anyhow::Result<PathBuf> {

@@ -47,6 +47,7 @@ const MAX_REQUEST_SIZE: usize = 10 * 1024 * 1024; // 10 MB
 /// small compressed payload that expands without limit.
 const MAX_DECOMPRESSED_SIZE: usize = 64 * 1024 * 1024; // 64 MB
 pub const DEFAULT_TRACE_BUFFER_MAX_MB: u64 = 100;
+const TRACE_PROXY_SHUTDOWN_BUDGET: Duration = Duration::from_secs(10);
 
 type ExportTraceServiceRequest =
     opentelemetry_proto::tonic::collector::trace::v1::ExportTraceServiceRequest;
@@ -88,6 +89,7 @@ pub struct TraceProxyConfig {
 
 struct ProxyState {
     config: TraceProxyConfig,
+    shutdown: watch::Sender<bool>,
     /// Shared wire transport — POSTs already-encoded `WireRequest` bytes to the
     /// subbox wire endpoint verbatim, attaching the repo's upload-token JWT and
     /// handling auth-refresh/retry exactly as logs and metrics do.
@@ -319,14 +321,14 @@ const DRAIN_BATCH_SIZE: usize = 50;
 /// Ticks every 200ms, peeks up to 50 entries, forwards each in sequence order.
 /// Stops on the first retryable failure per cycle to preserve ordering.
 /// Deletes only entries that were confirmed delivered.
-async fn drain_loop(state: Arc<ProxyState>, mut shutdown: watch::Receiver<bool>) {
+async fn drain_loop(state: Arc<ProxyState>) {
     let mut tick = tokio::time::interval(std::time::Duration::from_millis(DRAIN_TICK_MS));
     tick.tick().await; // skip immediate
 
     loop {
         tokio::select! {
             _ = tick.tick() => {}
-            _ = shutdown.changed() => {
+            _ = wait_for_proxy_shutdown(state.shutdown.subscribe()) => {
                 info!("trace drain loop shutting down");
                 return;
             }
@@ -367,7 +369,10 @@ async fn drain_loop(state: Arc<ProxyState>, mut shutdown: watch::Receiver<bool>)
         for entry in &entries {
             // Buffered entries are already-encoded `WireRequest` bytes — ship
             // them verbatim through the same transport the request path uses.
-            let outcome = ship_payload(&state.transport, state.retry_policy, &entry.payload).await;
+            let outcome = tokio::select! {
+                outcome = ship_payload(&state.transport, state.retry_policy, &entry.payload) => outcome,
+                _ = wait_for_proxy_shutdown(state.shutdown.subscribe()) => return,
+            };
 
             match outcome {
                 ForwardOutcome::Delivered => {
@@ -436,6 +441,20 @@ fn decode_request_body(headers: &HeaderMap, body: Bytes) -> Option<Vec<u8>> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum TraceRequestRejection {
     ServiceNamePolicy(ServiceNamePolicyRejection),
+    ShuttingDown,
+}
+
+async fn wait_for_proxy_shutdown(mut shutdown: watch::Receiver<bool>) {
+    loop {
+        if *shutdown.borrow() {
+            return;
+        }
+        match shutdown.changed().await {
+            Ok(()) if *shutdown.borrow() => return,
+            Ok(()) => {}
+            Err(_) => return,
+        }
+    }
 }
 
 /// Apply the service-name policy to every resource span, then encode, forward,
@@ -505,7 +524,12 @@ async fn process_trace_request(
             }
         };
 
-        let outcome = forward_payload(state, &payload).await;
+        let outcome = tokio::select! {
+            outcome = forward_payload(state, &payload) => outcome,
+            _ = wait_for_proxy_shutdown(state.shutdown.subscribe()) => {
+                return Err(TraceRequestRejection::ShuttingDown);
+            }
+        };
         if matches!(outcome, ForwardOutcome::Retryable) {
             buffer_for_retry(state, &payload).await;
         }
@@ -536,6 +560,7 @@ async fn handle_traces(
     match process_trace_request(state.as_ref(), request).await {
         Ok(()) => StatusCode::OK,
         Err(TraceRequestRejection::ServiceNamePolicy(_)) => StatusCode::FORBIDDEN,
+        Err(TraceRequestRejection::ShuttingDown) => StatusCode::SERVICE_UNAVAILABLE,
     }
 }
 
@@ -563,6 +588,9 @@ impl TraceService for TraceGrpcService {
                 Err(tonic::Status::permission_denied(
                     "service.name rejected by trace acceptance policy",
                 ))
+            }
+            Err(TraceRequestRejection::ShuttingDown) => {
+                Err(tonic::Status::unavailable("trace proxy is shutting down"))
             }
         }
     }
@@ -611,7 +639,19 @@ impl TraceProxy {
             transport = transport.with_counters(counters.clone());
         }
 
+        let listener = tokio::net::TcpListener::bind(self.config.listen_address).await?;
+        let grpc_incoming = match self.config.grpc_listen_address {
+            Some(address) => Some((
+                address,
+                tonic::transport::server::TcpIncoming::bind(address).map_err(|error| {
+                    anyhow::anyhow!("failed to bind trace proxy gRPC listener: {error}")
+                })?,
+            )),
+            None => None,
+        };
+
         let state = Arc::new(ProxyState {
+            shutdown: shutdown_tx.clone(),
             service_name_fallback: format!("unknown:{}", self.config.resource_identifier),
             missing_service_name_total: AtomicU64::new(0),
             // At most one warn per minute — enough to flag a misconfigured
@@ -630,7 +670,6 @@ impl TraceProxy {
             .route("/v1/traces", post(handle_traces))
             .with_state(state.clone());
 
-        let listener = tokio::net::TcpListener::bind(self.config.listen_address).await?;
         info!(address = %self.config.listen_address, "trace proxy listening");
 
         self.shutdown_tx = Some(shutdown_tx);
@@ -650,7 +689,7 @@ impl TraceProxy {
         // plane set a gRPC address. Bind eagerly here, exactly as the HTTP
         // listener does above, so a busy or malformed gRPC port fails `start`
         // loudly instead of becoming a silent dead listener inside the task.
-        if let Some(grpc_address) = self.config.grpc_listen_address {
+        if let Some((grpc_address, incoming)) = grpc_incoming {
             let grpc_service = TraceServiceServer::new(TraceGrpcService {
                 state: state.clone(),
             })
@@ -658,8 +697,6 @@ impl TraceProxy {
             // defaults to 4 MB).
             .max_decoding_message_size(MAX_REQUEST_SIZE);
 
-            let incoming = tonic::transport::server::TcpIncoming::bind(grpc_address)
-                .map_err(|e| anyhow::anyhow!("failed to bind trace proxy gRPC listener: {e}"))?;
             info!(address = %grpc_address, "trace proxy gRPC listening");
 
             let mut grpc_shutdown_rx = shutdown_rx.clone();
@@ -674,45 +711,50 @@ impl TraceProxy {
             }));
         }
 
-        self.drain_handle = Some(tokio::spawn(drain_loop(state, shutdown_rx)));
+        self.drain_handle = Some(tokio::spawn(drain_loop(state)));
 
         Ok(())
     }
 
-    /// Stop the proxy gracefully — signals shutdown and awaits both server and
-    /// drain tasks with a timeout.
+    /// Stop the proxy gracefully. Every task shares one end-to-end deadline;
+    /// anything still running at the deadline is aborted and reaped.
     pub async fn stop(&mut self) {
         if let Some(tx) = self.shutdown_tx.take() {
             let _ = tx.send(true);
         }
 
-        let timeout = std::time::Duration::from_secs(10);
-
-        if let Some(handle) = self.server_handle.take() {
-            match tokio::time::timeout(timeout, handle).await {
-                Ok(Ok(())) => {}
-                Ok(Err(e)) => error!(error = %e, "trace proxy server task panicked"),
-                Err(_) => warn!("trace proxy server stop timed out"),
-            }
-        }
-
-        if let Some(handle) = self.grpc_handle.take() {
-            match tokio::time::timeout(timeout, handle).await {
-                Ok(Ok(())) => {}
-                Ok(Err(e)) => error!(error = %e, "trace proxy gRPC task panicked"),
-                Err(_) => warn!("trace proxy gRPC stop timed out"),
-            }
-        }
-
-        if let Some(handle) = self.drain_handle.take() {
-            match tokio::time::timeout(timeout, handle).await {
-                Ok(Ok(())) => {}
-                Ok(Err(e)) => error!(error = %e, "trace drain task panicked"),
-                Err(_) => warn!("trace drain stop timed out"),
-            }
-        }
+        let deadline = tokio::time::Instant::now() + TRACE_PROXY_SHUTDOWN_BUDGET;
+        tokio::join!(
+            finish_proxy_task("server", self.server_handle.take(), deadline),
+            finish_proxy_task("gRPC", self.grpc_handle.take(), deadline),
+            finish_proxy_task("drain", self.drain_handle.take(), deadline),
+        );
 
         info!("trace proxy stopped");
+    }
+}
+
+async fn finish_proxy_task(
+    task: &'static str,
+    handle: Option<JoinHandle<()>>,
+    deadline: tokio::time::Instant,
+) {
+    let Some(mut handle) = handle else {
+        return;
+    };
+
+    match tokio::time::timeout_at(deadline, &mut handle).await {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => error!(task, %error, "trace proxy task panicked"),
+        Err(_) => {
+            warn!(task, "trace proxy task stop timed out, aborting");
+            handle.abort();
+            match handle.await {
+                Ok(()) => {}
+                Err(error) if error.is_cancelled() => {}
+                Err(error) => error!(task, %error, "trace proxy task failed while aborting"),
+            }
+        }
     }
 }
 
@@ -721,12 +763,20 @@ mod tests {
     use super::*;
     use std::collections::HashMap;
     use std::path::Path;
+    use std::sync::Arc;
 
     use logpacer_wire::{WireRequest, WireResponse, routed_batch};
     use opentelemetry_proto::tonic::trace::v1::{ScopeSpans, Span};
     use prost::Message as WireMessage;
     use wiremock::matchers::{header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    async fn stall_relay(
+        axum::extract::State(entered): axum::extract::State<Arc<tokio::sync::Notify>>,
+    ) {
+        entered.notify_one();
+        std::future::pending::<()>().await;
+    }
 
     /// Wire endpoint path the proxy POSTs to verbatim — the test subbox endpoint
     /// is `{server.uri}{WIRE_PATH}`, mirroring the real `/v1/logpacer-wire` URL.
@@ -791,6 +841,69 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn stop_releases_listener_when_relay_delivery_stalls() {
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let relay_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let relay_address = relay_listener.local_addr().unwrap();
+        let relay = tokio::spawn(
+            axum::serve(
+                relay_listener,
+                Router::new()
+                    .route(WIRE_PATH, post(stall_relay))
+                    .with_state(entered.clone()),
+            )
+            .into_future(),
+        );
+
+        let reserved = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let listen_address = reserved.local_addr().unwrap();
+        drop(reserved);
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = test_config(
+            format!("http://{relay_address}{WIRE_PATH}"),
+            &dir.path().join("buffer.sqlite"),
+        );
+        config.listen_address = listen_address;
+        let mut proxy = TraceProxy::new(config);
+        proxy.start().await.unwrap();
+
+        let mut request = tokio::spawn(async move {
+            reqwest::Client::new()
+                .post(format!("http://{listen_address}/v1/traces"))
+                .header("content-type", "application/x-protobuf")
+                .body(encode_trace_request(vec![sample_resource_span()]))
+                .send()
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(2), entered.notified())
+            .await
+            .expect("trace delivery should reach the stalled relay");
+
+        proxy.stop().await;
+
+        std::net::TcpListener::bind(listen_address)
+            .expect("bounded proxy cleanup must release the HTTP listener");
+
+        match tokio::time::timeout(Duration::from_secs(1), &mut request).await {
+            Ok(Ok(Err(_))) => {}
+            Ok(Ok(Ok(response))) => assert_eq!(
+                response.status(),
+                reqwest::StatusCode::SERVICE_UNAVAILABLE,
+                "shutdown should cancel stalled delivery"
+            ),
+            Ok(Err(error)) => panic!("trace request task panicked: {error}"),
+            Err(_) => {
+                request.abort();
+                let _ = request.await;
+                panic!("proxy cleanup detached the stalled HTTP request");
+            }
+        }
+        relay.abort();
+        let _ = relay.await;
+    }
+
     fn test_config_with_policy(
         endpoint: String,
         buffer_path: &Path,
@@ -811,8 +924,10 @@ mod tests {
     async fn test_state_from_config(config: TraceProxyConfig) -> Arc<ProxyState> {
         let buffer = TraceBuffer::open(&config.buffer_path, config.buffer_max_mb).unwrap();
         let transport = WireTransport::new(&config.subbox_endpoint, &config.repo_id).unwrap();
+        let (shutdown, _) = watch::channel(false);
 
         Arc::new(ProxyState {
+            shutdown,
             service_name_fallback: format!("unknown:{}", config.resource_identifier),
             missing_service_name_total: AtomicU64::new(0),
             missing_service_name_warn: RateLimiter::new(1, Duration::from_secs(60)),
