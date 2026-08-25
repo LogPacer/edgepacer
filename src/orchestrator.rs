@@ -10,7 +10,7 @@
 //! Streaming sources (Docker, journald) use `StreamingDeliveryPipeline` with a
 //! concurrent reader + drain loop.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -283,14 +283,26 @@ impl Orchestrator {
         }
     }
 
-    /// Forget removed sources' body-variant counters so a later source reusing
-    /// the id starts at zero. Restarted sources keep theirs — the registry
-    /// entry survives and the new shipper picks it up by id.
-    fn forget_body_variants(&self, removed: &[String]) {
+    /// Forget every source no longer desired, including sources that failed
+    /// before they reached the managed-pipeline maps.
+    fn retain_desired_body_variants(
+        &self,
+        file_streams: &[LogStreamConfig],
+        streaming_sources: &[StreamingSourceConfig],
+    ) {
         if let Some(ref counters) = self.counters {
-            for id in removed {
-                counters.body_variants().remove(id);
-            }
+            let desired = file_streams
+                .iter()
+                .map(|source| source.log_source_id.as_str())
+                .chain(
+                    streaming_sources
+                        .iter()
+                        .map(|source| source.log_source_id.as_str()),
+                )
+                .collect::<HashSet<_>>();
+            counters
+                .body_variants()
+                .retain_sources(|id| desired.contains(id));
         }
     }
 
@@ -314,6 +326,7 @@ impl Orchestrator {
         // possibly adopted) before the replacement opens it.
         self.stop_stale_file_pipelines(file_streams).await;
         self.stop_stale_streaming_sources(streaming_sources).await;
+        self.retain_desired_body_variants(file_streams, streaming_sources);
         self.adopt_legacy_state_dirs(checkpoint_adoptions, file_streams, streaming_sources);
         self.start_missing_file_pipelines(file_streams);
         self.start_missing_streaming_sources(streaming_sources);
@@ -413,7 +426,6 @@ impl Orchestrator {
         for id in &plan.to_remove {
             info!(log_source_id = %id, "stopping removed file pipeline");
         }
-        self.forget_body_variants(&plan.to_remove);
         for id in &plan.to_restart {
             info!(log_source_id = %id, "restarting file pipeline (config changed)");
         }
@@ -464,7 +476,6 @@ impl Orchestrator {
         for id in &plan.to_remove {
             info!(log_source_id = %id, "stopping removed streaming source");
         }
-        self.forget_body_variants(&plan.to_remove);
         for id in &plan.to_restart {
             info!(log_source_id = %id, "restarting streaming source (config changed)");
         }
@@ -981,6 +992,28 @@ mod tests {
         assert_eq!(orch.active_count(), 0);
         orch.reconcile(&[], &[], &[]).await;
         assert_eq!(orch.active_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn reconcile_forgets_failed_sources_that_are_no_longer_desired() {
+        let dir = tempfile::tempdir().unwrap();
+        let counters = AgentCounters::new();
+        counters
+            .body_variants()
+            .mark_pipeline_failed("src-failed", "state directory unavailable");
+        let mut orch = Orchestrator::new(dir.path(), test_identity())
+            .with_monitoring(counters.clone(), Arc::new(ErrorCollector::new()));
+
+        orch.reconcile(&[], &[], &[]).await;
+
+        assert!(
+            counters
+                .body_variants()
+                .stream_snapshot_for("src-failed")
+                .1
+                .is_none(),
+            "a never-started source must not survive removal in the registry"
+        );
     }
 
     #[test]

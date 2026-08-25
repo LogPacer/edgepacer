@@ -281,14 +281,13 @@ async fn collect_stream_status(
             .into_iter()
             .map(|stream| {
                 let mut status = stream_status_for_collect_stream(&stream, &cache, last_checked);
-                status.body_variants = body_variants.snapshot_for(&stream.log_source_id);
-                match body_variants.pipeline_liveness_for(&stream.log_source_id) {
+                let (variants, liveness) = body_variants.stream_snapshot_for(&stream.log_source_id);
+                status.body_variants = variants;
+                match liveness {
                     Some(PipelineLiveness::Running) => status.pipeline = PipelineStatus::Running,
                     Some(PipelineLiveness::Failed { reason }) => {
                         status.pipeline = PipelineStatus::Failed;
-                        if status.status == "collecting" {
-                            status.reason = Some(reason);
-                        }
+                        status.reason = Some(reason);
                     }
                     None => {}
                 }
@@ -786,6 +785,13 @@ mod tests {
                         "subbox_endpoint": "http://127.0.0.1:9/wire",
                         "archive_id": "arc",
                         "repo_id": "repo"
+                    },
+                    "src-windows": {
+                        "locator": "Application",
+                        "matching_strategy": "windows_event_log",
+                        "subbox_endpoint": "http://127.0.0.1:9/wire",
+                        "archive_id": "arc",
+                        "repo_id": "repo"
                     }
                 }
             }),
@@ -817,7 +823,10 @@ mod tests {
             .cloned()
             .collect::<Vec<_>>();
         orchestrator.reconcile(&attempted, &[], &[]).await;
-        let recorded_failure = match counters.body_variants().pipeline_liveness_for("src-failed") {
+        counters
+            .body_variants()
+            .mark_pipeline_failed("src-windows", "event log unavailable");
+        let recorded_failure = match counters.body_variants().stream_snapshot_for("src-failed").1 {
             Some(PipelineLiveness::Failed { reason }) => reason,
             state => panic!("expected recorded pipeline failure, got {state:?}"),
         };
@@ -860,6 +869,11 @@ mod tests {
         assert_eq!(never_started["status"], "collecting");
         assert_eq!(never_started["pipeline"], "not_started");
         assert!(never_started.get("reason").is_none());
+
+        let windows = by_id("src-windows");
+        assert_eq!(windows["status"], "not_found");
+        assert_eq!(windows["pipeline"], "failed");
+        assert_eq!(windows["reason"], "event log unavailable");
 
         orchestrator.shutdown_all().await;
     }

@@ -188,16 +188,23 @@ impl BodyVariantRegistry {
         });
     }
 
-    /// Snapshot the last settled pipeline-start state for a source.
-    pub(crate) fn pipeline_liveness_for(&self, log_source_id: &str) -> Option<PipelineLiveness> {
-        self.entries()
-            .get(log_source_id)
-            .and_then(|entry| entry.pipeline.clone())
+    /// Snapshot one source's counters and liveness under the same registry lock.
+    pub(crate) fn stream_snapshot_for(
+        &self,
+        log_source_id: &str,
+    ) -> (Option<BodyVariantSplit>, Option<PipelineLiveness>) {
+        let entries = self.entries();
+        let Some(entry) = entries.get(log_source_id) else {
+            return (None, None);
+        };
+        (
+            entry.counters.as_ref().map(|counters| counters.snapshot()),
+            entry.pipeline.clone(),
+        )
     }
 
-    /// Forget a removed source so a later source reusing the id starts at zero.
-    pub fn remove(&self, log_source_id: &str) {
-        self.entries().remove(log_source_id);
+    pub(crate) fn retain_sources(&self, mut keep: impl FnMut(&str) -> bool) {
+        self.entries().retain(|id, _| keep(id));
     }
 }
 
@@ -541,23 +548,23 @@ mod tests {
         });
         assert_eq!(registry.snapshot_for("src-a").unwrap().entry_json, 6);
 
-        assert!(registry.pipeline_liveness_for("src-a").is_none());
+        assert!(registry.stream_snapshot_for("src-a").1.is_none());
         registry.mark_pipeline_running("src-a");
         assert_eq!(
-            registry.pipeline_liveness_for("src-a"),
+            registry.stream_snapshot_for("src-a").1,
             Some(PipelineLiveness::Running)
         );
         registry.mark_pipeline_failed("src-a", "buffer unavailable");
         assert_eq!(
-            registry.pipeline_liveness_for("src-a"),
+            registry.stream_snapshot_for("src-a").1,
             Some(PipelineLiveness::Failed {
                 reason: "buffer unavailable".to_string()
             })
         );
 
-        registry.remove("src-a");
+        registry.retain_sources(|id| id != "src-a");
         assert!(registry.snapshot_for("src-a").is_none());
-        assert!(registry.pipeline_liveness_for("src-a").is_none());
+        assert!(registry.stream_snapshot_for("src-a").1.is_none());
     }
 
     #[test]
