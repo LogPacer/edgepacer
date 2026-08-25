@@ -284,8 +284,6 @@ impl DiscoveryCache {
                 c.name.clone()
             };
 
-            self.containers.insert(c.id.clone(), c.clone());
-
             if !c.name.is_empty() {
                 self.containers.insert(c.name.clone(), c.clone());
             }
@@ -319,9 +317,16 @@ impl DiscoveryCache {
             if !c.log_path.is_empty() {
                 self.containers.insert(c.log_path.clone(), c.clone());
             }
+        }
 
-            if !c.container_id.is_empty() && c.container_id != c.id {
-                self.containers.insert(c.container_id.clone(), c.clone());
+        // Exact runtime identifiers outrank every shared alias, even when an
+        // unrelated container happens to use the identifier text as an alias.
+        for container in containers {
+            self.containers
+                .insert(container.id.clone(), container.clone());
+            if !container.container_id.is_empty() && container.container_id != container.id {
+                self.containers
+                    .insert(container.container_id.clone(), container.clone());
             }
         }
     }
@@ -1089,6 +1094,22 @@ mod tests {
             matched(cache.resolve("checkout-prod", "container")).access_locator,
             "exited-id"
         );
+    }
+
+    #[test]
+    fn exact_container_ids_outrank_another_containers_shared_alias() {
+        let cache = cache_with(vec![
+            kamal_generation("running-id", "checkout-web-prod-new", "running"),
+            kamal_generation("checkout", "archive-web-prod-old", "exited"),
+        ]);
+
+        let exact = matched(cache.resolve("checkout", "container"));
+        assert_eq!(exact.matched_via, MatchVia::ContainerId);
+        assert_eq!(exact.access_locator, "checkout");
+
+        let stable = matched(cache.resolve("checkout-prod", "container"));
+        assert_eq!(stable.matched_via, MatchVia::StableId);
+        assert_eq!(stable.access_locator, "running-id");
     }
 
     #[test]
