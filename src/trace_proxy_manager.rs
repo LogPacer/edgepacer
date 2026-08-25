@@ -50,7 +50,7 @@ impl TraceProxyManager {
     /// 1. New proxy (in config, not running) → start
     /// 2. Removed proxy (running, not in config) → stop
     /// 3. Changed proxy (config_hash differs) → restart
-    pub async fn reconcile(&mut self, configs: &[TraceProxyStreamConfig]) {
+    pub async fn reconcile(&mut self, configs: &[TraceProxyStreamConfig]) -> bool {
         let desired: HashMap<&str, &TraceProxyStreamConfig> = configs
             .iter()
             .map(|c| (c.log_source_id.as_str(), c))
@@ -71,24 +71,38 @@ impl TraceProxyManager {
             }
         }
 
-        // Phase 2: stop removed proxies.
+        // Phase 2: remove every affected proxy from manager state, then stop
+        // them concurrently before starting replacements.
         for id in &to_remove {
             info!(log_source_id = %id, "stopping removed trace proxy");
-            self.stop_proxy(id).await;
         }
-
-        // Phase 3: restart changed proxies (stop old first).
         for id in &to_restart {
             info!(log_source_id = %id, "restarting trace proxy (config changed)");
-            self.stop_proxy(id).await;
         }
+        let stops = to_remove.iter().chain(&to_restart).filter_map(|id| {
+            self.proxies
+                .remove(id)
+                .map(|managed| Self::stop_managed(id.clone(), managed))
+        });
+        futures_util::future::join_all(stops).await;
 
-        // Phase 4: start new and restarted proxies.
+        // Phase 3: start new and restarted proxies.
         for cfg in configs {
             if !self.proxies.contains_key(&cfg.log_source_id) {
                 self.start_proxy(cfg).await;
             }
         }
+
+        self.is_converged(configs)
+    }
+
+    fn is_converged(&self, configs: &[TraceProxyStreamConfig]) -> bool {
+        self.proxies.len() == configs.len()
+            && configs.iter().all(|cfg| {
+                self.proxies
+                    .get(&cfg.log_source_id)
+                    .is_some_and(|managed| managed.config_hash == cfg.config_hash)
+            })
     }
 
     fn build_proxy(&self, cfg: &TraceProxyStreamConfig) -> TraceProxy {
@@ -143,20 +157,23 @@ impl TraceProxyManager {
         );
     }
 
-    async fn stop_proxy(&mut self, id: &str) {
-        let Some(mut managed) = self.proxies.remove(id) else {
-            return;
-        };
+    async fn stop_managed(id: String, mut managed: ManagedProxy) {
         managed.proxy.stop().await;
         info!(log_source_id = %id, "trace proxy stopped");
     }
 
+    /// Stop every proxy concurrently. Each proxy owns a shared end-to-end
+    /// deadline and aborts and reaps any child task that exceeds it.
     pub async fn shutdown_all(&mut self) {
-        let ids: Vec<String> = self.proxies.keys().cloned().collect();
-        info!(count = ids.len(), "shutting down all trace proxies");
-        for id in &ids {
-            self.stop_proxy(id).await;
-        }
+        info!(
+            count = self.proxies.len(),
+            "shutting down all trace proxies"
+        );
+        let stops = self
+            .proxies
+            .drain()
+            .map(|(id, managed)| Self::stop_managed(id, managed));
+        futures_util::future::join_all(stops).await;
     }
 }
 
@@ -201,22 +218,22 @@ pub async fn run_with_counters(
             }
         }
 
-        let configs = {
+        let (checksum, configs) = {
             let cfg = shared_config.read().await;
-            match cfg.as_ref() {
-                Some(unified) if unified.checksum != last_checksum => {
-                    last_checksum = unified.checksum.clone();
-                    config::all_trace_proxies(unified)
-                }
-                _ => continue,
-            }
+            let Some(unified) = cfg.as_ref() else {
+                continue;
+            };
+            (unified.checksum.clone(), config::all_trace_proxies(unified))
         };
 
-        info!(
-            proxies = configs.len(),
-            "config changed, reconciling trace proxies"
-        );
-        manager.reconcile(&configs).await;
+        if checksum == last_checksum && manager.is_converged(&configs) {
+            continue;
+        }
+
+        info!(proxies = configs.len(), "reconciling trace proxies");
+        if manager.reconcile(&configs).await {
+            last_checksum = checksum;
+        }
     }
 }
 
@@ -229,6 +246,7 @@ fn sanitize_id(id: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     #[test]
     fn sanitize_trace_proxy_ids() {
@@ -272,5 +290,143 @@ mod tests {
         };
 
         assert!(manager.build_proxy(&config).uses_counters(&counters));
+    }
+
+    #[tokio::test]
+    async fn unchanged_config_retries_a_failed_proxy_start() {
+        let held_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let listen_address = held_listener.local_addr().unwrap();
+        let shared_config = config::shared_config();
+        *shared_config.write().await = Some(config::UnifiedConfig::new(
+            json!({
+                "traces": {
+                    "retry-source": {
+                        "listen_address": listen_address.to_string(),
+                        "subbox_endpoint": "http://127.0.0.1:9/v1/logpacer-wire",
+                        "archive_id": "arc",
+                        "repo_id": "repo",
+                        "require_service_name": false
+                    }
+                }
+            }),
+            "unchanged".into(),
+        ));
+
+        let dir = tempfile::tempdir().unwrap();
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let manager = tokio::spawn({
+            let shared_config = shared_config.clone();
+            let data_dir = dir.path().to_path_buf();
+            async move {
+                run_with_counters(
+                    shared_config,
+                    &data_dir,
+                    "host-test".into(),
+                    AgentCounters::new(),
+                    shutdown_rx,
+                )
+                .await;
+            }
+        });
+
+        tokio::time::sleep(Duration::from_millis(2_100)).await;
+        drop(held_listener);
+
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if tokio::net::TcpStream::connect(listen_address).await.is_ok() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("the unchanged desired proxy must retry after its port becomes free");
+
+        shutdown_tx.send(true).unwrap();
+        tokio::time::timeout(Duration::from_secs(2), manager)
+            .await
+            .expect("trace proxy manager should stop")
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn rollback_reconciles_when_the_previous_checksum_is_no_longer_running() {
+        let reserve_a = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address_a = reserve_a.local_addr().unwrap();
+        drop(reserve_a);
+        let held_b = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address_b = held_b.local_addr().unwrap();
+        let unified = |address: std::net::SocketAddr, checksum: &str| {
+            config::UnifiedConfig::new(
+                json!({
+                    "traces": {
+                        "rollback-source": {
+                            "listen_address": address.to_string(),
+                            "subbox_endpoint": "http://127.0.0.1:9/v1/logpacer-wire",
+                            "archive_id": "arc",
+                            "repo_id": "repo",
+                            "require_service_name": false
+                        }
+                    }
+                }),
+                checksum.into(),
+            )
+        };
+
+        let shared_config = config::shared_config();
+        *shared_config.write().await = Some(unified(address_a, "a"));
+        let dir = tempfile::tempdir().unwrap();
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let manager = tokio::spawn({
+            let shared_config = shared_config.clone();
+            let data_dir = dir.path().to_path_buf();
+            async move {
+                run_with_counters(
+                    shared_config,
+                    &data_dir,
+                    "host-test".into(),
+                    AgentCounters::new(),
+                    shutdown_rx,
+                )
+                .await;
+            }
+        });
+
+        wait_for_listener(address_a).await;
+        *shared_config.write().await = Some(unified(address_b, "b"));
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if tokio::net::TcpStream::connect(address_a).await.is_err() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("failed replacement should first stop the previous listener");
+
+        *shared_config.write().await = Some(unified(address_a, "a"));
+        wait_for_listener(address_a).await;
+
+        shutdown_tx.send(true).unwrap();
+        tokio::time::timeout(Duration::from_secs(2), manager)
+            .await
+            .expect("trace proxy manager should stop")
+            .unwrap();
+        drop(held_b);
+    }
+
+    async fn wait_for_listener(address: std::net::SocketAddr) {
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if tokio::net::TcpStream::connect(address).await.is_ok() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("trace proxy listener should bind");
     }
 }
