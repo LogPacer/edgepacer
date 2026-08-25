@@ -636,14 +636,13 @@ async fn run_local_mode(app_config: AppConfig) -> anyhow::Result<()> {
         )
     };
 
-    let orchestrator = spawn_orchestrator(
+    let tasks = LocalTasks::spawn(
         shared_config,
         discovery_cache,
         data_dir,
         identity,
         counters,
-        Arc::new(error_collector::ErrorCollector::new()),
-        shutdown.subscribe(),
+        &shutdown,
     );
 
     info!("edgepacer local mode running, press Ctrl+C to stop");
@@ -651,12 +650,57 @@ async fn run_local_mode(app_config: AppConfig) -> anyhow::Result<()> {
     info!("shutdown signal received");
 
     shutdown.signal();
-    wait_task(orchestrator, ShutdownBudgets::local().orchestrator).await;
+    tasks.wait(ShutdownBudgets::local()).await;
     #[cfg(all(target_os = "linux", feature = "ebpf"))]
     wait_task(ebpf, ShutdownBudgets::local().orchestrator).await;
 
     info!("edgepacer stopped");
     Ok(())
+}
+
+struct LocalTasks {
+    orchestrator: JoinHandle<()>,
+    trace: JoinHandle<()>,
+}
+
+impl LocalTasks {
+    fn spawn(
+        shared_config: config::SharedConfig,
+        discovery_cache: discovery::SharedDiscoveryCache,
+        data_dir: PathBuf,
+        identity: identity::AgentIdentity,
+        counters: Arc<counters::AgentCounters>,
+        shutdown: &SharedShutdown,
+    ) -> Self {
+        let trace = spawn_trace_proxy_manager(
+            shared_config.clone(),
+            data_dir.clone(),
+            identity.current(),
+            counters.clone(),
+            shutdown.subscribe(),
+        );
+        let orchestrator = spawn_orchestrator(
+            shared_config,
+            discovery_cache,
+            data_dir,
+            identity,
+            counters,
+            Arc::new(error_collector::ErrorCollector::new()),
+            shutdown.subscribe(),
+        );
+
+        Self {
+            orchestrator,
+            trace,
+        }
+    }
+
+    async fn wait(self, budgets: ShutdownBudgets) {
+        tokio::join!(
+            wait_task(self.orchestrator, budgets.orchestrator),
+            wait_task(self.trace, budgets.standard),
+        );
+    }
 }
 
 async fn wait_for_shutdown_signal() -> anyhow::Result<()> {
@@ -734,6 +778,13 @@ fn prepare_data_dir(data_dir: &Path) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use logpacer_wire::WireResponse;
+    use opentelemetry_proto::tonic::collector::trace::v1::ExportTraceServiceRequest;
+    use opentelemetry_proto::tonic::trace::v1::{ResourceSpans, ScopeSpans, Span};
+    use prost::Message;
+    use serde_json::json;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
 
     #[test]
     fn data_dir_uses_edgepacer_child_under_cache_root() {
@@ -781,5 +832,112 @@ mod tests {
         subscriber.changed().await.unwrap();
 
         assert!(*subscriber.borrow());
+    }
+
+    #[tokio::test]
+    async fn local_tasks_manage_trace_proxy_lifecycle() {
+        let relay = MockServer::start().await;
+        let mut wire_response = Vec::new();
+        WireResponse {
+            accepted: 1,
+            rejected: 0,
+            error_message: String::new(),
+        }
+        .encode(&mut wire_response)
+        .unwrap();
+        Mock::given(method("POST"))
+            .and(path("/v1/logpacer-wire"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_raw(wire_response, "application/x-protobuf"),
+            )
+            .expect(1)
+            .mount(&relay)
+            .await;
+
+        let reserved = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let listen_address = reserved.local_addr().unwrap();
+        drop(reserved);
+
+        let shared_config = config::shared_config();
+        *shared_config.write().await = Some(config::UnifiedConfig::new(
+            json!({}),
+            "local-disabled".into(),
+        ));
+        let counters = counters::AgentCounters::new();
+        let shutdown = SharedShutdown::new();
+        let data_dir = tempfile::tempdir().unwrap();
+        let identity = identity::AgentIdentity::seed(None, "host-test", "host-test");
+        let tasks = LocalTasks::spawn(
+            shared_config.clone(),
+            discovery::shared_discovery_cache(),
+            data_dir.path().to_path_buf(),
+            identity,
+            counters.clone(),
+            &shutdown,
+        );
+
+        tokio::time::sleep(Duration::from_millis(2_100)).await;
+        let unbound = std::net::TcpListener::bind(listen_address)
+            .expect("a directive without traces must leave the listener unbound");
+        drop(unbound);
+
+        *shared_config.write().await = Some(config::UnifiedConfig::new(
+            json!({
+                "traces": {
+                    "local-traces": {
+                        "listen_address": listen_address.to_string(),
+                        "subbox_endpoint": format!("{}/v1/logpacer-wire", relay.uri()),
+                        "archive_id": "arc_test",
+                        "repo_id": "repo_test",
+                        "require_service_name": false
+                    }
+                }
+            }),
+            "local-enabled".into(),
+        ));
+
+        let request = ExportTraceServiceRequest {
+            resource_spans: vec![ResourceSpans {
+                scope_spans: vec![ScopeSpans {
+                    spans: vec![Span {
+                        trace_id: vec![0x11; 16],
+                        span_id: vec![0x22; 8],
+                        name: "local-mode-span".into(),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+        };
+        let mut body = Vec::new();
+        request.encode(&mut body).unwrap();
+        let client = reqwest::Client::new();
+        let url = format!("http://{listen_address}/v1/traces");
+        let response = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                match client
+                    .post(&url)
+                    .header("content-type", "application/x-protobuf")
+                    .body(body.clone())
+                    .send()
+                    .await
+                {
+                    Ok(response) => break response,
+                    Err(_) => tokio::time::sleep(Duration::from_millis(50)).await,
+                }
+            }
+        })
+        .await
+        .expect("local mode should start the configured trace proxy");
+
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        assert!(counters.snapshot().bytes_sent > 0);
+
+        shutdown.signal();
+        tasks.wait(ShutdownBudgets::local()).await;
+
+        std::net::TcpListener::bind(listen_address)
+            .expect("local-mode shutdown must release the trace proxy listener");
     }
 }
