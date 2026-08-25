@@ -225,6 +225,7 @@ pub struct AgentCounters {
     pub spans_cross_linked: AtomicU64,
     pub spans_kind_from_bytes: AtomicU64,
     pub ebpf_capture_read_faults: AtomicU64,
+    pub ebpf_stream_gaps: AtomicU64,
     error_window: ErrorWindow,
     body_variants: BodyVariantRegistry,
 }
@@ -247,6 +248,7 @@ impl AgentCounters {
             spans_cross_linked: AtomicU64::new(0),
             spans_kind_from_bytes: AtomicU64::new(0),
             ebpf_capture_read_faults: AtomicU64::new(0),
+            ebpf_stream_gaps: AtomicU64::new(0),
             error_window: ErrorWindow::new(),
             body_variants: BodyVariantRegistry::default(),
         })
@@ -321,6 +323,12 @@ impl AgentCounters {
             .fetch_add(n, Ordering::Relaxed);
     }
 
+    pub fn observe_ebpf_stream_gap(&self, observed: bool) {
+        if observed {
+            self.ebpf_stream_gaps.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
     pub fn snapshot(&self) -> CountersSnapshot {
         CountersSnapshot {
             bytes_sent: self.bytes_sent.load(Ordering::Relaxed),
@@ -337,6 +345,7 @@ impl AgentCounters {
             spans_cross_linked: self.spans_cross_linked.load(Ordering::Relaxed),
             spans_kind_from_bytes: self.spans_kind_from_bytes.load(Ordering::Relaxed),
             ebpf_capture_read_faults: self.ebpf_capture_read_faults.load(Ordering::Relaxed),
+            ebpf_stream_gaps: self.ebpf_stream_gaps.load(Ordering::Relaxed),
         }
     }
 }
@@ -358,6 +367,7 @@ pub struct CountersSnapshot {
     pub spans_cross_linked: u64,
     pub spans_kind_from_bytes: u64,
     pub ebpf_capture_read_faults: u64,
+    pub ebpf_stream_gaps: u64,
 }
 
 #[cfg(test)]
@@ -448,6 +458,17 @@ mod tests {
         counters.add_ebpf_capture_read_faults(3);
 
         assert_eq!(counters.snapshot().ebpf_capture_read_faults, 5);
+    }
+
+    #[test]
+    fn ebpf_stream_gap_observation_counts_only_flagged_segments() {
+        let counters = AgentCounters::new();
+        counters.observe_ebpf_stream_gap(false);
+        counters.observe_ebpf_stream_gap(true);
+        counters.observe_ebpf_stream_gap(false);
+        counters.observe_ebpf_stream_gap(true);
+
+        assert_eq!(counters.snapshot().ebpf_stream_gaps, 2);
     }
 
     #[test]

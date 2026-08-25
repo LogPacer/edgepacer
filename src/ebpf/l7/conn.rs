@@ -51,7 +51,7 @@ pub struct CapturedSegment {
     /// for span start + duration until the kernel stamps ktime (a refinement).
     pub timestamp_nano: i64,
     /// Successfully transferred bytes are missing after this captured prefix.
-    /// This carries evidence only; tracker invalidation and resync are separate.
+    /// The tracker consumes the prefix, then invalidates its stream state.
     pub stream_gap: bool,
     pub bytes: Vec<u8>,
 }
@@ -326,8 +326,14 @@ impl ConnTracker {
             // resurrects. The prior stream killed it — e.g. a file closed on
             // the same fd, then reopened as a socket, or corrupt bytes.
             // Eviction on close(2) is the cleaner fix and a planned refinement.
-            if looks_like_any_request(bytes) {
+            let hinted_parser = protocol_hint
+                .filter(|_| dir == Direction::Inbound)
+                .and_then(parser_for_protocol);
+            let request_boundary =
+                hinted_parser.is_some() || protocol_hint.is_none() && looks_like_any_request(bytes);
+            if request_boundary {
                 *self = ConnTracker::default();
+                self.parser = hinted_parser;
             } else {
                 return;
             }
@@ -485,7 +491,11 @@ impl ConnRegistry {
             protocol_hint,
             flip,
         );
-        tracker.take_records()
+        let records = tracker.take_records();
+        if seg.stream_gap {
+            tracker.kill();
+        }
+        records
     }
 
     /// Which side of a connection the monitored process turned out to be,
@@ -537,6 +547,13 @@ mod tests {
             timestamp_nano: 0,
             stream_gap: false,
             bytes: bytes.to_vec(),
+        }
+    }
+
+    fn gap_seg(pid: u32, fd: u32, direction: Direction, bytes: &[u8]) -> CapturedSegment {
+        CapturedSegment {
+            stream_gap: true,
+            ..seg(pid, fd, direction, bytes)
         }
     }
 
@@ -1088,6 +1105,111 @@ mod tests {
         let r = reg.on_segment(&seg(1, 9, Direction::Outbound, b"HTTP/1.1 200 OK\r\n\r\n"));
         assert_eq!(r.len(), 1);
         assert_eq!(r[0].operation, "GET /after");
+    }
+
+    #[test]
+    fn stream_gap_discards_partial_http_state_before_the_next_request() {
+        let mut reg = ConnRegistry::new();
+
+        assert!(
+            reg.on_segment(&gap_seg(
+                1,
+                9,
+                Direction::Inbound,
+                b"GET /lost HTTP/1.1\r\nHost: example"
+            ))
+            .is_empty()
+        );
+        assert!(
+            reg.on_segment(&seg(1, 9, Direction::Inbound, b".invalid\r\n\r\n"))
+                .is_empty(),
+            "bytes after the gap must not complete the discarded request"
+        );
+        assert!(
+            reg.on_segment(&seg(1, 9, Direction::Outbound, RESP))
+                .is_empty(),
+            "a response alone must not resurrect the tracker"
+        );
+
+        assert!(
+            reg.on_segment(&seg(1, 9, Direction::Inbound, REQ))
+                .is_empty()
+        );
+        let records = reg.on_segment(&seg(1, 9, Direction::Outbound, RESP));
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].operation, "GET /api/users");
+    }
+
+    #[test]
+    fn stream_gap_returns_records_from_the_trustworthy_prefix_then_invalidates() {
+        let mut reg = ConnRegistry::new();
+        reg.on_segment(&seg(1, 9, Direction::Inbound, REQ));
+
+        let records = reg.on_segment(&gap_seg(1, 9, Direction::Outbound, RESP));
+        assert_eq!(records.len(), 1, "the captured prefix remains trustworthy");
+        assert_eq!(records[0].operation, "GET /api/users");
+
+        assert!(
+            reg.on_segment(&seg(1, 9, Direction::Outbound, RESP))
+                .is_empty(),
+            "the flagged segment must invalidate the completed parser too"
+        );
+    }
+
+    #[test]
+    fn client_request_opener_recovers_after_a_stream_gap() {
+        let mut reg = ConnRegistry::new();
+
+        reg.on_segment(&gap_seg(
+            1,
+            9,
+            Direction::Outbound,
+            b"GET /lost HTTP/1.1\r\n",
+        ));
+        assert!(
+            reg.on_segment(&seg(1, 9, Direction::Outbound, REQ))
+                .is_empty()
+        );
+        let records = reg.on_segment(&seg(1, 9, Direction::Inbound, RESP));
+
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].operation, "GET /api/users");
+        assert_eq!(
+            reg.byte_role(&seg(1, 9, Direction::Outbound, REQ)),
+            Some(PeerRole::Client)
+        );
+    }
+
+    #[test]
+    fn hinted_request_direction_recovers_but_response_direction_does_not() {
+        let mut reg = ConnRegistry::new();
+        let gap = gap_seg(1, 9, Direction::Outbound, &[1]);
+
+        reg.on_segment_hinted(&gap, Some("clickhouse"), true);
+        let key = gap.connection_identity();
+        assert!(reg.conns[&key].dead);
+
+        let response_shaped_like_request = [0x04, 0, 0, 1, 0x05, 0, 0, 0, 0];
+        assert!(looks_like_any_request(&response_shaped_like_request));
+        reg.on_segment_hinted(
+            &seg(1, 9, Direction::Inbound, &response_shaped_like_request),
+            Some("clickhouse"),
+            true,
+        );
+        assert!(
+            reg.conns[&key].dead,
+            "a hinted response segment must not resurrect the tracker"
+        );
+
+        reg.on_segment_hinted(
+            &seg(1, 9, Direction::Outbound, &[1]),
+            Some("clickhouse"),
+            true,
+        );
+        assert!(
+            !reg.conns[&key].dead && reg.conns[&key].parser.is_some(),
+            "the hint and configured request direction must establish a fresh parser"
+        );
     }
 
     #[test]
